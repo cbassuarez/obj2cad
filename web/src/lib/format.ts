@@ -3,10 +3,13 @@ export const fmt = (n: number) => n.toLocaleString("en-US");
 export function bytes(n: number): string {
   if (n < 1024) return `${n} B`;
   if (n < 1048576) return `${(n / 1024).toFixed(1)} KB`;
-  return `${(n / 1048576).toFixed(1)} MB`;
+  if (n < 1073741824) return `${(n / 1048576).toFixed(1)} MB`;
+  return `${(n / 1073741824).toFixed(2)} GB`;
 }
 
-/** Dimension text: up to 3 decimals, trailing zeros kept for a drafting look. */
-export const dim = (n: number) => n.toFixed(3);
+const measureFormat = new Intl.NumberFormat("en-US", { maximumFractionDigits: 3 });
+
+/** A length for display: up to 3 decimals, grouped thousands. */
+export const measure = (n: number) => measureFormat.format(n);
 
 export const cap = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);

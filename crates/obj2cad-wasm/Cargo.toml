@@ -6,11 +6,24 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+# The DWG writer (acadrust) roughly sextuples the module, so the web app builds it as a
+# second module, loaded only when DWG is chosen.
+dwg = ["dep:obj2cad-dwg"]
+
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 obj2cad-core.workspace = true
 obj2cad-dxf.workspace = true
+obj2cad-dwg = { workspace = true, optional = true }
+serde.workspace = true
 serde_json.workspace = true
+earcut = "0.4"
+# Pinned together: wasm-bindgen-cli must match exactly (web/scripts/build-wasm.mjs).
 wasm-bindgen = "=0.2.129"
+js-sys = "=0.3.106"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.3", features = ["wasm_js"] }

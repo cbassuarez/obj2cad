@@ -1,0 +1,19 @@
+# concave faces must not be triangulated or filled wrongly
+o U
+v 0 0 0
+v 3 0 0
+v 3 2 0
+v 2 2 0
+v 2 1 0
+v 1 1 0
+v 1 2 0
+v 0 2 0
+f 1 2 3 4 5 6 7 8
+o L
+v 4 0 0
+v 6 0 0
+v 6 1 0
+v 5 1 0
+v 5 2 0
+v 4 2 0
+f 9 10 11 12 13 14

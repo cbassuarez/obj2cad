@@ -1,0 +1,30 @@
+[package]
+name = "obj2cad-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+obj2cad-core = { path = "../crates/obj2cad-core" }
+obj2cad-dxf = { path = "../crates/obj2cad-dxf" }
+
+# Separate from the main workspace: needs nightly and libFuzzer.
+[workspace]
+
+[[bin]]
+name = "parse"
+path = "fuzz_targets/parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pipeline"
+path = "fuzz_targets/pipeline.rs"
+test = false
+doc = false
+bench = false

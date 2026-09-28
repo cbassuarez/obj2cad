@@ -1,0 +1,37 @@
+name: Fuzz
+
+# Coverage-guided fuzzing of the parser and the whole pipeline (fuzz/). Nightly, because
+# it needs nightly Rust and takes a few minutes; crashes are uploaded as artifacts.
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [parse, pipeline]
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install nightly --profile minimal
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - name: Seed corpus from the fixtures
+        run: |
+          mkdir -p fuzz/corpus/${{ matrix.target }}
+          for f in tests/fixtures/*/*.obj; do cp "$f" "fuzz/corpus/${{ matrix.target }}/$(basename "$f")"; done
+      - name: Fuzz for 3 minutes
+        working-directory: fuzz
+        run: cargo +nightly fuzz run ${{ matrix.target }} corpus/${{ matrix.target }} -- -max_total_time=180 -max_len=65536
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: fuzz/artifacts/

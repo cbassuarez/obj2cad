@@ -11,12 +11,14 @@ pub mod hash;
 pub mod hints;
 pub mod mtl;
 pub mod obj;
+pub mod output;
 pub mod report;
 pub mod synth;
 
-pub use convert::{convert, CadModel, Options, Units, UpAxis};
+pub use convert::{convert, CadModel, LayerMode, Omissions, Options, Units, UpAxis};
 pub use diag::{Code, Diagnostic, Severity};
-pub use obj::{parse, ObjDocument, ParseError};
+pub use obj::{parse, parse_with_progress, ErrorKind, ObjDocument, ParseError, ParseIssue};
+pub use output::Meta;
 
 /// Engine version, recorded in every output file and report.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

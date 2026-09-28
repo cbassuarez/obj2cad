@@ -9,12 +9,22 @@ use crate::convert::{Units, UpAxis};
 use crate::obj::ObjDocument;
 use serde::Serialize;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnitsSource {
+    Exporter,
+    Size,
+    None,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Hints {
     /// Exporter name if the leading comments identify one.
     pub exporter: Option<String>,
     pub units: Units,
     pub units_reason: String,
+    /// Where the unit came from: the exporter's convention, the model's size, or nothing.
+    pub units_source: UnitsSource,
     pub up_axis: UpAxis,
     pub up_axis_reason: String,
     /// True when the geometry itself decided the up axis (not just a default).
@@ -92,23 +102,15 @@ pub fn hints(doc: &ObjDocument) -> Hints {
 
     // Only guess from size when it is a plausible physical size; extreme or degenerate
     // extents (surveys in odd units, test files) get no suggestion rather than a bad one.
-    let (units, units_reason) = match (known.and_then(|e| e.2), size) {
-        (Some(u), _) => (
-            u,
-            format!("{} usually exports in {}", known.unwrap().1, unit_name(u)),
-        ),
-        (None, Some(s)) if s > 0.0 && s < 5.0 => (
-            Units::Meters,
-            format!("the model is about {} across", units_across(s)),
-        ),
-        (None, Some(s)) if (5.0..50_000.0).contains(&s) => (
-            Units::Millimeters,
-            format!("the model is about {} across", units_across(s)),
-        ),
-        _ => (
-            Units::Unitless,
-            "neither the file nor the model's size says".to_owned(),
-        ),
+    let (units, units_reason, units_source) = match (known.and_then(|e| e.2), size) {
+        (Some(u), _) => (u, format!("{} usually exports in {}", known.unwrap().1, unit_name(u)), UnitsSource::Exporter),
+        (None, Some(s)) if s > 0.0 && s < 5.0 => {
+            (Units::Meters, format!("the model is about {} across", units_across(s)), UnitsSource::Size)
+        }
+        (None, Some(s)) if (5.0..50_000.0).contains(&s) => {
+            (Units::Millimeters, format!("the model is about {} across", units_across(s)), UnitsSource::Size)
+        }
+        _ => (Units::Unitless, "neither the file nor the model's size says".to_owned(), UnitsSource::None),
     };
     let exporter_up = known.and_then(|e| e.3.map(|u| (u, e.1)));
     let (up_axis, up_axis_reason, up_axis_confident) = match (detect_up(doc, bounds), exporter_up) {
@@ -130,11 +132,36 @@ pub fn hints(doc: &ObjDocument) -> Hints {
         exporter: known.map(|e| e.1.to_owned()),
         units,
         units_reason,
+        units_source,
         up_axis,
         up_axis_reason,
         up_axis_confident,
         bounds,
     }
+}
+
+/// What the user (or a team default) decided; `None` means "decide automatically".
+#[derive(Debug, Clone, Default)]
+pub struct Choices {
+    pub units: Option<Units>,
+    /// The team's "house unit", used when the file's exporter doesn't state one.
+    pub default_units: Option<Units>,
+    pub up_axis: Option<UpAxis>,
+}
+
+/// Resolve units and up axis. The CLI and the web app both call this, so the same file
+/// with the same choices always gives the same output.
+///
+/// Units: an explicit choice, else the exporter's convention, else the house unit, else
+/// the size-based guess, else unitless. Up axis: an explicit choice, else detection.
+pub fn resolve(h: &Hints, c: &Choices) -> (Units, UpAxis) {
+    let units = c
+        .units
+        .or((h.units_source == UnitsSource::Exporter).then_some(h.units))
+        .or(c.default_units)
+        .or((h.units_source == UnitsSource::Size).then_some(h.units))
+        .unwrap_or(Units::Unitless);
+    (units, c.up_axis.unwrap_or(h.up_axis))
 }
 
 /// Which way is up, from the geometry alone. Candidates are Y-up (most 3D apps) and Z-up
@@ -403,6 +430,25 @@ f 1 2 3 4
             ),
             (UpAxis::YUpToZUp, false)
         );
+    }
+
+    #[test]
+    fn resolution_order() {
+        let blender = hints(&parse(b"# Blender 4.2
+v 0 0 0
+v 160 0 0
+").unwrap());
+        let unknown = hints(&parse(b"v 0 0 0
+v 30 12 9
+").unwrap());
+        let house = Choices { default_units: Some(Units::Meters), ..Default::default() };
+        // The exporter's convention beats the house unit; the house unit beats a size guess.
+        assert_eq!(resolve(&blender, &house).0, Units::Meters);
+        assert_eq!(resolve(&unknown, &Choices::default()).0, Units::Millimeters);
+        assert_eq!(resolve(&unknown, &house).0, Units::Meters);
+        // An explicit choice beats everything.
+        let explicit = Choices { units: Some(Units::Inches), up_axis: Some(UpAxis::YUpToZUp), ..house };
+        assert_eq!(resolve(&unknown, &explicit), (Units::Inches, UpAxis::YUpToZUp));
     }
 
     #[test]

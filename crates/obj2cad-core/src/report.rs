@@ -1,10 +1,10 @@
 //! The parity report written next to every conversion.
 
-use crate::convert::{CadModel, Options};
+use crate::convert::{CadModel, Omissions, Options, UpAxis};
 use crate::diag::Diagnostic;
-use crate::hash::sha256_hex;
 use crate::obj::SourceCounts;
 use serde::Serialize;
+use std::collections::BTreeSet;
 
 #[derive(Debug, Serialize)]
 pub struct Report {
@@ -15,6 +15,12 @@ pub struct Report {
     pub options: Options,
     /// `obj2cad-parity-v1` hash of the geometry as written (see `hash.rs`).
     pub parity_hash: String,
+    /// The model was stood upright (an exact axis swap).
+    pub rotated: bool,
+    /// The file had only vertices; they were written as points.
+    pub point_cloud: bool,
+    /// Geometry in the source that is not in the output.
+    pub omissions: Omissions,
     pub layers: Vec<LayerSummary>,
     pub diagnostics: Vec<Diagnostic>,
 }
@@ -23,8 +29,12 @@ pub struct Report {
 pub struct LayerSummary {
     /// Name in the drawing (DXF-safe, unique).
     pub name: String,
-    /// The OBJ object/group it came from, verbatim ("" for the default layer 0).
+    /// The OBJ name it came from, verbatim ("" for layer 0 and the default layer).
     pub source: String,
+    /// Layer color in the drawing, `#rrggbb`.
+    pub color: String,
+    /// Material colors of entities on this layer (they override the layer color).
+    pub entity_colors: Vec<String>,
     pub faces: u64,
     pub polylines: u64,
     pub points: u64,
@@ -50,7 +60,8 @@ pub struct Input {
 pub struct Output {
     pub format: String,
     pub bytes: u64,
-    pub sha256: String,
+    /// `None` until computed (the web app hashes the file when the report is saved).
+    pub sha256: Option<String>,
     pub mesh_entities: u64,
     pub faces: u64,
     pub polylines: u64,
@@ -68,19 +79,37 @@ pub struct Source<'a> {
     pub sha256: &'a str,
 }
 
-/// `output_sha256: None` hashes the output here; the web app passes the browser's
-/// hardware-accelerated digest instead.
-pub fn build(
-    model: &CadModel,
-    source: &Source,
-    parity: &str,
-    format: &str,
-    output_bytes: &[u8],
-    output_sha256: Option<&str>,
-) -> Report {
+/// The written file as the report describes it.
+pub struct Written<'a> {
+    pub format: &'a str,
+    pub bytes: u64,
+    pub sha256: Option<String>,
+}
+
+pub fn hex_color([r, g, b]: [u8; 3]) -> String {
+    format!("#{r:02x}{g:02x}{b:02x}")
+}
+
+pub fn build(model: &CadModel, source: &Source, parity: &str, written: Written) -> Report {
     let d = model.doc;
+    // Per-layer tallies in one pass over the entities.
+    let n = model.layers.len();
+    let (mut faces, mut polylines, mut points) = (vec![0u64; n], vec![0u64; n], vec![0u64; n]);
+    let mut colors: Vec<BTreeSet<[u8; 3]>> = vec![BTreeSet::new(); n];
+    for m in &model.meshes {
+        faces[m.layer as usize] += m.face_count() as u64;
+        colors[m.layer as usize].extend(m.color);
+    }
+    for l in &model.polylines {
+        polylines[l.layer as usize] += 1;
+        colors[l.layer as usize].extend(l.color);
+    }
+    for p in &model.points {
+        points[p.layer as usize] += 1;
+        colors[p.layer as usize].extend(p.color);
+    }
     Report {
-        schema: "obj2cad-report-v1",
+        schema: "obj2cad-report-v2",
         engine_version: crate::VERSION,
         input: Input {
             name: source.name.to_owned(),
@@ -97,29 +126,24 @@ pub fn build(
             header_comments: d.header_comments.clone(),
         },
         output: Output {
-            format: format.to_owned(),
-            bytes: output_bytes.len() as u64,
-            sha256: output_sha256.map_or_else(|| sha256_hex(output_bytes), str::to_owned),
+            format: written.format.to_owned(),
+            bytes: written.bytes,
+            sha256: written.sha256,
             mesh_entities: model.meshes.len() as u64,
-            faces: model.meshes.iter().map(|m| m.face_count() as u64).sum(),
+            faces: faces.iter().sum(),
             polylines: model.polylines.len() as u64,
             points: model.points.len() as u64,
-            vertices_written: model
-                .meshes
-                .iter()
-                .map(|m| m.vertices.len() as u64)
-                .sum::<u64>()
-                + model
-                    .polylines
-                    .iter()
-                    .map(|l| l.vertices.len() as u64)
-                    .sum::<u64>()
+            vertices_written: model.meshes.iter().map(|m| m.vertices.len() as u64).sum::<u64>()
+                + model.polylines.iter().map(|l| l.vertices.len() as u64).sum::<u64>()
                 + model.points.len() as u64,
-            unreferenced_vertices_skipped: model.unreferenced_vertices,
+            unreferenced_vertices_skipped: model.omissions.loose_points,
             bounds: model.bounds(),
         },
         options: model.options.clone(),
         parity_hash: parity.to_owned(),
+        rotated: model.options.up_axis != UpAxis::AsIs,
+        point_cloud: model.point_cloud,
+        omissions: model.omissions.clone(),
         layers: model
             .layers
             .iter()
@@ -127,22 +151,11 @@ pub fn build(
             .map(|(i, l)| LayerSummary {
                 name: l.name.clone(),
                 source: l.source.clone(),
-                faces: model
-                    .meshes
-                    .iter()
-                    .filter(|m| m.layer as usize == i)
-                    .map(|m| m.face_count() as u64)
-                    .sum(),
-                polylines: model
-                    .polylines
-                    .iter()
-                    .filter(|p| p.layer as usize == i)
-                    .count() as u64,
-                points: model
-                    .points
-                    .iter()
-                    .filter(|p| p.layer as usize == i)
-                    .count() as u64,
+                color: hex_color(l.color),
+                entity_colors: colors[i].iter().map(|&c| hex_color(c)).collect(),
+                faces: faces[i],
+                polylines: polylines[i],
+                points: points[i],
             })
             .collect(),
         diagnostics: model.diagnostics.clone(),

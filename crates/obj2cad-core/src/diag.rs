@@ -53,6 +53,10 @@ pub enum Code {
     UnreferencedVertices,
     /// A vertex shared by faces in different entities is written once per entity.
     SharedVerticesRepeated,
+    /// Vertices no element uses were written as POINT entities (point cloud, or on request).
+    LooseVerticesAsPoints,
+    /// Layers were left out on request.
+    LayersExcluded,
 }
 
 #[derive(Debug, Clone, Serialize)]

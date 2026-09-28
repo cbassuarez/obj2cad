@@ -11,3 +11,7 @@ rust-version.workspace = true
 serde.workspace = true
 sha2.workspace = true
 memchr = "2"
+
+[dev-dependencies]
+proptest = "1"
+obj2cad-dxf = { path = "../obj2cad-dxf" }
