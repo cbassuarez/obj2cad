@@ -1,0 +1,107 @@
+name: Release
+
+# Merging the release PR (opened by release-please from conventional commits) tags a
+# version; this workflow then verifies, builds and deploys it to GitHub Pages:
+#   /obj2cad/            latest version (installable PWA, auto-updates with a prompt)
+#   /obj2cad/v/<ver>/    a pinned, never-changing copy of every release
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+  attestations: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    outputs:
+      released: ${{ steps.rp.outputs.release_created }}
+      version: ${{ steps.rp.outputs.version }}
+      tag: ${{ steps.rp.outputs.tag_name }}
+    steps:
+      - id: rp
+        uses: googleapis/release-please-action@v4
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  deploy:
+    needs: release-please
+    if: needs.release-please.outputs.released == 'true'
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.release-please.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen-cli@0.2.129
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Verify (tests + parity harness)
+        run: |
+          cargo test --workspace
+          cargo build --release -p obj2cad-cli
+          pip install -r tests/harness/requirements.txt
+          python tests/harness/parity.py --up as-is tests/fixtures
+          python tests/harness/parity.py --up y-to-z tests/fixtures
+
+      - name: Build web (latest + pinned)
+        working-directory: web
+        run: |
+          npm ci
+          BASE=/obj2cad/ npm run build
+          mv dist ../site-latest
+          BASE=/obj2cad/v/$VERSION/ PINNED=1 npm run build
+          mv dist ../site-pinned
+
+      - name: Publish to gh-pages (keeps every pinned version)
+        run: |
+          git fetch origin gh-pages || true
+          if git rev-parse --verify -q origin/gh-pages; then
+            git worktree add pages origin/gh-pages && git -C pages checkout -B gh-pages
+          else
+            git worktree add --orphan -b gh-pages pages
+          fi
+          find pages -mindepth 1 -maxdepth 1 ! -name v ! -name .git -exec rm -rf {} +
+          cp -r site-latest/. pages/
+          mkdir -p pages/v && rm -rf "pages/v/$VERSION" && cp -r site-pinned "pages/v/$VERSION"
+          touch pages/.nojekyll
+          cd pages
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A && git commit -m "deploy $VERSION" && git push origin gh-pages
+
+      - name: SBOM (Rust + npm dependencies)
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: spdx-json
+          output-file: sbom.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Release assets (web bundle, checksums, SBOM)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.release-please.outputs.tag }}
+        run: |
+          tar czf obj2cad-web-$VERSION.tar.gz -C site-pinned .
+          sha256sum obj2cad-web-$VERSION.tar.gz sbom.spdx.json > SHA256SUMS
+          gh release upload "$TAG" obj2cad-web-$VERSION.tar.gz sbom.spdx.json SHA256SUMS --clobber
+
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: obj2cad-web-${{ env.VERSION }}.tar.gz

@@ -1,0 +1,213 @@
+/* Layer order: Mantine's styles sit below Tailwind components/utilities, so one set of
+   tokens and utility classes styles shadcn and Mantine components alike. */
+@layer theme, base, mantine, components, utilities;
+@import "tailwindcss";
+/* Only the Mantine components we use. Tailwind's preflight replaces Mantine's baseline. */
+@import "@mantine/core/styles/default-css-variables.layer.css";
+@import "@mantine/core/styles/global.layer.css";
+@import "@mantine/core/styles/UnstyledButton.layer.css";
+@import "@mantine/core/styles/CloseButton.layer.css";
+@import "@mantine/core/styles/Overlay.layer.css";
+@import "@mantine/core/styles/Paper.layer.css";
+@import "@mantine/core/styles/Popover.layer.css";
+@import "@mantine/core/styles/Menu.layer.css";
+@import "@mantine/core/styles/ModalBase.layer.css";
+@import "@mantine/core/styles/Modal.layer.css";
+@import "@mantine/core/styles/Notification.layer.css";
+@import "@mantine/core/styles/Loader.layer.css";
+@import "@mantine/dropzone/styles.layer.css";
+@import "@mantine/notifications/styles.layer.css";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* ---------------------------------------------------------------- tokens
+   Dark = "Studio" (B): near-black ground, chartreuse accent.
+   Light = "Drafting" (A): paper ground, ink-blue accent.
+   Every color used in the app comes from here. */
+:root,
+.light {
+  --bg: #f4f2ee;
+  --viewport: #efece6;
+  --panel: rgb(255 255 255 / 0.94);
+  --panel-solid: #ffffff;
+  --panel-2: #f6f4f0;
+  --line: #dcd8d0;
+  --line-soft: #ece9e3;
+  --text: #1c1d1f;
+  --text-2: #4a4d53;
+  --text-3: #6b6e74;
+  --accent: #2b55c7;
+  --accent-hover: #2349b0;
+  --accent-fg: #ffffff;
+  --accent-soft: #eef2fc;
+  --exact: #1e7a4c;
+  --exact-soft: #eef8f2;
+  --warn: #9a5a12;
+  --warn-soft: #fff5e8;
+  --info: #3f5578;
+  --info-soft: #f2f4f8;
+  --danger: #b42318;
+  --danger-soft: #fdecea;
+  --grid: #ddd8ce;
+  --grid-major: #cbc4b7;
+  --dim: #2b55c7;
+  --axis-x: #c4552b;
+  --axis-y: #1e7a4c;
+  --axis-z: #2b55c7;
+  --shadow: 0 1px 0 rgb(28 29 31 / 0.04), 0 12px 32px rgb(28 29 31 / 0.08);
+  --backdrop: rgb(20 22 26 / 0.35);
+  color-scheme: light;
+}
+
+.dark {
+  --bg: #0e0f11;
+  --viewport: #0e0f11;
+  --panel: rgb(22 24 28 / 0.92);
+  --panel-solid: #16181c;
+  --panel-2: #121417;
+  --line: #2a2d34;
+  --line-soft: #202329;
+  --text: #ecedef;
+  --text-2: #b4b8c0;
+  --text-3: #8b909a;
+  --accent: #c6f432;
+  --accent-hover: #d4fa5c;
+  --accent-fg: #101208;
+  --accent-soft: rgb(198 244 50 / 0.1);
+  --exact: #c6f432;
+  --exact-soft: rgb(198 244 50 / 0.08);
+  --warn: #f2b85b;
+  --warn-soft: rgb(242 184 91 / 0.1);
+  --info: #8fb0ff;
+  --info-soft: rgb(143 176 255 / 0.1);
+  --danger: #ff8a80;
+  --danger-soft: rgb(255 138 128 / 0.1);
+  --grid: #1c1f24;
+  --grid-major: #272b32;
+  --dim: #8fb0ff;
+  --axis-x: #ff9a6b;
+  --axis-y: #c6f432;
+  --axis-z: #8fb0ff;
+  --shadow: 0 1px 0 rgb(0 0 0 / 0.3), 0 20px 50px rgb(0 0 0 / 0.45);
+  --backdrop: rgb(0 0 0 / 0.55);
+  color-scheme: dark;
+}
+
+@theme inline {
+  --font-sans: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "Cascadia Code", Menlo, monospace;
+  --font-display: "Instrument Sans Variable", "IBM Plex Sans", ui-sans-serif, sans-serif;
+
+  --color-bg: var(--bg);
+  --color-viewport: var(--viewport);
+  --color-panel: var(--panel);
+  --color-panel-solid: var(--panel-solid);
+  --color-panel-2: var(--panel-2);
+  --color-line: var(--line);
+  --color-line-soft: var(--line-soft);
+  --color-fg: var(--text);
+  --color-fg-2: var(--text-2);
+  --color-fg-3: var(--text-3);
+  --color-accent: var(--accent);
+  --color-accent-hover: var(--accent-hover);
+  --color-accent-fg: var(--accent-fg);
+  --color-accent-soft: var(--accent-soft);
+  --color-exact: var(--exact);
+  --color-exact-soft: var(--exact-soft);
+  --color-warn: var(--warn);
+  --color-warn-soft: var(--warn-soft);
+  --color-info: var(--info);
+  --color-info-soft: var(--info-soft);
+  --color-danger: var(--danger);
+  --color-danger-soft: var(--danger-soft);
+  --color-dim: var(--dim);
+
+  --radius-panel: 4px;
+  --radius-control: 4px;
+  --shadow-panel: var(--shadow);
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font-sans);
+    font-size: 14px;
+    line-height: 1.45;
+    -webkit-font-smoothing: antialiased;
+    overflow: hidden;
+  }
+  :focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  ::selection {
+    background: var(--accent);
+    color: var(--accent-fg);
+  }
+}
+
+@layer components {
+  /* Floating surfaces (B), drawn with hairlines (A). */
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-panel);
+    box-shadow: var(--shadow);
+    backdrop-filter: blur(14px) saturate(1.2);
+  }
+  /* Section label: mono, tracked, uppercase (A). */
+  .label {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 0.13em;
+    text-transform: uppercase;
+    color: var(--text-3);
+  }
+  /* Drafting paper for the drop screen; the 3D viewport draws its own grid. */
+  .paper {
+    background-color: var(--viewport);
+    background-image:
+      linear-gradient(var(--grid) 1px, transparent 1px),
+      linear-gradient(90deg, var(--grid) 1px, transparent 1px),
+      linear-gradient(var(--grid-major) 1px, transparent 1px),
+      linear-gradient(90deg, var(--grid-major) 1px, transparent 1px);
+    background-size:
+      24px 24px,
+      24px 24px,
+      120px 120px,
+      120px 120px;
+  }
+  .num {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+/* CSS2D dimension labels in the viewport (A). */
+.dim-label {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--dim);
+  background: var(--panel-solid);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 1px 5px;
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

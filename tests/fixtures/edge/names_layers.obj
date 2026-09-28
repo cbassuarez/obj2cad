@@ -1,0 +1,17 @@
+# names that are invalid, colliding or non-ASCII as DXF layer names
+v 0 0 0
+v 1 0 0
+v 0 1 0
+o Stühle/Wohnzimmer
+f 1 2 3
+o Chair:Leg*1
+f 1 2 3
+o chair_leg_1
+f 1 2 3
+o CHAIR_LEG_1
+f 1 2 3
+o 椅子
+g 座面 背もたれ
+f 1 2 3
+o
+f 1 2 3

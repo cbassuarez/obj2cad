@@ -1,0 +1,16 @@
+[package]
+name = "obj2cad-wasm"
+description = "WebAssembly bindings for the obj2cad web app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+obj2cad-core.workspace = true
+obj2cad-dxf.workspace = true
+serde_json.workspace = true
+wasm-bindgen = "=0.2.129"

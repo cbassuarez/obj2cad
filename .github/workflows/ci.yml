@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain (from rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Lint
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Unit tests
+        run: cargo test --workspace
+      - name: Build CLI
+        run: cargo build --release -p obj2cad-cli
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Harness dependencies
+        run: pip install -r tests/harness/requirements.txt
+      - name: Parity harness (as-is)
+        run: python tests/harness/parity.py --up as-is --keep acceptance tests/fixtures
+      - name: Upload AutoCAD acceptance files (see docs/ACCEPTANCE.md)
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: acceptance-${{ github.sha }}
+          path: acceptance/
+      - name: Parity harness (Y-up → Z-up)
+        run: python tests/harness/parity.py --up y-to-z tests/fixtures
+
+  bench:
+    name: Performance budget (docs/PERFORMANCE.md, M4)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p obj2cad-cli
+      - name: Benchmark
+        run: ./target/release/obj2cad bench --synthetic 1000 --runs 5 --json | tee bench.json | python3 tests/harness/bench_budget.py 1500
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ github.sha }}
+          path: bench.json
+
+  web:
+    name: Web app
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen-cli@0.2.129
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Build (wasm + typecheck + bundle)
+        working-directory: web
+        run: |
+          npm ci
+          npm run build

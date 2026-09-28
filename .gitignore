@@ -1,0 +1,10 @@
+/target
+node_modules/
+dist/
+.venv/
+__pycache__/
+*.pyc
+# large corpora live outside the repo or in tests/corpus/cache (never committed)
+tests/corpus/cache/
+tests/out/
+.claude/

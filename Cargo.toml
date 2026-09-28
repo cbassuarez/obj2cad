@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/cbassuarez/obj2cad"
+rust-version = "1.85"
+
+[workspace.dependencies]
+obj2cad-core = { path = "crates/obj2cad-core" }
+obj2cad-dxf = { path = "crates/obj2cad-dxf" }
+ryu = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+
+[profile.release]
+lto = true
+codegen-units = 1

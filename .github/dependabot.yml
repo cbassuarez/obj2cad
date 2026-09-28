@@ -1,0 +1,22 @@
+# Weekly, grouped dependency updates. Each PR runs the full CI (tests, parity harness on
+# every OS, performance budget, web build) before it can be merged.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule: { interval: weekly, day: monday }
+    groups:
+      rust: { patterns: ["*"] }
+    ignore:
+      # Must match the wasm-bindgen-cli version pinned in the workflows; bump together.
+      - dependency-name: wasm-bindgen
+  - package-ecosystem: npm
+    directory: /web
+    schedule: { interval: weekly, day: monday }
+    groups:
+      web-minor: { update-types: ["minor", "patch"] }
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: weekly, day: monday }
+    groups:
+      actions: { patterns: ["*"] }

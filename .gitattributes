@@ -1,0 +1,4 @@
+* text=auto eol=lf
+# keep fixture bytes exactly as committed (CRLF fixtures must stay CRLF)
+tests/fixtures/** -text
+*.dxf -text

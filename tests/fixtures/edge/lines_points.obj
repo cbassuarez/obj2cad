@@ -1,0 +1,12 @@
+# polylines (l) and points (p) are written as POLYLINE and POINT entities
+v 0 0 0
+v 1 0 0
+v 1 1 0
+v 1 1 1
+vt 0 0
+o Curve
+l 1 2 3 4
+l 4/1 1/1
+o Markers
+p 1 3
+p -1
