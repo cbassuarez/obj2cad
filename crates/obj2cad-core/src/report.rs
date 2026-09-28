@@ -1,5 +1,6 @@
 //! The parity report written next to every conversion.
 
+use crate::bundle::FileEntry;
 use crate::convert::{CadModel, Omissions, Options, UpAxis};
 use crate::diag::Diagnostic;
 use crate::obj::SourceCounts;
@@ -21,6 +22,10 @@ pub struct Report {
     pub point_cloud: bool,
     /// Geometry in the source that is not in the output.
     pub omissions: Omissions,
+    /// Faces colored from texture images (approximate colors; shapes are exact).
+    pub texture_colored_faces: u64,
+    /// Every file in the bundle and what it was used for (empty for a single file).
+    pub files: Vec<FileEntry>,
     pub layers: Vec<LayerSummary>,
     pub diagnostics: Vec<Diagnostic>,
 }
@@ -33,8 +38,10 @@ pub struct LayerSummary {
     pub source: String,
     /// Layer color in the drawing, `#rrggbb`.
     pub color: String,
-    /// Material colors of entities on this layer (they override the layer color).
+    /// Colors of entities on this layer (they override the layer color), at most
+    /// [`MAX_LISTED_COLORS`]; `more_colors` when there are more.
     pub entity_colors: Vec<String>,
+    pub more_colors: bool,
     pub faces: u64,
     pub polylines: u64,
     pub points: u64,
@@ -77,7 +84,11 @@ pub struct Source<'a> {
     pub name: &'a str,
     pub len: u64,
     pub sha256: &'a str,
+    pub files: &'a [FileEntry],
 }
+
+/// How many entity colors a layer summary lists.
+pub const MAX_LISTED_COLORS: usize = 16;
 
 /// The written file as the report describes it.
 pub struct Written<'a> {
@@ -96,20 +107,29 @@ pub fn build(model: &CadModel, source: &Source, parity: &str, written: Written) 
     let n = model.layers.len();
     let (mut faces, mut polylines, mut points) = (vec![0u64; n], vec![0u64; n], vec![0u64; n]);
     let mut colors: Vec<BTreeSet<[u8; 3]>> = vec![BTreeSet::new(); n];
+    // Colored point clouds can have millions of colors; only a few are listed.
+    let mut add = |layer: u32, c: Option<[u8; 3]>| {
+        let set = &mut colors[layer as usize];
+        if let Some(c) = c {
+            if set.len() <= MAX_LISTED_COLORS {
+                set.insert(c);
+            }
+        }
+    };
     for m in &model.meshes {
         faces[m.layer as usize] += m.face_count() as u64;
-        colors[m.layer as usize].extend(m.color);
+        add(m.layer, m.color);
     }
     for l in &model.polylines {
         polylines[l.layer as usize] += 1;
-        colors[l.layer as usize].extend(l.color);
+        add(l.layer, l.color);
     }
     for p in &model.points {
         points[p.layer as usize] += 1;
-        colors[p.layer as usize].extend(p.color);
+        add(p.layer, p.color);
     }
     Report {
-        schema: "obj2cad-report-v2",
+        schema: "obj2cad-report-v3",
         engine_version: crate::VERSION,
         input: Input {
             name: source.name.to_owned(),
@@ -152,6 +172,12 @@ pub fn build(model: &CadModel, source: &Source, parity: &str, written: Written) 
         rotated: model.options.up_axis != UpAxis::AsIs,
         point_cloud: model.point_cloud,
         omissions: model.omissions.clone(),
+        texture_colored_faces: model.texture_colored_faces,
+        files: if source.files.len() > 1 {
+            source.files.to_vec()
+        } else {
+            Vec::new()
+        },
         layers: model
             .layers
             .iter()
@@ -160,7 +186,12 @@ pub fn build(model: &CadModel, source: &Source, parity: &str, written: Written) 
                 name: l.name.clone(),
                 source: l.source.clone(),
                 color: hex_color(l.color),
-                entity_colors: colors[i].iter().map(|&c| hex_color(c)).collect(),
+                entity_colors: colors[i]
+                    .iter()
+                    .take(MAX_LISTED_COLORS)
+                    .map(|&c| hex_color(c))
+                    .collect(),
+                more_colors: colors[i].len() > MAX_LISTED_COLORS,
                 faces: faces[i],
                 polylines: polylines[i],
                 points: points[i],

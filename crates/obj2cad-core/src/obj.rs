@@ -45,6 +45,8 @@ pub enum ErrorKind {
     Encoding,
     /// More than 4 billion references or 4 GB of coordinate text.
     TooLarge,
+    /// A point cloud's extra columns could mean more than one thing.
+    AmbiguousColumns,
 }
 
 /// One problem found while parsing.
@@ -109,10 +111,23 @@ pub struct Elements {
 
 impl Elements {
     fn new() -> Self {
+        Self::empty()
+    }
+
+    pub(crate) fn empty() -> Self {
         Self {
             offsets: vec![0],
             ..Default::default()
         }
+    }
+
+    pub(crate) fn push_element(
+        &mut self,
+        indices: &[u32],
+        attr: u32,
+        line: u64,
+    ) -> Result<(), ParseIssue> {
+        self.push(indices, attr, line)
     }
 
     pub fn len(&self) -> usize {
@@ -191,9 +206,17 @@ pub struct ObjDocument {
     pub header_comments: Vec<String>,
     pub counts: SourceCounts,
     pub diagnostics: Vec<Diagnostic>,
-    coord_text: Vec<u8>,
-    coord_offsets: Vec<u32>,
+    /// Texture coordinates (`vt` u, v), kept for coloring faces from textures.
+    pub texcoords: Vec<[f32; 2]>,
+    /// Texture coordinate of each face corner, parallel to `faces.indices`
+    /// ([`NO_UV`] where a corner has none). Empty when no face uses texture coordinates.
+    pub face_uvs: Vec<u32>,
+    pub(crate) coord_text: Vec<u8>,
+    pub(crate) coord_offsets: Vec<u32>,
 }
+
+/// A face corner without a texture coordinate.
+pub const NO_UV: u32 = u32::MAX;
 
 impl ObjDocument {
     /// The exact source text of coordinate `axis` (0..3) of vertex `v`.
@@ -273,6 +296,7 @@ struct Parser {
     current_attr_id: Option<u32>,
     in_header: bool,
     scratch: Vec<u32>,
+    scratch_uv: Vec<u32>,
     objects: Names,
     groups: Names,
     materials: Names,
@@ -319,6 +343,7 @@ pub fn parse_with_progress(
         current_attr_id: None,
         in_header: true,
         scratch: Vec::new(),
+        scratch_uv: Vec::new(),
         objects: Names::default(),
         groups: Names::default(),
         materials: Names::default(),
@@ -493,7 +518,24 @@ impl Parser {
             b"v" => self.vertex(rest),
             b"vt" => {
                 self.doc.counts.texcoords += 1;
-                self.numbers(rest, 1, 3, "vt")
+                let mut uv = [0f32; 2];
+                let mut n = 0;
+                for t in tokens(rest) {
+                    let v = self.number(t)?;
+                    if n < 2 {
+                        uv[n] = v as f32;
+                    }
+                    n += 1;
+                }
+                // Keep indices aligned even when the line is rejected below.
+                self.doc.texcoords.push(uv);
+                if !(1..=3).contains(&n) {
+                    return self.issue(
+                        ErrorKind::WrongArity,
+                        format!("`vt` needs 1..=3 numbers, found {n}"),
+                    );
+                }
+                Ok(())
             }
             b"vn" => {
                 self.doc.counts.normals += 1;
@@ -749,7 +791,9 @@ impl Parser {
         ];
         let mut idx = std::mem::take(&mut self.scratch);
         idx.clear();
-        let result = self.references(rest, counts, &mut idx);
+        let mut uvs = std::mem::take(&mut self.scratch_uv);
+        uvs.clear();
+        let result = self.references(rest, counts, &mut idx, &mut uvs);
         let line = self.line;
         let outcome = result.and_then(|()| {
             let attr = self.attr_id();
@@ -771,6 +815,13 @@ impl Parser {
                                 || "face uses the same vertex more than once (kept as-is)".into(),
                             );
                         }
+                        let before = self.doc.faces.indices.len();
+                        if uvs.iter().any(|&u| u != NO_UV) && self.doc.face_uvs.is_empty() {
+                            self.doc.face_uvs.resize(before, NO_UV);
+                        }
+                        if !self.doc.face_uvs.is_empty() {
+                            self.doc.face_uvs.extend_from_slice(&uvs);
+                        }
                         self.doc.faces.push(&idx, attr, line)
                     }
                 }
@@ -787,6 +838,7 @@ impl Parser {
             }
         });
         self.scratch = idx;
+        self.scratch_uv = uvs;
         outcome
     }
 
@@ -795,8 +847,10 @@ impl Parser {
         rest: &[u8],
         counts: [i64; 3],
         idx: &mut Vec<u32>,
+        uvs: &mut Vec<u32>,
     ) -> Result<(), ParseIssue> {
         for tok in tokens(rest) {
+            uvs.push(NO_UV);
             let mut parts = tok.split(|&b| b == b'/');
             for (slot, &count) in counts.iter().enumerate() {
                 let Some(part) = parts.next() else { break };
@@ -811,8 +865,10 @@ impl Parser {
                     continue;
                 }
                 let resolved = self.index(part, count, slot)?;
-                if slot == 0 {
-                    idx.push(resolved);
+                match slot {
+                    0 => idx.push(resolved),
+                    1 => *uvs.last_mut().expect("pushed above") = resolved,
+                    _ => {}
                 }
             }
             if parts.next().is_some() {

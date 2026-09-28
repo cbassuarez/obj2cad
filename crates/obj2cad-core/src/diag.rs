@@ -57,6 +57,14 @@ pub enum Code {
     LooseVerticesAsPoints,
     /// Layers were left out on request.
     LayersExcluded,
+    /// Point cloud columns (intensity, normals) with no CAD equivalent.
+    PointAttributesDropped,
+    /// A point cloud's declared point count differs from the points it holds.
+    PointCountMismatch,
+    /// Face colors were sampled from texture images (approximate; shapes are exact).
+    TextureColors,
+    /// A file in a bundle refers to a file that isn't in the bundle.
+    MissingFile,
 }
 
 #[derive(Debug, Clone, Serialize)]

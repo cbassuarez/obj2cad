@@ -7,13 +7,26 @@
 
 use crate::diag::{Code, Diagnostic, Diagnostics, Severity};
 use crate::mtl::Palette;
-use crate::obj::ObjDocument;
+use crate::obj::{ObjDocument, NO_UV};
+use crate::texture::{self, Texture};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 /// AutoCAD's default SMOOTHMESHMAXFACE; larger meshes are split so they open with default settings.
 pub const MAX_FACES_PER_MESH: usize = 1_000_000;
+
+/// Face colors sampled from one texture are reduced to at most this many, so a textured
+/// model becomes a few meshes rather than one per face.
+pub const TEXTURE_COLORS: usize = 32;
+
+/// Material colors and textures for a conversion.
+#[derive(Default)]
+pub struct Materials<'a> {
+    pub palette: Option<&'a Palette>,
+    /// Material name → its diffuse texture.
+    pub textures: HashMap<&'a str, Texture<'a>>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -220,6 +233,8 @@ pub struct CadModel<'a> {
     pub omissions: Omissions,
     /// The file has no elements at all, so every vertex was written as a point.
     pub point_cloud: bool,
+    /// Faces whose color was sampled from a texture (approximate colors).
+    pub texture_colored_faces: u64,
 }
 
 impl CadModel<'_> {
@@ -391,6 +406,89 @@ pub fn convert<'a>(
     palette: Option<&Palette>,
     options: Options,
 ) -> CadModel<'a> {
+    convert_with(
+        doc,
+        &Materials {
+            palette,
+            textures: HashMap::new(),
+        },
+        options,
+    )
+}
+
+/// Color of vertex `v` from the file (`v x y z r g b`, or a point cloud's RGB columns).
+fn vertex_rgb(doc: &ObjDocument, v: u32) -> Option<[u8; 3]> {
+    doc.colors
+        .get(v as usize)
+        .copied()
+        .flatten()
+        .map(|c| c.map(|x| (f64::from(x).clamp(0.0, 1.0) * 255.0).round() as u8))
+}
+
+/// Per-face colors sampled from textures, reduced per texture (see [`TEXTURE_COLORS`]).
+/// `None` for faces that keep their material color.
+fn texture_colors(doc: &ObjDocument, materials: &Materials) -> Option<Vec<Option<[u8; 3]>>> {
+    if materials.textures.is_empty() || doc.face_uvs.is_empty() {
+        return None;
+    }
+    let tex_of_attr: Vec<Option<(usize, &Texture)>> = doc
+        .attrs
+        .iter()
+        .map(|a| {
+            let m = a.material?;
+            let name = doc.materials[m as usize].as_str();
+            materials.textures.get(name).map(|t| (m as usize, t))
+        })
+        .collect();
+    if tex_of_attr.iter().all(Option::is_none) {
+        return None;
+    }
+    let mut out: Vec<Option<[u8; 3]>> = vec![None; doc.faces.len()];
+    // Sampled colors per material, then reduced.
+    let mut sampled: HashMap<usize, (Vec<usize>, Vec<[u8; 3]>)> = HashMap::new();
+    let mut uvs: Vec<[f32; 2]> = Vec::new();
+    for fi in 0..doc.faces.len() {
+        let Some((m, tex)) = tex_of_attr[doc.faces.attr[fi] as usize] else {
+            continue;
+        };
+        let range = doc.faces.offsets[fi] as usize..doc.faces.offsets[fi + 1] as usize;
+        uvs.clear();
+        for &t in &doc.face_uvs[range] {
+            if t == NO_UV {
+                break;
+            }
+            uvs.push(doc.texcoords[t as usize]);
+        }
+        if uvs.len() != doc.faces.get(fi).len() {
+            continue;
+        }
+        let c = tex
+            .face_color(&uvs)
+            .map(|x| x.round().clamp(0.0, 255.0) as u8);
+        let e = sampled.entry(m).or_default();
+        e.0.push(fi);
+        e.1.push(c);
+    }
+    let mut keys: Vec<usize> = sampled.keys().copied().collect();
+    keys.sort_unstable();
+    for m in keys {
+        let (faces, colors) = &sampled[&m];
+        let (palette, index) = texture::quantize(colors, TEXTURE_COLORS);
+        for (&fi, &k) in faces.iter().zip(&index) {
+            out[fi] = Some(palette[k as usize]);
+        }
+    }
+    Some(out)
+}
+
+/// [`convert`] with textures: faces on a textured material that have texture coordinates
+/// are colored from the image (one color per face, approximate). Shapes are unchanged.
+pub fn convert_with<'a>(
+    doc: &'a ObjDocument,
+    materials: &Materials,
+    options: Options,
+) -> CadModel<'a> {
+    let palette = materials.palette;
     let mut diags = Diagnostics::default();
     note_dropped(doc, &mut diags);
     if palette.is_none() && !doc.materials.is_empty() {
@@ -475,14 +573,28 @@ pub fn convert<'a>(
     let keys: Vec<(u32, Option<[u8; 3]>)> = (0..doc.attrs.len() as u32)
         .map(|a| (layer_of_attr[a as usize], color_of_attr(a)))
         .collect();
+    let face_colors = texture_colors(doc, materials);
+    let texture_colored_faces = face_colors
+        .as_ref()
+        .map_or(0, |c| c.iter().filter(|x| x.is_some()).count() as u64);
+    if texture_colored_faces > 0 {
+        diags.push(Severity::Info, Code::TextureColors, 0, || {
+            format!(
+                "{texture_colored_faces} faces are colored from textures, at most {TEXTURE_COLORS} colors per texture (approximate)"
+            )
+        });
+    }
     // Source vertex -> (mesh, local index) for the first mesh that used it; vertices shared
     // with other meshes fall back to a map (rare: only on layer/material borders).
     let mut slot: Vec<(u32, u32)> = vec![(u32::MAX, 0); doc.positions.len()];
     let mut shared: HashMap<(u32, u32), u32> = HashMap::new();
-    let (mut last_attr, mut last_mi) = (u32::MAX, 0usize);
+    let (mut last_key, mut last_mi) = (None, 0usize);
     for (fi, face) in doc.faces.iter().enumerate() {
         let attr = doc.faces.attr[fi];
-        let key = keys[attr as usize];
+        let mut key = keys[attr as usize];
+        if let Some(c) = face_colors.as_ref().and_then(|c| c[fi]) {
+            key.1 = Some(c);
+        }
         if excluded.contains(&key.0) {
             omissions.excluded_faces += 1;
             face.iter().for_each(|&v| referenced[v as usize] = true);
@@ -491,7 +603,7 @@ pub fn convert<'a>(
         let full = meshes
             .get(last_mi)
             .is_some_and(|m| m.face_count() >= MAX_FACES_PER_MESH);
-        if attr != last_attr || full {
+        if last_key != Some(key) || full {
             last_mi = match open.get(&key) {
                 Some(&mi) if meshes[mi].face_count() < MAX_FACES_PER_MESH => mi,
                 _ => {
@@ -506,7 +618,7 @@ pub fn convert<'a>(
                     meshes.len() - 1
                 }
             };
-            last_attr = attr;
+            last_key = Some(key);
         }
         let mi = last_mi;
         let m = &mut meshes[mi];
@@ -585,7 +697,7 @@ pub fn convert<'a>(
             }
             points.push(PointEntity {
                 layer: layer_of_attr[attr as usize],
-                color: color_of_attr(attr),
+                color: vertex_rgb(doc, v).or_else(|| color_of_attr(attr)),
                 vertex: v,
             });
         }
@@ -611,7 +723,7 @@ pub fn convert<'a>(
                 if !used {
                     points.push(PointEntity {
                         layer,
-                        color: None,
+                        color: vertex_rgb(doc, v as u32),
                         vertex: v as u32,
                     });
                 }
@@ -648,11 +760,24 @@ pub fn convert<'a>(
         unreferenced_vertices: unreferenced,
         omissions,
         point_cloud,
+        texture_colored_faces,
     }
 }
 
 fn note_dropped(doc: &ObjDocument, d: &mut Diagnostics) {
     let c = &doc.counts;
+    // Points carry their vertex's color; faces and lines carry one color per entity.
+    let colors_lost = if c.vertices_with_color == 0 {
+        0
+    } else {
+        let mut seen = vec![false; doc.positions.len()];
+        for &v in doc.faces.indices.iter().chain(&doc.lines.indices) {
+            if doc.colors[v as usize].is_some() {
+                seen[v as usize] = true;
+            }
+        }
+        seen.iter().filter(|x| **x).count() as u64
+    };
     let drops: [(u64, Code, &str); 6] = [
         (
             c.texcoords,
@@ -675,9 +800,9 @@ fn note_dropped(doc: &ObjDocument, d: &mut Diagnostics) {
             "homogeneous vertex weights (w ≠ 1) were not written",
         ),
         (
-            c.vertices_with_color,
+            colors_lost,
             Code::VertexColorsDropped,
-            "per-vertex colors are not written yet",
+            "per-vertex colors on faces and lines are not written",
         ),
         (
             c.smoothing_statements,

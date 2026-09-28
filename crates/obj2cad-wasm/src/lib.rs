@@ -7,11 +7,12 @@
 
 mod preview;
 
+use obj2cad_core::bundle::{self, Bundle, InputFile};
 use obj2cad_core::hints::{self, Choices, Hints, UnitsSource};
-use obj2cad_core::mtl::Palette;
+use obj2cad_core::texture::Texture;
 use obj2cad_core::{
-    convert as to_cad, hash, mtl, parse_with_progress, report, CadModel, LayerMode, Meta,
-    ObjDocument, Options, ParseError, Units, UpAxis,
+    convert_with, hash, report, CadModel, LayerMode, Materials, Meta, Options, ParseError, Units,
+    UpAxis,
 };
 use preview::Preview;
 use serde::Deserialize;
@@ -112,41 +113,71 @@ fn settings_from(json: &str) -> Result<Settings, JsError> {
 
 // ---------------------------------------------------------------- session
 
-/// One loaded file: parsed once, converted as often as settings change.
+/// One loaded bundle (a model, or models, clouds, materials and textures): parsed once,
+/// converted as often as settings change.
 #[wasm_bindgen]
 pub struct Session {
-    doc: ObjDocument,
-    palette: Option<Palette>,
-    name: String,
-    stem: String,
-    source_len: u64,
-    source_sha: String,
+    /// Files added but not loaded yet.
+    pending: Vec<(String, Vec<u8>, String, Option<f64>)>,
+    bundle: Option<Bundle>,
     parse_ms: f64,
-    hints: Hints,
+    hints: Option<Hints>,
 }
 
-/// A parse failure as a plain JS object `{kind, line, message, issues, truncated}`.
-fn parse_error(e: &ParseError) -> JsValue {
+/// A parse failure as a plain JS object `{file, kind, line, message, issues, truncated}`.
+fn parse_error(file: &str, e: &ParseError) -> JsValue {
     let json = serde_json::json!({
-        "kind": e.kind, "line": e.line, "message": e.message, "issues": e.issues(), "truncated": e.truncated,
+        "file": file, "kind": e.kind, "line": e.line, "message": e.message, "issues": e.issues(), "truncated": e.truncated,
     });
     js_sys::JSON::parse(&json.to_string()).unwrap_or_else(|_| JsValue::from_str(&e.to_string()))
 }
 
+impl Default for Session {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[wasm_bindgen]
 impl Session {
-    /// Parse `obj`. `progress(done, total)` is called every few megabytes. Throws a plain
-    /// object `{kind, line, message, issues, truncated}` when the file can't be read
-    /// without guessing. `source_sha256` comes from the browser's native digest.
     #[wasm_bindgen(constructor)]
-    pub fn new(
-        obj: &[u8],
+    pub fn new() -> Session {
+        Session {
+            pending: Vec::new(),
+            bundle: None,
+            parse_ms: 0.0,
+            hints: None,
+        }
+    }
+
+    /// Add a file (`path` may include folders; `sha256` from the browser's native digest;
+    /// `modified` in Unix seconds, or a negative number when unknown).
+    pub fn add_file(&mut self, path: String, bytes: Vec<u8>, sha256: String, modified: f64) {
+        let modified = (modified >= 0.0).then_some(modified);
+        self.pending.push((path, bytes, sha256, modified));
+    }
+
+    /// Read everything added into one drawing. `name` names it when it holds several
+    /// models or clouds (a zip's or folder's name). `progress(done, total)` is called
+    /// every few megabytes. Throws a plain object `{file, kind, line, message, issues,
+    /// truncated}` when a file can't be read without guessing.
+    pub fn load(
+        &mut self,
         name: String,
-        source_sha256: String,
         progress: Option<js_sys::Function>,
-    ) -> Result<Session, JsValue> {
+    ) -> Result<(), JsValue> {
         let t = now();
-        let doc = parse_with_progress(obj, |done, total| {
+        let pending = std::mem::take(&mut self.pending);
+        let files = pending
+            .iter()
+            .map(|(path, bytes, sha, modified)| InputFile {
+                path: path.clone(),
+                bytes,
+                sha256: Some(sha.clone()),
+                modified: *modified,
+            })
+            .collect();
+        let bundle = bundle::load(files, &name, |done, total| {
             if let Some(f) = &progress {
                 let _ = f.call2(
                     &JsValue::NULL,
@@ -155,34 +186,26 @@ impl Session {
                 );
             }
         })
-        .map_err(|e| parse_error(&e))?;
-        let parse_ms = now() - t;
-        let hints = hints::hints(&doc);
-        let stem = name
-            .rsplit_once('.')
-            .map_or(name.as_str(), |(s, _)| s)
-            .to_owned();
-        Ok(Session {
-            doc,
-            palette: None,
-            stem,
-            name,
-            source_len: obj.len() as u64,
-            source_sha: source_sha256,
-            parse_ms,
-            hints,
-        })
+        .map_err(|e| parse_error(&e.file, &e.error))?;
+        self.parse_ms = now() - t;
+        self.hints = Some(hints::hints(&bundle.doc));
+        self.bundle = Some(bundle);
+        Ok(())
     }
 
-    /// Attach (or replace) the material library.
-    pub fn set_mtl(&mut self, mtl_bytes: &[u8]) {
-        self.palette = Some(mtl::parse(mtl_bytes));
+    fn loaded(&self) -> Result<(&Bundle, &Hints), JsError> {
+        match (&self.bundle, &self.hints) {
+            (Some(b), Some(h)) => Ok((b, h)),
+            _ => Err(JsError::new("nothing is loaded")),
+        }
     }
 
-    /// What was found in the file and what would be chosen automatically, as JSON.
-    pub fn inspect(&self) -> String {
-        let d = &self.doc;
-        serde_json::json!({
+    /// What was found and what would be chosen automatically, as JSON.
+    pub fn inspect(&self) -> Result<String, JsError> {
+        let (b, h) = self.loaded()?;
+        let d = &b.doc;
+        Ok(serde_json::json!({
+            "name": b.name,
             "vertices": d.positions.len(),
             "faces": d.faces.len(),
             "lines": d.lines.len(),
@@ -191,38 +214,58 @@ impl Session {
             "groups": d.groups.len(),
             "materials": d.materials,
             "mtllibs": d.mtllibs,
-            "hints": self.hints,
+            "files": b.files,
+            "hints": h,
             "parse_ms": self.parse_ms,
         })
-        .to_string()
+        .to_string())
     }
 
-    fn options(&self, s: &Settings) -> Options {
+    fn options(&self, s: &Settings) -> Result<Options, JsError> {
+        let (b, h) = self.loaded()?;
         let choices = Choices {
             units: s.units,
             default_units: s.default_units,
             up_axis: s.up_axis,
         };
-        let (units, up_axis) = hints::resolve(&self.hints, &choices);
-        Options {
+        let (units, up_axis) = hints::resolve(h, &choices);
+        Ok(Options {
             units,
             up_axis,
             layer_mode: s.layer_mode,
-            default_layer: self.stem.clone(),
+            default_layer: b.stem.clone(),
             keep_loose_points: s.keep_loose_points,
             exclude_layers: s.exclude_layers.clone(),
-        }
+        })
     }
 
-    fn model(&self, s: &Settings) -> CadModel<'_> {
-        to_cad(&self.doc, self.palette.as_ref(), self.options(s))
+    fn model(&self, s: &Settings) -> Result<CadModel<'_>, JsError> {
+        let (b, _) = self.loaded()?;
+        let textures = b
+            .textures
+            .iter()
+            .map(|(m, t)| {
+                (
+                    m.as_str(),
+                    Texture {
+                        image: &b.images[t.image],
+                        map: &t.map,
+                    },
+                )
+            })
+            .collect();
+        let materials = Materials {
+            palette: b.palette.as_ref(),
+            textures,
+        };
+        Ok(convert_with(&b.doc, &materials, self.options(s)?))
     }
 
     /// Step 1: the canonical bytes whose SHA-256 is the parity hash. The caller digests
     /// them natively. Only settings that move geometry change it (up axis, loose points,
     /// excluded layers), so callers can cache it across the others.
     pub fn parity_stream(&self, settings: &str) -> Result<Vec<u8>, JsError> {
-        Ok(hash::parity_stream(&self.model(&settings_from(settings)?)))
+        Ok(hash::parity_stream(&self.model(&settings_from(settings)?)?))
     }
 
     /// Step 2: convert and write. The file goes to `sink(chunk: Uint8Array)` in pieces of
@@ -236,7 +279,8 @@ impl Session {
     ) -> Result<Conversion, JsError> {
         let s = settings_from(settings)?;
         let t0 = now();
-        let model = self.model(&s);
+        let model = self.model(&s)?;
+        let (b, h) = self.loaded()?;
         let t1 = now();
 
         let exact = if model.omissions.is_partial() {
@@ -246,17 +290,17 @@ impl Session {
         };
         let mut props = vec![
             ("obj2cad.version", obj2cad_core::VERSION),
-            ("obj2cad.source_sha256", self.source_sha.as_str()),
+            ("obj2cad.source_sha256", b.source_sha256.as_str()),
             ("obj2cad.parity_hash", parity),
             ("obj2cad.parity", exact),
         ];
         if s.include_name {
-            props.push(("obj2cad.source_name", self.name.as_str()));
+            props.push(("obj2cad.source_name", b.name.as_str()));
         }
         let meta = Meta {
             properties: &props,
-            fingerprint_seed: &self.source_sha,
-            created_unix: s.created_unix,
+            fingerprint_seed: &b.source_sha256,
+            created_unix: b.modified.or(s.created_unix),
         };
         let mut out = JsSink {
             f: sink,
@@ -291,9 +335,10 @@ impl Session {
         let rep = report::build(
             &model,
             &report::Source {
-                name: &self.name,
-                len: self.source_len,
-                sha256: &self.source_sha,
+                name: &b.name,
+                len: b.source_len,
+                sha256: &b.source_sha256,
+                files: &b.files,
             },
             parity,
             report::Written {
@@ -311,7 +356,7 @@ impl Session {
         let units_from = if s.units.is_some() {
             "chosen"
         } else {
-            match self.hints.units_source {
+            match h.units_source {
                 UnitsSource::Exporter => "file",
                 _ if s.default_units.is_some() => "default",
                 UnitsSource::Size => "size",
@@ -323,8 +368,8 @@ impl Session {
             "units_from": units_from,
             "up_axis": model.options.up_axis,
             "up_from": if s.up_axis.is_some() { "chosen" } else { "detected" },
-            "detected_units": hints::resolve(&self.hints, &Choices { units: None, default_units: s.default_units, up_axis: None }).0,
-            "detected_up_axis": self.hints.up_axis,
+            "detected_units": hints::resolve(h, &Choices { units: None, default_units: s.default_units, up_axis: None }).0,
+            "detected_up_axis": h.up_axis,
         })
         .to_string();
         let timings = serde_json::json!({

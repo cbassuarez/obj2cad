@@ -2,13 +2,15 @@
 
 use obj2cad_core::hints::{self, Choices};
 use obj2cad_core::Meta;
-use obj2cad_core::{convert, mtl, parse, report, LayerMode, Options, Units, UpAxis};
+use obj2cad_core::{convert, parse, report, LayerMode, Options, Units, UpAxis};
 use obj2cad_dxf::Format;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 const USAGE: &str = "usage:
-  obj2cad convert <input.obj> [options]
+  obj2cad convert <inputs...> [options]
+      inputs: .obj, .xyz, .mtl, .jpg/.png files, folders or .zip files; together they
+      make one drawing (a lone .obj brings the .mtl and textures it names)
       -o <out>                   output file (default: input with .dxf; a .dwg name writes DWG)
       --format dxf|dxf-binary|dwg   ASCII DXF (default), binary DXF, or DWG (beta)
       --mtl <file.mtl>           materials (default: the mtllib next to the OBJ)
@@ -20,7 +22,7 @@ const USAGE: &str = "usage:
       --exclude-layer <name>     leave a layer out (repeatable)
       --report <file.json>       report path (default: <out>.report.json)
       --quiet
-  obj2cad inspect <input.obj>    detected units and up direction
+  obj2cad inspect <inputs...>    detected units and up direction
   obj2cad dwg-dump <file.dwg>    a DWG's geometry as JSON (exact bit patterns; for tests)
   obj2cad bench [--synthetic N] [--runs R] [--json] [files.obj...]
   obj2cad synth <n> <out.obj>    write an n×n synthetic terrain (for tests)
@@ -78,10 +80,12 @@ fn run(args: Vec<String>) -> Result<(), String> {
         Some("convert") => convert_cmd(it.collect()),
         Some("bench") => bench(it.collect()),
         Some("inspect") => {
-            let path = it.next().ok_or(USAGE)?;
-            let src = std::fs::read(&path).map_err(|e| format!("{path}: {e}"))?;
-            let doc = parse(&src).map_err(|e| format!("{path}: {e}"))?;
-            let h = hints::hints(&doc);
+            let inputs: Vec<PathBuf> = it.map(PathBuf::from).collect();
+            if inputs.is_empty() {
+                return Err(USAGE.into());
+            }
+            let (bundle, _) = load_inputs(&inputs, None, "dxf")?;
+            let h = hints::hints(&bundle.doc);
             println!("{}", serde_json::to_string_pretty(&h).expect("serializes"));
             Ok(())
         }
@@ -104,8 +108,213 @@ fn run(args: Vec<String>) -> Result<(), String> {
     }
 }
 
+/// A file for the bundle, with its modification time (Unix seconds).
+struct Gathered {
+    path: String,
+    bytes: Vec<u8>,
+    modified: Option<f64>,
+}
+
+fn modified(meta: &std::fs::Metadata) -> Option<f64> {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as f64)
+}
+
+/// Hidden files and macOS archive metadata are never part of a bundle.
+fn hidden(path: &str) -> bool {
+    path.split(['/', '\\'])
+        .any(|p| p.starts_with('.') || p == "__MACOSX")
+}
+
+fn read_file(path: &Path, as_name: String, out: &mut Vec<Gathered>) -> Result<(), String> {
+    let meta = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    out.push(Gathered {
+        path: as_name,
+        bytes,
+        modified: modified(&meta),
+    });
+    Ok(())
+}
+
+fn read_dir(root: &Path, dir: &Path, out: &mut Vec<Gathered>) -> Result<(), String> {
+    let mut entries: Vec<_> = std::fs::read_dir(dir)
+        .map_err(|e| format!("{}: {e}", dir.display()))?
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .collect();
+    entries.sort();
+    for p in entries {
+        let rel = p
+            .strip_prefix(root)
+            .unwrap_or(&p)
+            .to_string_lossy()
+            .replace('\\', "/");
+        if hidden(&rel) {
+            continue;
+        }
+        if p.is_dir() {
+            read_dir(root, &p, out)?;
+        } else {
+            read_file(&p, rel, out)?;
+        }
+    }
+    Ok(())
+}
+
+fn read_zip(path: &Path, out: &mut Vec<Gathered>) -> Result<(), String> {
+    use std::io::Read;
+    let err = |e: &dyn std::fmt::Display| format!("{}: {e}", path.display());
+    let file = std::fs::File::open(path).map_err(|e| err(&e))?;
+    // Entries take the archive's date, as in the web app.
+    let when = file.metadata().ok().as_ref().and_then(modified);
+    let mut zip = zip::ZipArchive::new(file).map_err(|e| err(&e))?;
+    for i in 0..zip.len() {
+        let mut entry = zip.by_index(i).map_err(|e| err(&e))?;
+        let name = entry.name().to_owned();
+        if entry.is_dir() || hidden(&name) || !obj2cad_core::bundle::is_supported(&name) {
+            continue;
+        }
+        let mut bytes = Vec::with_capacity(entry.size() as usize);
+        entry
+            .read_to_end(&mut bytes)
+            .map_err(|e| format!("{}: {name}: {e}", path.display()))?;
+        out.push(Gathered {
+            path: name,
+            bytes,
+            modified: when,
+        });
+    }
+    Ok(())
+}
+
+/// A model on its own brings the files it names from next to it: its material
+/// libraries, and their texture images.
+fn read_companions(
+    model: &Path,
+    explicit_mtl: Option<&Path>,
+    out: &mut Vec<Gathered>,
+) -> Result<(), String> {
+    let have = |out: &Vec<Gathered>, p: &str| {
+        let b = obj2cad_core::bundle::base_name(p).to_lowercase();
+        out.iter()
+            .any(|g| obj2cad_core::bundle::base_name(&g.path).to_lowercase() == b)
+    };
+    let src = &out.last().expect("the model was just read").bytes;
+    let dir = model.parent().unwrap_or(Path::new("."));
+    let mut libs: Vec<PathBuf> = explicit_mtl.map(Path::to_path_buf).into_iter().collect();
+    if libs.is_empty() {
+        for line in String::from_utf8_lossy(src).lines() {
+            if let Some(rest) = line.trim().strip_prefix("mtllib") {
+                if rest.starts_with(char::is_whitespace) {
+                    libs.push(dir.join(rest.trim()));
+                    libs.extend(rest.split_whitespace().map(|t| dir.join(t)));
+                }
+            }
+        }
+    }
+    for lib in libs {
+        let name = lib
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if !lib.is_file() || have(out, &name) {
+            continue;
+        }
+        read_file(&lib, name, out)?;
+        let text = String::from_utf8_lossy(&out.last().expect("just read").bytes).into_owned();
+        let lib_dir = lib.parent().unwrap_or(Path::new("."));
+        for t in obj2cad_core::mtl::parse_library(text.as_bytes())
+            .textures
+            .values()
+        {
+            let img = lib_dir.join(t.file.replace('\\', "/"));
+            let name = obj2cad_core::bundle::base_name(&t.file).to_owned();
+            if img.is_file() && !have(out, &name) {
+                read_file(&img, name, out)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Read every input (files, folders, zips) into one bundle, and the default
+/// output path for a single folder or zip (empty otherwise).
+fn load_inputs(
+    inputs: &[PathBuf],
+    mtl_path: Option<&Path>,
+    extension: &str,
+) -> Result<(obj2cad_core::bundle::Bundle, PathBuf), String> {
+    let mut gathered: Vec<Gathered> = Vec::new();
+    for input in inputs {
+        let is_zip = input
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("zip"));
+        if input.is_dir() {
+            read_dir(input, input, &mut gathered)?;
+        } else if is_zip {
+            read_zip(input, &mut gathered)?;
+        } else {
+            let name = input
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            read_file(input, name, &mut gathered)?;
+            if inputs.len() == 1
+                && input
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("obj"))
+            {
+                read_companions(input, mtl_path, &mut gathered)?;
+            }
+        }
+    }
+    if let (Some(m), true) = (mtl_path, inputs.len() > 1) {
+        let name = m
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        read_file(m, name, &mut gathered)?;
+    }
+    // A folder or zip names the drawing; loose files are named after their first model.
+    let (bundle_name, default_out) = match inputs {
+        [one]
+            if one.is_dir()
+                || one
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("zip")) =>
+        {
+            let n = one
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            (n, one.with_extension(extension))
+        }
+        _ => (String::new(), PathBuf::new()),
+    };
+    let files = gathered
+        .iter()
+        .map(|g| obj2cad_core::bundle::InputFile {
+            path: g.path.clone(),
+            bytes: &g.bytes,
+            sha256: None,
+            modified: g.modified,
+        })
+        .collect();
+    let bundle = obj2cad_core::bundle::load(files, &bundle_name, |_, _| {}).map_err(|e| {
+        let mut msg = e.to_string();
+        for issue in e.error.more.iter() {
+            msg.push_str(&format!("\n  line {}: {}", issue.line, issue.message));
+        }
+        msg
+    })?;
+    Ok((bundle, default_out))
+}
+
 fn convert_cmd(args: Vec<String>) -> Result<(), String> {
-    let (mut input, mut output, mut mtl_path, mut report_path) = (None, None, None, None);
+    let (mut inputs, mut output, mut mtl_path, mut report_path) = (Vec::new(), None, None, None);
     let mut choices = Choices::default();
     let (mut format, mut layer_mode, mut keep_loose, mut exclude, mut quiet) =
         (None, LayerMode::Objects, false, Vec::new(), false);
@@ -153,64 +362,63 @@ fn convert_cmd(args: Vec<String>) -> Result<(), String> {
             "--keep-loose-points" => keep_loose = true,
             "--exclude-layer" => exclude.push(val()?),
             "--quiet" => quiet = true,
-            _ if input.is_none() && !a.starts_with('-') => input = Some(PathBuf::from(a)),
+            _ if !a.starts_with('-') => inputs.push(PathBuf::from(a)),
             _ => return Err(format!("unexpected argument `{a}`\n{USAGE}")),
         }
     }
-    let input = input.ok_or(USAGE)?;
+    if inputs.is_empty() {
+        return Err(USAGE.into());
+    }
     // Without --format, an output named *.dwg means DWG.
     let format = format.unwrap_or(match &output {
         Some(o) if o.extension().is_some_and(|e| e.eq_ignore_ascii_case("dwg")) => OutFormat::Dwg,
         _ => OutFormat::Dxf(Format::Ascii),
     });
-    let output = output.unwrap_or_else(|| input.with_extension(format.extension()));
 
-    let src = std::fs::read(&input).map_err(|e| format!("{}: {e}", input.display()))?;
-    let doc = parse(&src).map_err(|e| {
-        let mut msg = format!("{}: {e}", input.display());
-        for issue in e.more.iter() {
-            msg.push_str(&format!("\n  line {}: {}", issue.line, issue.message));
+    let (bundle, default_out) = load_inputs(&inputs, mtl_path.as_deref(), format.extension())?;
+    let output = output.unwrap_or_else(|| {
+        if default_out.as_os_str().is_empty() {
+            let first = &inputs[0];
+            first.with_file_name(format!("{}.{}", bundle.stem, format.extension()))
+        } else {
+            default_out
         }
-        msg
-    })?;
-
-    // MTL: explicit, else the first `mtllib` found next to the OBJ.
-    let mtl_path = mtl_path.or_else(|| {
-        let dir = input.parent().unwrap_or(Path::new("."));
-        doc.mtllibs
-            .iter()
-            .map(|m| dir.join(m))
-            .find(|p| p.is_file())
     });
-    let palette = match &mtl_path {
-        Some(p) => Some(mtl::parse(
-            &std::fs::read(p).map_err(|e| format!("{}: {e}", p.display()))?,
-        )),
-        None => None,
+    let doc = &bundle.doc;
+    let images_by_material: std::collections::HashMap<&str, obj2cad_core::texture::Texture> =
+        bundle
+            .textures
+            .iter()
+            .map(|(m, t)| {
+                (
+                    m.as_str(),
+                    obj2cad_core::texture::Texture {
+                        image: &bundle.images[t.image],
+                        map: &t.map,
+                    },
+                )
+            })
+            .collect();
+    let materials = obj2cad_core::Materials {
+        palette: bundle.palette.as_ref(),
+        textures: images_by_material,
     };
 
-    let h = hints::hints(&doc);
+    let h = hints::hints(doc);
     let (units, up_axis) = hints::resolve(&h, &choices);
-    let stem = input
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
     let options = Options {
         units,
         up_axis,
         layer_mode,
-        default_layer: stem,
+        default_layer: bundle.stem.clone(),
         keep_loose_points: keep_loose,
         exclude_layers: exclude,
     };
-    let model = convert(&doc, palette.as_ref(), options);
+    let model = obj2cad_core::convert_with(doc, &materials, options);
 
-    let source_sha = obj2cad_core::hash::sha256_hex(&src);
+    let source_sha = bundle.source_sha256.clone();
     let parity = obj2cad_core::hash::parity_hash(&model);
-    let name = input
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
+    let name = bundle.name.clone();
     let props = [
         ("obj2cad.version", obj2cad_core::VERSION),
         ("obj2cad.source_sha256", source_sha.as_str()),
@@ -225,11 +433,8 @@ fn convert_cmd(args: Vec<String>) -> Result<(), String> {
         ),
         ("obj2cad.source_name", name.as_str()),
     ];
-    let created_unix = std::fs::metadata(&input)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as f64);
+    // The newest file that went into the drawing dates it.
+    let created_unix = bundle.modified;
     let meta = Meta {
         properties: &props,
         fingerprint_seed: &source_sha,
@@ -245,8 +450,9 @@ fn convert_cmd(args: Vec<String>) -> Result<(), String> {
         &model,
         &report::Source {
             name: &name,
-            len: src.len() as u64,
+            len: bundle.source_len,
             sha256: &source_sha,
+            files: &bundle.files,
         },
         &parity,
         report::Written {
@@ -273,7 +479,7 @@ fn convert_cmd(args: Vec<String>) -> Result<(), String> {
         };
         eprintln!(
             "{} → {}  ({} faces, {} entities, parity {})\n  units: {unit_name}{}\n  up: {up}{}",
-            input.display(),
+            name,
             output.display(),
             rep.output.faces,
             rep.output.mesh_entities + rep.output.polylines + rep.output.points,

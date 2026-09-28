@@ -11,6 +11,9 @@ rust-version.workspace = true
 serde.workspace = true
 sha2.workspace = true
 memchr = "2"
+# Texture images, decoded the same way in the CLI and the browser.
+jpeg-decoder = { version = "0.3", default-features = false }
+png = "0.18"
 
 [dev-dependencies]
 proptest = "1"
