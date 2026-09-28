@@ -20,6 +20,8 @@ use std::borrow::Cow;
 use std::io::{self, Write};
 
 const TEMPLATE: &str = include_str!("../templates/r2018.dxf");
+/// The ACDSDATA section's schemas (ACIS data storage, DXF R2013+).
+const ACDSDATA: &str = include_str!("../templates/acdsdata.dxf");
 /// Handles used by the template that new records refer to.
 const MODEL_SPACE_RECORD: &str = "17";
 const LAYER_TABLE: &str = "1";
@@ -136,6 +138,8 @@ fn kind(code: i32) -> Kind {
 
 struct Out<'w> {
     format: Format,
+    /// ACIS data per surface entity handle, for the ACDSDATA section.
+    acds: Vec<(String, Vec<u8>)>,
     buf: Vec<u8>,
     sink: &'w mut dyn Write,
     written: u64,
@@ -213,6 +217,24 @@ impl Out<'_> {
                 self.buf.extend_from_slice(b"\r\n");
             }
             Format::Binary => self.buf.extend_from_slice(&value.to_le_bytes()),
+        }
+    }
+
+    /// Binary data (at most 127 bytes per group, as DXF readers expect).
+    fn bytes(&mut self, code: i32, data: &[u8]) {
+        debug_assert!(data.len() <= 127);
+        self.code(code);
+        match self.format {
+            Format::Ascii => {
+                for b in data {
+                    let _ = write!(self.buf, "{b:02X}");
+                }
+                self.buf.extend_from_slice(b"\r\n");
+            }
+            Format::Binary => {
+                self.buf.push(data.len() as u8);
+                self.buf.extend_from_slice(data);
+            }
         }
     }
 
@@ -344,6 +366,7 @@ fn handles_needed(model: &CadModel) -> u64 {
             .map(|l| 2 + l.vertices.len() as u64)
             .sum::<u64>()
         + model.points.len() as u64
+        + model.surfaces.len() as u64
 }
 
 /// Write `model` as DXF R2018 to `sink`. Returns the number of bytes written.
@@ -355,6 +378,7 @@ pub fn write_to(
 ) -> io::Result<u64> {
     let mut out = Out {
         format,
+        acds: Vec::new(),
         buf: Vec::with_capacity(CHUNK + 4096),
         sink,
         written: 0,
@@ -461,7 +485,34 @@ pub fn write_to(
                     out.str(347, GLOBAL_MATERIAL);
                 }
             }
-            Chunk::Marker("ENTITIES") => entities(&mut out, model)?,
+            Chunk::Marker("ENTITIES") => entities(&mut out, model, meta)?,
+            Chunk::Marker("CLASSES") => {
+                if model.surfaces.iter().any(|s| !s.body.solid) {
+                    out.template(
+                        "  0\nCLASS\n  1\nSURFACE\n  2\nAcDbSurface\n  3\nObjectDBX Classes\n 90\n4095\n 91\n0\n280\n0\n281\n1\n",
+                    );
+                }
+            }
+            Chunk::Marker("ACDSDATA") => {
+                if !out.acds.is_empty() {
+                    out.template(ACDSDATA);
+                    for (handle, sab) in std::mem::take(&mut out.acds) {
+                        out.str(0, "ACDSRECORD");
+                        out.int(90, 1);
+                        out.str(2, "AcDbDs::ID");
+                        out.int(280, 10);
+                        out.str(320, &handle);
+                        out.str(2, "ASM_Data");
+                        out.int(280, 15);
+                        out.int(94, sab.len() as i64);
+                        for chunk in sab.chunks(127) {
+                            out.bytes(310, chunk);
+                        }
+                        out.maybe_flush()?;
+                    }
+                    out.str(0, "ENDSEC");
+                }
+            }
             Chunk::Marker(other) => unreachable!("unknown template marker {other}"),
         }
         out.maybe_flush()?;
@@ -475,7 +526,7 @@ pub fn write_to(
     Ok(out.written)
 }
 
-fn entities(out: &mut Out, model: &CadModel) -> io::Result<()> {
+fn entities(out: &mut Out, model: &CadModel, meta: &Meta) -> io::Result<()> {
     for m in &model.meshes {
         let layer = &model.layers[m.layer as usize].name;
         out.entity_head("MESH", MODEL_SPACE_RECORD, layer, m.color);
@@ -525,6 +576,30 @@ fn entities(out: &mut Out, model: &CadModel) -> io::Result<()> {
         out.entity_head("POINT", MODEL_SPACE_RECORD, layer, p.color);
         out.str(100, "AcDbPoint");
         out.xyz(model, p.vertex);
+        out.maybe_flush()?;
+    }
+    // Curved surfaces: the ACIS data goes to the ACDSDATA section, keyed by handle.
+    let product = format!("obj2cad {}", obj2cad_core::VERSION);
+    for s in &model.surfaces {
+        let layer = &model.layers[s.layer as usize].name;
+        let kind = if s.body.solid { "3DSOLID" } else { "SURFACE" };
+        let h = out.entity_head(kind, MODEL_SPACE_RECORD, layer, s.color);
+        out.str(100, "AcDbModelerGeometry");
+        out.int(290, 1);
+        out.str(
+            2,
+            &obj2cad_core::output::guid(&format!("acis:{}:{h}", meta.fingerprint_seed)),
+        );
+        if s.body.solid {
+            out.str(100, "AcDb3dSolid");
+            out.str(350, "0");
+        } else {
+            out.str(100, "AcDbSurface");
+            out.int(71, 6);
+            out.int(72, 6);
+        }
+        let sab = obj2cad_acis::sab::write(&s.body, &product, meta.created_unix.unwrap_or(0.0));
+        out.acds.push((h, sab));
         out.maybe_flush()?;
     }
     Ok(())

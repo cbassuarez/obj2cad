@@ -56,6 +56,7 @@ jobs:
           ./target/release/obj2cad synth 818 big_terrain.obj
           ./target/release/obj2cad convert big_terrain.obj -o acceptance/dxf/big_terrain.dxf --quiet
           ./target/release/obj2cad convert big_terrain.obj -o acceptance/dwg/big_terrain.dwg --quiet
+          ./target/release/obj2cad acis-samples acceptance/acis
       - name: Upload AutoCAD acceptance files
         if: matrix.os == 'ubuntu-latest'
         uses: actions/upload-artifact@v4

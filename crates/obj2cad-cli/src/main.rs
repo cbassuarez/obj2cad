@@ -26,6 +26,7 @@ const USAGE: &str = "usage:
   obj2cad dwg-dump <file.dwg>    a DWG's geometry as JSON (exact bit patterns; for tests)
   obj2cad bench [--synthetic N] [--runs R] [--json] [files.obj...]
   obj2cad synth <n> <out.obj>    write an n×n synthetic terrain (for tests)
+  obj2cad acis-samples <dir>     ACIS test bodies as DXF, binary DXF and DWG (AutoCAD acceptance)
   obj2cad --version";
 
 fn main() -> ExitCode {
@@ -94,6 +95,10 @@ fn run(args: Vec<String>) -> Result<(), String> {
             let bytes = std::fs::read(&path).map_err(|e| format!("{path}: {e}"))?;
             println!("{}", dwg_dump(bytes).map_err(|e| format!("{path}: {e}"))?);
             Ok(())
+        }
+        Some("acis-samples") => {
+            let dir = PathBuf::from(it.next().ok_or(USAGE)?);
+            acis_samples(&dir)
         }
         Some("synth") => {
             let n: usize = it.next().and_then(|v| v.parse().ok()).ok_or(USAGE)?;
@@ -509,6 +514,7 @@ fn dwg_dump(bytes: Vec<u8>) -> Result<String, String> {
         other => json!(format!("{other:?}")),
     };
     let bits = |v: &Vector3| [v.x, v.y, v.z].map(|c| format!("{:016x}", c.to_bits()));
+    let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
     let entities: Vec<Value> = doc
         .entities()
         .map(|e| match e {
@@ -523,6 +529,14 @@ fn dwg_dump(bytes: Vec<u8>) -> Result<String, String> {
             }),
             EntityType::Point(p) => json!({
                 "t": "point", "layer": p.common.layer, "color": color(&p.common.color), "v": [bits(&p.location)],
+            }),
+            EntityType::Surface(x) => json!({
+                "t": "surface", "layer": x.common.layer, "color": color(&x.common.color),
+                "sab": hex(&x.acis_data.sab_data), "sat": x.acis_data.sat_data,
+            }),
+            EntityType::Solid3D(x) => json!({
+                "t": "solid", "layer": x.common.layer, "color": color(&x.common.color),
+                "sab": hex(&x.acis_data.sab_data), "sat": x.acis_data.sat_data,
             }),
             other => json!({ "t": format!("{:?}", std::mem::discriminant(other)) }),
         })
@@ -647,6 +661,50 @@ fn bench(args: Vec<String>) -> Result<(), String> {
             "{}",
             serde_json::to_string_pretty(&rows).expect("serializes")
         );
+    }
+    Ok(())
+}
+
+/// Small bodies with known answers (plane, box, cylinder, cone, sphere, torus), written
+/// as they would be for a recognized surface, for checking in AutoCAD.
+fn acis_samples(dir: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let doc = parse(b"").map_err(|e| e.to_string())?;
+    for (name, body) in obj2cad_acis::samples::all() {
+        body.validate(1e-9).map_err(|e| format!("{name}: {e}"))?;
+        let mut model = convert(&doc, None, Options::default());
+        model.layers.push(obj2cad_core::convert::Layer {
+            name: "Curves".into(),
+            source: String::new(),
+            color: obj2cad_core::convert::layer_color(1),
+        });
+        model.surfaces.push(obj2cad_core::convert::SurfaceEntity {
+            layer: 1,
+            color: None,
+            body,
+        });
+        let props = [
+            ("obj2cad.version", obj2cad_core::VERSION),
+            ("obj2cad.sample", name),
+        ];
+        let meta = Meta {
+            properties: &props,
+            fingerprint_seed: name,
+            created_unix: Some(1_790_000_000.0),
+        };
+        let write = |ext: &str, bytes: Vec<u8>| {
+            let p = dir.join(format!("{name}{ext}"));
+            std::fs::write(&p, bytes).map_err(|e| format!("{}: {e}", p.display()))
+        };
+        write(".dxf", obj2cad_dxf::write(&model, &meta, Format::Ascii))?;
+        write(
+            ".binary.dxf",
+            obj2cad_dxf::write(&model, &meta, Format::Binary),
+        )?;
+        write(
+            ".dwg",
+            obj2cad_dwg::write(&model, &meta).map_err(|e| e.to_string())?,
+        )?;
     }
     Ok(())
 }

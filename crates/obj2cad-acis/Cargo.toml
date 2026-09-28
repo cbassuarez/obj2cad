@@ -1,6 +1,6 @@
 [package]
-name = "obj2cad-dxf"
-description = "Exact DXF writer for obj2cad"
+name = "obj2cad-acis"
+description = "Minimal ACIS B-rep writer (SAT and SAB) for obj2cad's curved surfaces"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,7 +8,3 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-obj2cad-core.workspace = true
-obj2cad-acis.workspace = true
-ryu.workspace = true
-itoa = "1"

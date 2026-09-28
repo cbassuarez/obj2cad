@@ -9,5 +9,6 @@ rust-version.workspace = true
 
 [dependencies]
 obj2cad-core.workspace = true
+obj2cad-acis.workspace = true
 # Patched through [patch.crates-io] in the workspace root: tools/vendor/fetch_acadrust.py.
 acadrust = { version = "=0.5.5", default-features = false }

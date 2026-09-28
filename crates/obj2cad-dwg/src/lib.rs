@@ -8,7 +8,9 @@
 //! The drawing mirrors the DXF writer: the same layers and colors, the same entities
 //! (MESH, 3D POLYLINE, POINT), units, dates, custom properties and opening view.
 
-use acadrust::entities::{Mesh, MeshFace, Point, Polyline3D, Vertex3DPolyline};
+use acadrust::entities::solid3d::AcisData;
+use acadrust::entities::surface::SurfaceKind;
+use acadrust::entities::{Mesh, MeshFace, Point, Polyline3D, Solid3D, Surface, Vertex3DPolyline};
 use acadrust::tables::TableEntry;
 use acadrust::{CadDocument, Color, DwgWriter, DxfVersion, EntityType, Layer, Vector2, Vector3};
 use obj2cad_core::convert::CadModel;
@@ -122,6 +124,28 @@ pub fn document(model: &CadModel, meta: &Meta) -> Result<CadDocument, Error> {
         point.location = v3(model.position(p.vertex));
         doc.add_entity(EntityType::Point(point)).map_err(fail)?;
     }
+    // Curved surfaces: SAB, which acadrust stores in the AcDs section (R2013+).
+    let product = format!("obj2cad {}", obj2cad_core::VERSION);
+    for s in &model.surfaces {
+        let sab = obj2cad_acis::sab::write(&s.body, &product, meta.created_unix.unwrap_or(0.0));
+        let layer = model.layers[s.layer as usize].name.clone();
+        let entity = if s.body.solid {
+            let mut e = Solid3D::new();
+            e.common.layer = layer;
+            e.common.color = color(s.color);
+            e.acis_data = AcisData::from_sab(sab);
+            EntityType::Solid3D(e)
+        } else {
+            let mut e = Surface::new(SurfaceKind::Generic);
+            e.common.layer = layer;
+            e.common.color = color(s.color);
+            e.acis_data = AcisData::from_sab(sab);
+            e.u_isolines = 6;
+            e.v_isolines = 6;
+            EntityType::Surface(e)
+        };
+        doc.add_entity(entity).map_err(fail)?;
+    }
     Ok(doc)
 }
 
@@ -135,6 +159,20 @@ mod tests {
     use super::*;
     use acadrust::DwgReader;
     use obj2cad_core::{convert, parse, Options, UpAxis};
+
+    /// acadrust's own SAB reader accepts every sample body, and finds every pointer valid.
+    #[test]
+    fn acis_samples_read_back_with_acadrust() {
+        use acadrust::entities::acis::SabReader;
+        for (name, body) in obj2cad_acis::samples::all() {
+            let sab = obj2cad_acis::sab::write(&body, "obj2cad", 0.0);
+            let sat = SabReader::read(&sab).unwrap_or_else(|e| panic!("{name}: {e:?}"));
+            let errors = sat.validate();
+            assert!(errors.is_empty(), "{name}: {errors:?}");
+            assert_eq!(sat.faces().len(), body.faces.len(), "{name}");
+            assert_eq!(sat.edges().len(), body.edges.len(), "{name}");
+        }
+    }
 
     const META: Meta = Meta {
         properties: &[("obj2cad.parity", "exact")],

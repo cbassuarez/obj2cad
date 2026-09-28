@@ -189,6 +189,15 @@ pub struct PolylineEntity {
     pub vertices: Vec<u32>,
 }
 
+/// A curved surface (or solid) recognized in the mesh, as an ACIS body. Written next to
+/// the exact mesh, never instead of it.
+#[derive(Debug, Clone)]
+pub struct SurfaceEntity {
+    pub layer: u32,
+    pub color: Option<[u8; 3]>,
+    pub body: obj2cad_acis::Body,
+}
+
 #[derive(Debug, Clone)]
 pub struct PointEntity {
     pub layer: u32,
@@ -227,6 +236,8 @@ pub struct CadModel<'a> {
     pub meshes: Vec<MeshEntity>,
     pub polylines: Vec<PolylineEntity>,
     pub points: Vec<PointEntity>,
+    /// Curved surfaces recognized in the mesh (empty unless requested).
+    pub surfaces: Vec<SurfaceEntity>,
     /// Parser diagnostics plus everything conversion could not carry over.
     pub diagnostics: Vec<Diagnostic>,
     pub unreferenced_vertices: u64,
@@ -293,6 +304,15 @@ impl CadModel<'_> {
         }
         for p in &self.points {
             take(p.vertex);
+        }
+        for s in &self.surfaces {
+            if let Some((a, b)) = s.body.bounds() {
+                for axis in 0..3 {
+                    lo[axis] = lo[axis].min(a[axis]);
+                    hi[axis] = hi[axis].max(b[axis]);
+                }
+                any = true;
+            }
         }
         any.then_some((lo, hi))
     }
@@ -756,6 +776,7 @@ pub fn convert_with<'a>(
         meshes,
         polylines,
         points,
+        surfaces: Vec::new(),
         diagnostics,
         unreferenced_vertices: unreferenced,
         omissions,
