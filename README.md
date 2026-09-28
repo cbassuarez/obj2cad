@@ -2,7 +2,7 @@
 
 Convert Wavefront OBJ to DWG/DXF **without changing a single bit of geometry**.
 
-**Use it: https://cbassuarez.github.io/obj2cad/** (runs entirely in your browser; files are
+**Use it: https://cbassuarez.com/obj2cad/** (runs entirely in your browser; files are
 never uploaded; installable and works offline).
 
 > Status: pre-release (see [the plan](docs/PLAN.md)). DXF output works and is verified;
@@ -66,10 +66,10 @@ Commits follow [Conventional Commits](https://www.conventionalcommits.org/). rel
 keeps a release PR open with the changelog and version bump; merging it tags the release,
 re-runs all verification, and deploys to GitHub Pages:
 
-- `https://cbassuarez.github.io/obj2cad/`: latest version. Installable as an app, works
+- `https://cbassuarez.com/obj2cad/`: latest version. Installable as an app, works
   offline, and shows **"A new version is ready → Reload"** when an update lands. It never
   reloads on its own.
-- `https://cbassuarez.github.io/obj2cad/v/<version>/`: every release stays available,
+- `https://cbassuarez.com/obj2cad/v/<version>/`: every release stays available,
   unchanged, so any past conversion can be reproduced with the exact engine that made it
   (the version is stored in each file's properties).
 

@@ -1,7 +1,8 @@
 name: Release
 
 # Merging the release PR (opened by release-please from conventional commits) tags a
-# version; this workflow then verifies, builds and deploys it to GitHub Pages:
+# version; this workflow then verifies, builds, commits the site to the gh-pages branch and
+# publishes it with the Pages workflow:
 #   /obj2cad/            latest version (installable PWA, auto-updates with a prompt)
 #   /obj2cad/v/<ver>/    a pinned, never-changing copy of every release
 on:
@@ -13,6 +14,7 @@ permissions:
   pull-requests: write
   id-token: write
   attestations: write
+  pages: write
 
 jobs:
   release-please:
@@ -105,3 +107,11 @@ jobs:
       - uses: actions/attest-build-provenance@v2
         with:
           subject-path: obj2cad-web-${{ env.VERSION }}.tar.gz
+
+  pages:
+    needs: deploy
+    uses: ./.github/workflows/pages.yml
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
