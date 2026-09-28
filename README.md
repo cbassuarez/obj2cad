@@ -6,7 +6,7 @@ Convert Wavefront OBJ to DWG/DXF **without changing a single bit of geometry**.
 never uploaded; installable and works offline).
 
 > Status: pre-release (see [the plan](docs/PLAN.md)). DXF (ASCII and binary) is verified;
-> DWG is in beta until it passes AutoCAD acceptance. Curve reconstruction is next.
+> DWG and curved surfaces are in beta until they pass AutoCAD acceptance.
 
 ## What "exact" means here
 
@@ -25,6 +25,38 @@ Every conversion writes a `*.report.json` with input/output SHA-256, a canonical
 **parity hash** of the geometry, the layer map, and all notes. The parity hash is also
 stored in the drawing's custom properties (`DWGPROPS` in AutoCAD), so any file can be
 traced back to its source.
+
+## What goes in
+
+A model (`.obj`), or a bundle: a `.zip`, a folder, or several files with the model's
+material libraries (`.mtl`), texture images (`.jpg`, `.png`) and point clouds (`.xyz`).
+Files are matched by name, ignoring folders and case, and a bundle becomes one drawing
+(scan bundles share coordinates). The report lists every file as used, not used or
+missing.
+
+- **Point clouds** (`.xyz`): each point becomes a CAD point with its exact coordinate
+  text, and RGB columns become its color. Column layouts that could mean two things
+  (colors or normals) are rejected, not guessed.
+- **Textures** color faces, one color per face and at most 32 per texture, sampled with the
+  same decoder in the browser and the command-line tool. The shapes stay exact; the
+  colors are labeled approximate.
+- **Free-form curves** in the OBJ (`curv`, B-spline or Bézier) become exact splines: the
+  control points are the OBJ's vertices, the knots and weights its own numbers.
+
+## Curved surfaces (optional)
+
+A mesh exported from CAD has its vertices on the original surfaces. With curved
+surfaces turned on (`--curves`, or the download menu), obj2cad looks for regions whose
+**every vertex lies on one cylinder, cone, sphere or torus within the precision the file
+writes it with** (a coordinate written `1.234560` is known to ±0.5e-6; never looser than a
+millionth of the model's size), whose faces hug that surface the way a tessellation does,
+and whose boundary is lines and circles on it. Each becomes an ACIS surface on a
+"Curves" layer, **next to the unchanged mesh**; the parity hash still covers the mesh.
+Anything that doesn't pass stays faceted: nothing is approximated to make a surface fit.
+Scans are noisier than their stated precision, so they rarely have such regions.
+
+The report lists each surface with the source faces it came from; the harness re-checks
+every one of their vertices against the surface read back from the file.
 
 ## Automatic choices
 
@@ -49,7 +81,12 @@ default, so the same file gives the same drawing (byte for byte) in both;
 its own OBJ reader, a DXF read-back through [ezdxf](https://github.com/mozman/ezdxf)
 (with ezdxf's audit) or a DWG read-back through acadrust's reader, a three-way
 parity-hash match (Rust source ↔ Python source ↔ read-back), and every element's layer
-and color. CI runs it on Windows, macOS and Linux for every axis mode and output format.
+and color. With `--curves` it also re-checks every recognized surface. CI runs it on
+Windows, macOS and Linux for every axis mode and output format.
+
+ACIS output (the surface data inside the drawing) is read back by two independent
+readers, ezdxf and acadrust. `obj2cad acis-samples DIR` writes known bodies (plane, box,
+cylinder, cone, sphere, torus) for checking in AutoCAD.
 
 The web app has browser tests (`web/e2e`, Playwright) on the built site: every fixture is
 opened, downloaded in each format, and must be byte-identical to the command-line output
@@ -65,13 +102,16 @@ Command-line binaries for Linux, macOS and Windows are attached to every
 python tools/vendor/fetch_acadrust.py     # once: the patched DWG writer
 cargo build --release -p obj2cad-cli
 ./target/release/obj2cad convert model.obj
+./target/release/obj2cad convert site.zip --curves      # a bundle, with curved surfaces
 ```
 
 Options: `--format dxf|dxf-binary|dwg`, `--units auto|unitless|mm|cm|m|in|ft` (written as
 `$INSUNITS`; coordinates are never scaled), `--default-units` (the house unit),
 `--up auto|as-is|y-to-z` (exact axis swap), `--layers objects|groups|materials|single`,
 `--keep-loose-points`, `--exclude-layer NAME`, `--mtl file.mtl` (material colors),
-`-o out.dxf`, `--report r.json`. `obj2cad` with no arguments lists them all.
+`--curves`, `-o out.dxf`, `--report r.json`. Inputs can be files, folders and `.zip`
+files; a lone `.obj` brings the `.mtl` and textures it names. `obj2cad` with no
+arguments lists everything.
 
 Web app: React + TypeScript, Tailwind v4, shadcn/ui (Radix) controls, Mantine (dropzone,
 modal, menu, notifications), Motion, three.js; the same Rust core compiled to WebAssembly in
@@ -113,13 +153,15 @@ checksums and build provenance attestations. With a GitHub App configured
 
 | Path | Purpose |
 |---|---|
-| `crates/obj2cad-core` | Strict, lossless OBJ parser; OBJ → CAD model; parity hash; report |
+| `crates/obj2cad-core` | Strict, lossless OBJ and XYZ parsers; bundles; OBJ → CAD model; parity hash; report |
+| `crates/obj2cad-curves` | Recognizing cylinders, cones, spheres and tori, strictly |
+| `crates/obj2cad-acis` | ACIS B-rep writer (SAB and SAT) |
 | `crates/obj2cad-dxf` | Exact DXF R2018 writer (ASCII and binary) |
 | `crates/obj2cad-dwg` | DWG writer (acadrust, patched by `tools/vendor`) |
 | `crates/obj2cad-cli` | Command-line tool (`convert`, `inspect`, `bench`) |
 | `crates/obj2cad-wasm` | WebAssembly bindings used by the web app |
 | `web/` | The web app |
-| `tests/fixtures` | Hand-built edge cases (`edge/`) and files that must be rejected (`invalid/`) |
+| `tests/fixtures` | Hand-built edge cases (`edge/`), bundles (`bundle/`), curved shapes (`curves/`, from `tools/fixtures/curves.py`) and files that must be rejected (`invalid/`) |
 | `tests/harness` | Independent parity verification |
 | `web/e2e` | Browser tests of the built web app |
 | `fuzz` | Coverage-guided fuzzing of the parser and pipeline (nightly Rust) |
