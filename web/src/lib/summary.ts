@@ -16,6 +16,13 @@ export interface Summary {
   notIncluded: string[];
   /** Materials are used but no .mtl was given. */
   needsMtl: boolean;
+  /** Files the drawing's files name that weren't there (a texture, a library). */
+  missing: string[];
+  /** Files that came along but weren't needed, or couldn't be read. */
+  notUsed: string[];
+  unreadable: string[];
+  /** Some faces are colored from textures (approximate colors). */
+  textureColors: boolean;
   /** Count and noun for the main stat. */
   shapes: { count: number; noun: string };
 }
@@ -42,12 +49,26 @@ export function summarize(r: Report): Summary {
         : null;
 
   const notIncluded = [
-    has("texcoords_dropped") && "textures",
+    has("texcoords_dropped") && !(r.texture_colored_faces > 0) && "textures",
     (has("normals_dropped") || has("smoothing_groups_ignored")) && "smooth shading",
     has("vertex_colors_dropped") && "vertex colors",
   ].filter((x): x is string => Boolean(x));
 
   const other = r.output.polylines + r.output.points;
   const shapes = { count: r.output.faces + other, noun: other ? "shapes" : "faces" };
-  return { status, title, leftOut, loosePoints, notIncluded, needsMtl: has("material_colors_unavailable"), shapes };
+  const files = r.files ?? [];
+  const named = (role: string) => files.filter((f) => f.role === role).map((f) => f.name);
+  return {
+    status,
+    title,
+    leftOut,
+    loosePoints,
+    notIncluded,
+    needsMtl: has("material_colors_unavailable"),
+    missing: named("missing"),
+    notUsed: named("not_used"),
+    unreadable: named("unreadable"),
+    textureColors: (r.texture_colored_faces ?? 0) > 0,
+    shapes,
+  };
 }

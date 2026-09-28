@@ -26,22 +26,16 @@ describe("preferences", () => {
 });
 
 describe("engine settings", () => {
-  it("use whole seconds of the file's time, like the command-line tool", () => {
-    expect(engineSettings(DEFAULT_PREFS, AUTO, { lastModified: 1_700_000_000_999 }).created_unix).toBe(1_700_000_000);
-    expect(engineSettings(DEFAULT_PREFS, AUTO, { lastModified: 0 }).created_unix).toBeNull();
-    expect(engineSettings(DEFAULT_PREFS, AUTO, null).created_unix).toBeNull();
-  });
-
   it("pass the house unit as the default, not as a choice", () => {
-    const s = engineSettings({ ...DEFAULT_PREFS, houseUnits: "feet" }, AUTO, null);
+    const s = engineSettings({ ...DEFAULT_PREFS, houseUnits: "feet" }, AUTO);
     expect([s.units, s.default_units]).toEqual([null, "feet"]);
   });
 
   it("rebuild the preview only when what it shows changes", () => {
-    const base = engineSettings(DEFAULT_PREFS, AUTO, null);
-    const upright = engineSettings(DEFAULT_PREFS, { ...AUTO, up: "y_up_to_z_up" }, null);
-    const units = engineSettings(DEFAULT_PREFS, { ...AUTO, units: "meters" }, null);
-    const layers = engineSettings({ ...DEFAULT_PREFS, layerMode: "materials" }, AUTO, null);
+    const base = engineSettings(DEFAULT_PREFS, AUTO);
+    const upright = engineSettings(DEFAULT_PREFS, { ...AUTO, up: "y_up_to_z_up" });
+    const units = engineSettings(DEFAULT_PREFS, { ...AUTO, units: "meters" });
+    const layers = engineSettings({ ...DEFAULT_PREFS, layerMode: "materials" }, AUTO);
     // Orientation turns the existing preview; units only relabel it.
     expect(previewKey(upright)).toBe(previewKey(base));
     expect(previewKey(units)).toBe(previewKey(base));

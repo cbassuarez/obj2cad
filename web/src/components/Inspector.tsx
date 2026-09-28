@@ -219,8 +219,20 @@ export function Inspector({
           <Stat value={bytes(report.output.bytes)} label={`${formatInfo(format).label.replace(" (binary)", "")} file`} />
         </div>
 
-        {(s.leftOut.length > 0 || s.loosePoints || s.needsMtl || s.notIncluded.length > 0) && (
+        {(s.leftOut.length > 0 || s.loosePoints || s.needsMtl || s.notIncluded.length > 0 || s.missing.length > 0 || s.unreadable.length > 0 || s.notUsed.length > 0 || s.textureColors) && (
           <ul className="m-0 flex list-none flex-col gap-1.5 px-5 py-4">
+            {s.missing.length > 0 && (
+              <Row tone="warn">
+                <TriangleAlert className="size-4 shrink-0 text-warn" />
+                <span className="min-w-0 flex-1">Missing: {s.missing.join(", ")}</span>
+              </Row>
+            )}
+            {s.unreadable.length > 0 && (
+              <Row tone="warn">
+                <TriangleAlert className="size-4 shrink-0 text-warn" />
+                <span className="min-w-0 flex-1">Unreadable: {s.unreadable.join(", ")}</span>
+              </Row>
+            )}
             {s.leftOut.length > 0 && (
               <Row tone="warn">
                 <TriangleAlert className="size-4 shrink-0 text-warn" />
@@ -246,7 +258,14 @@ export function Inspector({
                 </Button>
               </Row>
             )}
+            {s.textureColors && (
+              <Row>
+                <Palette className="size-4 shrink-0 text-accent" />
+                <span className="min-w-0 flex-1">Texture colors, approximate</span>
+              </Row>
+            )}
             {s.notIncluded.length > 0 && <Row tone="muted">Not included: {s.notIncluded.join(", ")}</Row>}
+            {s.notUsed.length > 0 && <Row tone="muted">Not used: {s.notUsed.join(", ")}</Row>}
           </ul>
         )}
 

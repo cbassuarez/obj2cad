@@ -103,11 +103,11 @@ export interface EngineSettings {
   keep_loose_points: boolean;
   exclude_layers: string[];
   format: Format;
-  created_unix: number | null;
   include_name: boolean;
 }
 
-export function engineSettings(prefs: Prefs, choices: FileChoices, file: { lastModified: number } | null, exclude: string[] = []): EngineSettings {
+/** The drawing's date comes from its files (the newest one used), set by the engine. */
+export function engineSettings(prefs: Prefs, choices: FileChoices, exclude: string[] = []): EngineSettings {
   return {
     units: choices.units,
     default_units: prefs.houseUnits,
@@ -116,8 +116,6 @@ export function engineSettings(prefs: Prefs, choices: FileChoices, file: { lastM
     keep_loose_points: choices.keepLoose,
     exclude_layers: exclude,
     format: prefs.format,
-    // Whole seconds, like the command-line tool, so both write identical files.
-    created_unix: file && file.lastModified > 0 ? Math.floor(file.lastModified / 1000) : null,
     include_name: prefs.includeName,
   };
 }

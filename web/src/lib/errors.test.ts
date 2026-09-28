@@ -4,7 +4,7 @@ import type { ParseFailure } from "@/lib/engine";
 
 (globalThis as Record<string, unknown>).__APP_VERSION__ = "0.0.0-test";
 
-const parse = (kind: string, line = 7): ParseFailure => ({ kind, line, message: "raw engine text", issues: [{ line, kind, message: "raw engine text" }], truncated: false });
+const parse = (kind: string, line = 7): ParseFailure => ({ file: "model.obj", kind, line, message: "raw engine text", issues: [{ line, kind, message: "raw engine text" }], truncated: false });
 
 describe("error copy", () => {
   it("names the cause and the line, and keeps the raw line underneath", () => {
@@ -16,7 +16,7 @@ describe("error copy", () => {
   });
 
   it("gives every parse error kind its own title", () => {
-    const kinds = ["comma_decimal", "invalid_number", "non_finite", "wrong_arity", "index_out_of_range", "hidden_characters", "encoding", "too_large"];
+    const kinds = ["comma_decimal", "invalid_number", "non_finite", "wrong_arity", "index_out_of_range", "hidden_characters", "encoding", "too_large", "ambiguous_columns"];
     const titles = new Set(kinds.map((k) => explain({ kind: "parse", parse: parse(k) }).title));
     expect(titles.size).toBe(kinds.length);
   });
