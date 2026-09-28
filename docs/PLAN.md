@@ -16,7 +16,7 @@ Repo: `github.com/cbassuarez/obj2cad` (public). Status: v0.1 live at https://cba
 | Parity | Vertices, faces, n-gons, and structure preserved **bit-for-bit** by default. |
 | Curves | **Strict** by default (see §3); user may loosen to a stated tolerance, and loosened output is flagged in the file, UI, and report. Regions that fail the rule stay exactly faceted. The tool never approximates silently. |
 | Structure | `o`/`g` → layers; `usemtl` → entity true color from MTL `Kd`. |
-| Units / axis | Chosen automatically, never asked: up direction detected from geometry (resting base, thin axis; exporter only as fallback), units from exporter convention or size (unitless if no basis). Shown with the reason; one-click override. Units written to `$INSUNITS`. |
+| Units / axis | Chosen automatically, never asked: up direction detected from geometry (resting base, thin axis; exporter only as fallback), units from exporter convention or size (unitless if no basis). House unit for files that don't state one; resulting size shown next to the download; one-click override. Units written to `$INSUNITS`. |
 | Acceptance | Automated independent-reader checks every commit + teammate AutoCAD checklist every release. |
 
 ## 2. Architecture
