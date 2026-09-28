@@ -14,6 +14,7 @@ export function LayersCard({
   onMode,
   onToggle,
   onDownloadVisible,
+  ownDownload = true,
 }: {
   report: Report;
   mode: LayerMode;
@@ -22,6 +23,8 @@ export function LayersCard({
   onMode: (m: LayerMode) => void;
   onToggle: (layer: number) => void;
   onDownloadVisible: () => void;
+  /** Offer its own "visible layers only" download; off when the main download already does. */
+  ownDownload?: boolean;
 }) {
   const rows = report.layers.map((l, i) => ({ ...l, i })).filter((l) => l.faces + l.polylines + l.points > 0);
   const total = (l: (typeof rows)[number]) => l.faces + l.polylines + l.points;
@@ -74,7 +77,12 @@ export function LayersCard({
           );
         })}
       </ul>
-      {hidden.size > 0 && shown > 0 && (
+      {hidden.size > 0 && shown > 0 && !ownDownload && (
+        <div className="border-t border-line-soft px-4 py-2 text-[12px] text-fg-3">
+          {shown} of {rows.length} shown · hidden layers are left out of the download
+        </div>
+      )}
+      {hidden.size > 0 && shown > 0 && ownDownload && (
         <div className="border-t border-line-soft p-2">
           <Button variant="ghost" size="sm" className="w-full" onClick={onDownloadVisible} disabled={busy}>
             <Download />
