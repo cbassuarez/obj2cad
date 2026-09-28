@@ -6,14 +6,13 @@ import { AnimatePresence, motion } from "motion/react";
 import { CubeArt } from "@/components/brand";
 import { DropScreen } from "@/components/DropScreen";
 import { FailedScreen } from "@/components/FailedScreen";
-import { SetupDialog } from "@/components/SetupDialog";
 import { TopBar, type FileInfo } from "@/components/TopBar";
 import { Button } from "@/components/ui/button";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
-import type { Suggestion } from "@/components/Dock";
+import type { AutoChoice } from "@/components/Dock";
 import * as engine from "@/lib/engine";
 import type { ConvertResult, Inspection, Report } from "@/lib/engine";
-import { HINT_UNITS, HINT_UP, UNITS, UPS, loadSettings, saveSettings, type Settings, type Theme } from "@/lib/settings";
+import { HINT_UNITS, HINT_UP, type Settings, type Units, type Up } from "@/lib/settings";
 
 type Phase = "empty" | "loading" | "failed" | "work";
 
@@ -29,12 +28,11 @@ function download(data: BlobPart, name: string, type: string) {
   setTimeout(() => URL.revokeObjectURL(url), 10_000);
 }
 
-export function App({ theme, onToggleTheme }: { theme: Theme; onToggleTheme: () => void }) {
+export function App() {
   const [phase, setPhase] = useState<Phase>("empty");
   const [file, setFile] = useState<FileInfo | null>(null);
   const [inspection, setInspection] = useState<Inspection | null>(null);
-  const [settings, setSettings] = useState<Settings>(() => loadSettings() ?? { units: "mm", up: "as-is" });
-  const [asking, setAsking] = useState(false);
+  const [settings, setSettings] = useState<Settings>({ units: "unitless", up: "as-is" });
   const [result, setResult] = useState<ConvertResult | null>(null);
   const [report, setReport] = useState<Report | null>(null);
   const [busy, setBusy] = useState(false);
@@ -109,7 +107,7 @@ export function App({ theme, onToggleTheme }: { theme: Theme; onToggleTheme: () 
       return;
     }
     if (!obj) {
-      notifications.show({ title: "Choose an .obj file", message: "You can add its .mtl alongside it.", color: "accent" });
+      notifications.show({ title: "That isn't an .obj file", message: "Drop an .obj (and its .mtl, if you have one).", color: "accent" });
       return;
     }
     const mtls = files.filter((f) => f.name.toLowerCase().endsWith(".mtl"));
@@ -133,19 +131,15 @@ export function App({ theme, onToggleTheme }: { theme: Theme; onToggleTheme: () 
     if (mtl) await engine.setMtl(mtl);
     setInspection(info);
     setFile({ name: obj.name, size: obj.size, exporter: info.hints.exporter, mtl: mtl?.name ?? null });
-    const saved = loadSettings();
-    if (saved) {
-      setSettings(saved);
-      await run(saved);
-    } else {
-      setBusy(false);
-      setAsking(true);
-    }
+    // Nothing to ask: units and up direction are both chosen from the file, and shown
+    // with the reason so they can be changed.
+    const next = { units: HINT_UNITS[info.hints.units] ?? "unitless", up: HINT_UP[info.hints.up_axis] ?? "as-is" };
+    setSettings(next);
+    await run(next);
   }, [run]);
 
   const change = (next: Settings) => {
     setSettings(next);
-    if (loadSettings()) saveSettings(next); // keep remembering the latest choice
     void run(next);
   };
 
@@ -167,34 +161,30 @@ export function App({ theme, onToggleTheme }: { theme: Theme; onToggleTheme: () 
   }, []);
 
   // ---------------------------------------------------------------- derived
-  const suggestion = useMemo<Suggestion | null>(() => {
+  // Automatic choices, with their reasons, for the dock's status lines.
+  const units = useMemo<AutoChoice<Units> | null>(() => {
     if (!inspection || phase !== "work") return null;
     const h = inspection.hints;
-    const su = HINT_UNITS[h.units];
-    if (su && su !== settings.units && h.units !== "unitless") {
-      const name = UNITS.find((u) => u.value === su)!.name;
-      return { text: `Suggested: ${name} (${h.units_reason})`, apply: () => change({ ...settings, units: su }) };
-    }
-    const sup = HINT_UP[h.up_axis];
-    // Orientation is only worth suggesting when we know the exporter's convention.
-    if (h.exporter && sup && sup !== settings.up) {
-      const label = UPS.find((u) => u.value === sup)!.label;
-      return { text: `Suggested: ${label} (${h.up_axis_reason})`, apply: () => change({ ...settings, up: sup }) };
-    }
-    return null;
+    const detected = HINT_UNITS[h.units] ?? "unitless";
+    return { detected, reason: h.units_reason, confident: h.units !== "unitless", overridden: settings.units !== detected, reset: () => change({ ...settings, units: detected }) };
   }, [inspection, settings, phase]); // `change` is recreated each render; these are its inputs
+
+  const orientation = useMemo<AutoChoice<Up> | null>(() => {
+    if (!inspection || phase !== "work") return null;
+    const h = inspection.hints;
+    const detected = HINT_UP[h.up_axis] ?? "as-is";
+    return { detected, reason: h.up_axis_reason, confident: h.up_axis_confident, overridden: settings.up !== detected, reset: () => change({ ...settings, up: detected }) };
+  }, [inspection, settings, phase]);
 
   const stem = (file?.name ?? "model.obj").replace(/\.obj$/i, "");
   const exportDxf = () => result && download(result.dxf as BlobPart, `${stem}.dxf`, "application/dxf");
   const exportReport = () => result && download(result.report, `${stem}.report.json`, "application/json");
 
   return (
-    <div className="relative h-full">
+    <div className="relative min-h-dvh">
       <TopBar
         file={phase === "work" || phase === "loading" ? file : null}
-        theme={theme}
         offlineReady={offlineReady}
-        onToggleTheme={onToggleTheme}
         onOpen={() => input.current?.click()}
         onDownloadReport={phase === "work" ? exportReport : undefined}
       />
@@ -203,16 +193,16 @@ export function App({ theme, onToggleTheme }: { theme: Theme; onToggleTheme: () 
       {phase === "failed" && error && <FailedScreen name={error.name} message={error.message} onPick={() => input.current?.click()} />}
       {phase === "work" && result && report && (
         <ErrorBoundary>
-        <Suspense fallback={<main className="h-full bg-viewport" />}>
+        <Suspense fallback={<main className="h-dvh bg-viewport" />}>
         <Workspace
           result={result}
           report={report}
           settings={settings}
-          theme={theme}
-          busy={busy}
+            busy={busy}
           exporter={file?.exporter ?? null}
           onAddMtl={() => mtlInput.current?.click()}
-          suggestion={suggestion}
+          units={units}
+          orientation={orientation}
           onUnits={(units) => change({ ...settings, units })}
           onUp={(up) => change({ ...settings, up })}
           onExport={exportDxf}
@@ -222,7 +212,7 @@ export function App({ theme, onToggleTheme }: { theme: Theme; onToggleTheme: () 
         </ErrorBoundary>
       )}
       {phase === "loading" && (
-        <main className="paper flex h-full items-center justify-center" role="status">
+        <main className="paper flex min-h-dvh items-center justify-center" role="status">
           <div className="panel flex flex-col items-center gap-4 px-10 py-8">
             <motion.div animate={{ rotate: [0, 0, 120, 120] }} transition={{ duration: 1.8, repeat: Infinity, times: [0, 0.3, 0.7, 1] }}>
               <CubeArt className="size-12 text-accent" />
@@ -232,22 +222,6 @@ export function App({ theme, onToggleTheme }: { theme: Theme; onToggleTheme: () 
             </div>
           </div>
         </main>
-      )}
-
-      {asking && inspection && (
-        <SetupDialog
-          inspection={inspection}
-          onCancel={() => {
-            setAsking(false);
-            setPhase("empty");
-          }}
-          onDone={(s, remember) => {
-            setAsking(false);
-            if (remember) saveSettings(s);
-            setSettings(s);
-            void run(s);
-          }}
-        />
       )}
 
       <Dropzone.FullScreen
@@ -265,8 +239,8 @@ export function App({ theme, onToggleTheme }: { theme: Theme; onToggleTheme: () 
           >
             <div className="panel flex flex-col items-center gap-4 border-2 border-dashed !border-accent px-12 py-12 text-center">
               <CubeArt className="size-16 text-accent" />
-              <div className="font-display text-[32px] font-semibold tracking-tight">Drop to convert</div>
-              <div className="text-[14px] text-fg-3">.obj, plus its .mtl for colors</div>
+              <div className="font-display text-[32px] font-semibold tracking-tight">Drop the file</div>
+              <div className="text-[14px] text-fg-3">.obj, plus its .mtl if you have one</div>
             </div>
           </motion.div>
         </AnimatePresence>
@@ -283,7 +257,7 @@ export function App({ theme, onToggleTheme }: { theme: Theme; onToggleTheme: () 
           if (!f) return;
           await engine.setMtl(f);
           setFile((prev) => (prev ? { ...prev, mtl: f.name } : prev));
-          void run(settings);
+          void run(settingsRef.current);
         }}
       />
       <input

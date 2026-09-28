@@ -22,6 +22,14 @@ fn run(args: Vec<String>) -> Result<(), String> {
     match it.next().as_deref() {
         Some("convert") => {}
         Some("bench") => return bench(it.collect()),
+        Some("inspect") => {
+            let path = it.next().ok_or(USAGE)?;
+            let src = std::fs::read(&path).map_err(|e| format!("{path}: {e}"))?;
+            let doc = parse(&src).map_err(|e| format!("{path}: {e}"))?;
+            let h = obj2cad_core::hints::hints(&doc);
+            println!("{}", serde_json::to_string_pretty(&h).expect("serializes"));
+            return Ok(());
+        }
         Some("--version") => {
             println!("obj2cad {}", obj2cad_core::VERSION);
             return Ok(());
@@ -183,18 +191,21 @@ fn bench(args: Vec<String>) -> Result<(), String> {
         let write_ms = best(&mut || {
             std::hint::black_box(obj2cad_dxf::write(&model, &[], "bench"));
         });
+        let hints_ms = best(&mut || {
+            std::hint::black_box(obj2cad_core::hints::hints(&doc));
+        });
         let hash_ms = best(&mut || {
             std::hint::black_box(obj2cad_core::hash::parity_hash(&model));
         });
         let total = parse_ms + convert_ms + write_ms + hash_ms;
         rows.push(serde_json::json!({
             "input": name, "bytes": src.len(), "faces": doc.faces.len(), "dxf_bytes": dxf.len(),
-            "parse_ms": parse_ms, "convert_ms": convert_ms, "write_ms": write_ms, "hash_ms": hash_ms,
+            "parse_ms": parse_ms, "hints_ms": hints_ms, "convert_ms": convert_ms, "write_ms": write_ms, "hash_ms": hash_ms,
             "total_ms": total, "mb_per_s": src.len() as f64 / 1e6 / (total / 1e3),
         }));
         if !json {
             println!(
-                "{name}\n  {:.1} MB, {} faces → {:.1} MB DXF\n  parse {parse_ms:.0} ms · convert {convert_ms:.0} ms · write {write_ms:.0} ms · hash {hash_ms:.0} ms\n  total {total:.0} ms  ({:.0} MB/s)",
+                "{name}\n  {:.1} MB, {} faces → {:.1} MB DXF\n  parse {parse_ms:.0} ms · detect {hints_ms:.0} ms · convert {convert_ms:.0} ms · write {write_ms:.0} ms · hash {hash_ms:.0} ms\n  total {total:.0} ms  ({:.0} MB/s)",
                 src.len() as f64 / 1e6,
                 doc.faces.len(),
                 dxf.len() as f64 / 1e6,

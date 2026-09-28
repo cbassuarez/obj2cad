@@ -10,13 +10,13 @@ Reference file: `obj2cad bench --synthetic 1000`, a 70.3 MB OBJ with 1,000,000 v
 
 | # | Metric | Budget | Now (2026-09-28, desktop Chrome, Windows 11) |
 |---|---|---|---|
-| M1 | Browser: drop → verified DXF + 3D preview | ≤ 2.0 s | **1.49 s** |
-| M2 | Browser: change units/orientation → new DXF | ≤ 1.0 s | **0.84 s** |
+| M1 | Browser: drop → verified DXF + 3D preview | ≤ 2.0 s | **1.5–2.0 s** (first load includes fetching the 3D module) |
+| M2 | Browser: change the up direction → new DXF | ≤ 1.0 s | **0.85–1.1 s** (at the edge; see Next levers) |
 | M3 | Native CLI throughput (parse + convert + hash + write) | ≥ 100 MB/s | **114 MB/s** (616 ms) |
 | M4 | Native CLI on GitHub's `ubuntu-latest` (regression guard) | ≤ 1,500 ms | enforced in CI |
 
-M1 and M2 are measured in the real app: drop the file and read the timing tooltip on the
-"DXF · N ms" stat, which lists every stage. M3/M4 come from `obj2cad bench`.
+M1 and M2 are measured in the real app: drop the file, open "Technical details" and hover
+"Time" for every stage. M3/M4 come from `obj2cad bench`.
 
 ## Where the time goes (M1, browser)
 
@@ -48,6 +48,10 @@ M1 and M2 are measured in the real app: drop the file and read the timing toolti
 
 ## Next levers, if needed
 
+- M2 is at its budget. About 0.63 s is engine work (write, parity, output digest); the rest
+  is main-thread geometry upload and React re-render. Reusing GPU buffers when only the
+  orientation changes (a transform, not new geometry) is the first thing to try.
+- Up-direction detection costs 15 ms on the 1.5M-face reference (`obj2cad bench`).
 - Stream the DXF to disk with the File System Access API instead of holding 125 MB.
 - Multi-threaded WebAssembly (needs cross-origin isolation headers, which GitHub Pages
   can't set; would need a service-worker shim).

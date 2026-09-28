@@ -49,7 +49,7 @@ export class Viewer {
   private hasContent = false;
   private unit = "";
   private hidden = new Set<number>();
-  private theme: ViewerTheme = { grid: "#1c1f24", gridMajor: "#272b32", dim: "#8fb0ff", edge: "#c6f432", line: "#8fb0ff" };
+  private theme: ViewerTheme = { grid: "#ddd8ce", gridMajor: "#cbc4b7", dim: "#2b55c7", edge: "#1c1d1f", line: "#2b55c7" };
   private resizeObserver: ResizeObserver;
   /** Called after each rendered frame with the camera's current axis directions. */
   onAxes: ((axes: AxisDirs) => void) | null = null;
@@ -178,7 +178,8 @@ export class Viewer {
   }
 
   fit(): void {
-    const dist = (this.radius / Math.sin(THREE.MathUtils.degToRad(this.camera.fov / 2))) * 1.15;
+    // Extra margin so the dimension labels around the model stay on screen.
+    const dist = (this.radius / Math.sin(THREE.MathUtils.degToRad(this.camera.fov / 2))) * 1.35;
     const dir = new THREE.Vector3(1, -1.35, 0.85).normalize();
     this.controls.target.set(0, 0, 0);
     this.camera.position.copy(dir.multiplyScalar(dist));

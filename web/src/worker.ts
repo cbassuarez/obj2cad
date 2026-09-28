@@ -25,6 +25,7 @@ export interface Inspection {
     units_reason: string;
     up_axis: string;
     up_axis_reason: string;
+    up_axis_confident: boolean;
   };
 }
 

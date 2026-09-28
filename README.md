@@ -26,6 +26,19 @@ Every conversion writes a `*.report.json` with input/output SHA-256, a canonical
 stored in the drawing's custom properties (`DWGPROPS` in AutoCAD), so any file can be
 traced back to its source.
 
+## Automatic choices
+
+OBJ files store neither units nor which way is up, so obj2cad decides both and says why:
+
+- **Up direction** is detected from the geometry: which way the model rests on a flat base,
+  or which axis it lies flat along. Only when the shape is ambiguous does it fall back to
+  the exporter's convention. Standing a model upright is an exact axis swap.
+- **Units** come from the exporter's convention (Blender: meters, SketchUp: inches, …) or
+  the model's size. Units only label the drawing (`$INSUNITS`); coordinates never change,
+  so a wrong guess can't damage geometry. With no basis, the drawing stays unitless.
+
+Both can be changed in one click; `obj2cad inspect file.obj` shows the same decisions.
+
 ## Verification
 
 `tests/harness/parity.py` checks every conversion independently of the Rust code:
@@ -46,7 +59,7 @@ scaled), `--up as-is|y-to-z` (exact axis swap), `--mtl file.mtl` (material color
 
 Web app: React + TypeScript, Tailwind v4, shadcn/ui (Radix) controls, Mantine (dropzone,
 modal, menu, notifications), Motion, three.js; the same Rust core compiled to WebAssembly in
-a Web Worker. One set of CSS tokens themes all of it (dark "studio", light "drafting").
+a Web Worker. One set of CSS tokens themes all of it (a single light "drafting" theme).
 
 ```bash
 cargo install wasm-bindgen-cli --version 0.2.129 --locked

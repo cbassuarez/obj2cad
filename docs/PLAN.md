@@ -3,7 +3,7 @@
 In-house OBJ → DWG/DXF converter for Ideum devs and designers. Replaces outsourced conversion.
 Priorities, in order: **trustworthy → no surprises → easy → beautiful → fast.**
 
-Repo: `github.com/cbassuarez/obj2cad` (public). Status: planning (2026-09-28).
+Repo: `github.com/cbassuarez/obj2cad` (public). Status: v0.1 live at https://cbassuarez.com/obj2cad/ (2026-09-28). UI: single light "drafting" theme.
 
 ---
 
@@ -16,7 +16,7 @@ Repo: `github.com/cbassuarez/obj2cad` (public). Status: planning (2026-09-28).
 | Parity | Vertices, faces, n-gons, and structure preserved **bit-for-bit** by default. |
 | Curves | **Strict** by default (see §3); user may loosen to a stated tolerance, and loosened output is flagged in the file, UI, and report. Regions that fail the rule stay exactly faceted. The tool never approximates silently. |
 | Structure | `o`/`g` → layers; `usemtl` → entity true color from MTL `Kd`. |
-| Units / axis | Asked on first drop (unit guess from bbox + exporter comment; keep axis vs Y-up→Z-up with live preview), remembered, always shown in the export summary. Written to `$INSUNITS`. |
+| Units / axis | Chosen automatically, never asked: up direction detected from geometry (resting base, thin axis; exporter only as fallback), units from exporter convention or size (unitless if no basis). Shown with the reason; one-click override. Units written to `$INSUNITS`. |
 | Acceptance | Automated independent-reader checks every commit + teammate AutoCAD checklist every release. |
 
 ## 2. Architecture

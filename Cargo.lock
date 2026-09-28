@@ -82,7 +82,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "obj2cad-cli"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "obj2cad-core",
  "obj2cad-dxf",
@@ -91,7 +91,7 @@ dependencies = [
 
 [[package]]
 name = "obj2cad-core"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "memchr",
  "serde",
@@ -100,7 +100,7 @@ dependencies = [
 
 [[package]]
 name = "obj2cad-dxf"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "itoa",
  "obj2cad-core",
@@ -109,7 +109,7 @@ dependencies = [
 
 [[package]]
 name = "obj2cad-wasm"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "obj2cad-core",
  "obj2cad-dxf",

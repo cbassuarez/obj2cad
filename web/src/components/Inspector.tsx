@@ -26,8 +26,8 @@ function Seal({ report }: { report: Report }) {
         </motion.div>
       </AnimatePresence>
       <div className="min-w-0">
-        <div className="font-display text-[22px] leading-tight font-semibold tracking-tight text-exact">Exact copy</div>
-        <div className="text-[13.5px] text-fg-2">Every shape lands in the DXF exactly as modeled.</div>
+        <div className="font-display text-[22px] leading-tight font-semibold tracking-tight text-exact">Ready to download</div>
+        <div className="text-[13.5px] text-fg-2">The geometry is copied exactly. Nothing is moved or rounded.</div>
       </div>
     </div>
   );
@@ -152,11 +152,11 @@ export function Inspector({
         </div>
 
         <div className="flex flex-col gap-2 px-5 py-4">
-          <div className="label">Good to know</div>
+          <div className="label">Notes</div>
           {notes.length === 0 ? (
             <div className="flex items-center gap-2.5 rounded-[3px] bg-exact-soft px-3 py-2.5 text-[13px] text-exact">
               <CircleCheck className="size-4 shrink-0" />
-              Everything in your file is included.
+              Everything in your file is in the DXF.
             </div>
           ) : (
             <ul className="m-0 flex list-none flex-col gap-1.5 p-0">

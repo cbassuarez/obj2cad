@@ -2,11 +2,11 @@ import { useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
 import { Viewer, type AxisDirs } from "@/viewer/Viewer";
 import { AxisGizmo } from "@/components/AxisGizmo";
-import { Dock, type Suggestion } from "@/components/Dock";
+import { Dock, type AutoChoice } from "@/components/Dock";
 import { Inspector } from "@/components/Inspector";
 import { LayersCard } from "@/components/LayersCard";
 import type { ConvertResult, Report } from "@/lib/engine";
-import type { Settings, Theme, Units, Up } from "@/lib/settings";
+import type { Settings, Units, Up } from "@/lib/settings";
 
 function cssVar(name: string) {
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
@@ -16,10 +16,10 @@ export function Workspace({
   result,
   report,
   settings,
-  theme,
   busy,
   exporter,
-  suggestion,
+  units,
+  orientation,
   onAddMtl,
   onUnits,
   onUp,
@@ -29,10 +29,10 @@ export function Workspace({
   result: ConvertResult;
   report: Report;
   settings: Settings;
-  theme: Theme;
   busy: boolean;
   exporter: string | null;
-  suggestion: Suggestion | null;
+  units: AutoChoice<Units> | null;
+  orientation: AutoChoice<Up> | null;
   onAddMtl: () => void;
   onUnits: (u: Units) => void;
   onUp: (u: Up) => void;
@@ -60,10 +60,10 @@ export function Workspace({
       grid: cssVar("--grid"),
       gridMajor: cssVar("--grid-major"),
       dim: cssVar("--dim"),
-      edge: cssVar("--accent"),
-      line: cssVar("--info"),
+      edge: cssVar("--text"),
+      line: cssVar("--accent"),
     });
-  }, [theme]);
+  }, []);
 
   useEffect(() => {
     viewer.current?.setUnit(settings.units === "unitless" ? "" : settings.units);
@@ -87,9 +87,9 @@ export function Workspace({
   };
 
   return (
-    <main className="h-full overflow-y-auto bg-viewport lg:relative lg:overflow-hidden">
+    <main className="bg-viewport pb-2 lg:relative lg:h-dvh lg:min-h-[700px] lg:overflow-hidden lg:pb-0">
       {/* viewport */}
-      <div className="relative h-[62vh] min-h-[380px] lg:absolute lg:inset-0 lg:h-auto">
+      <div className="relative h-[60vh] min-h-[360px] lg:absolute lg:inset-0 lg:h-auto">
         <div ref={host} className="absolute inset-0" />
         {!result.previewAvailable && (
           <div className="absolute inset-0 grid place-items-center p-6">
@@ -132,7 +132,8 @@ export function Workspace({
             onExport={onExport}
             exportBytes={busy ? null : result.dxf.byteLength}
             busy={busy}
-            suggestion={suggestion}
+            units={units}
+            orientation={orientation}
           />
         </div>
       {/* panels: floating on large screens, stacked below the viewer on small ones */}
