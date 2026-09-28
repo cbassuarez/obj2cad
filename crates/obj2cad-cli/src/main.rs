@@ -19,6 +19,8 @@ const USAGE: &str = "usage:
       --up auto|as-is|y-to-z                       (default: auto)
       --layers objects|groups|materials|single     (default: objects)
       --keep-loose-points        write unused vertices as points
+      --curves                   also write curved surfaces found in the mesh (cylinders,
+                                 cones, spheres, tori; every vertex within its precision)
       --exclude-layer <name>     leave a layer out (repeatable)
       --report <file.json>       report path (default: <out>.report.json)
       --quiet
@@ -323,11 +325,13 @@ fn convert_cmd(args: Vec<String>) -> Result<(), String> {
     let mut choices = Choices::default();
     let (mut format, mut layer_mode, mut keep_loose, mut exclude, mut quiet) =
         (None, LayerMode::Objects, false, Vec::new(), false);
+    let mut curves = false;
     let mut it = args.into_iter();
     while let Some(a) = it.next() {
         let mut val = || it.next().ok_or_else(|| format!("{a} needs a value"));
         match a.as_str() {
             "-o" => output = Some(PathBuf::from(val()?)),
+            "--curves" => curves = true,
             "--mtl" => mtl_path = Some(PathBuf::from(val()?)),
             "--report" => report_path = Some(PathBuf::from(val()?)),
             "--format" => {
@@ -418,13 +422,18 @@ fn convert_cmd(args: Vec<String>) -> Result<(), String> {
         default_layer: bundle.stem.clone(),
         keep_loose_points: keep_loose,
         exclude_layers: exclude,
+        curves,
     };
-    let model = obj2cad_core::convert_with(doc, &materials, options);
+    let mut model = obj2cad_core::convert_with(doc, &materials, options);
+    let curves_label = model
+        .options
+        .curves
+        .then(|| obj2cad_curves::label(&obj2cad_curves::add_to(&mut model).to_string()));
 
     let source_sha = bundle.source_sha256.clone();
     let parity = obj2cad_core::hash::parity_hash(&model);
     let name = bundle.name.clone();
-    let props = [
+    let mut props = vec![
         ("obj2cad.version", obj2cad_core::VERSION),
         ("obj2cad.source_sha256", source_sha.as_str()),
         ("obj2cad.parity_hash", parity.as_str()),
@@ -438,6 +447,9 @@ fn convert_cmd(args: Vec<String>) -> Result<(), String> {
         ),
         ("obj2cad.source_name", name.as_str()),
     ];
+    if let Some(c) = &curves_label {
+        props.push(("obj2cad.curves", c.as_str()));
+    }
     // The newest file that went into the drawing dates it.
     let created_unix = bundle.modified;
     let meta = Meta {
@@ -682,6 +694,7 @@ fn acis_samples(dir: &Path) -> Result<(), String> {
             layer: 1,
             color: None,
             body,
+            region: None,
         });
         let props = [
             ("obj2cad.version", obj2cad_core::VERSION),

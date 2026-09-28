@@ -23,6 +23,8 @@ export interface Summary {
   unreadable: string[];
   /** Some faces are colored from textures (approximate colors). */
   textureColors: boolean;
+  /** Curved surfaces written next to the mesh, by kind ("2 cylinders", "1 sphere"). */
+  curves: string[];
   /** Count and noun for the main stat. */
   shapes: { count: number; noun: string };
 }
@@ -69,6 +71,10 @@ export function summarize(r: Report): Summary {
     notUsed: named("not_used"),
     unreadable: named("unreadable"),
     textureColors: (r.texture_colored_faces ?? 0) > 0,
+    curves: (["cylinder", "cone", "sphere", "torus"] as const)
+      .map((k) => [k, (r.curves ?? []).filter((c) => c.kind === k).length] as const)
+      .filter(([, n]) => n > 0)
+      .map(([k, n]) => plural(n, k, k === "torus" ? "tori" : `${k}s`)),
     shapes,
   };
 }

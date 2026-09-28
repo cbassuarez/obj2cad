@@ -71,6 +71,7 @@ def read_obj(path: Path) -> dict:
         logical.append(buf)
 
     pos: list[tuple[float, float, float]] = []
+    texts: list[tuple[str, str, str]] = []  # the coordinates as written
     colors: list = []  # per vertex: (r, g, b) 0..255 or None
     elements = []  # (kind, [vertex indices], object, group, material, every corner has a vt)
     nvt = nvn = 0
@@ -113,6 +114,7 @@ def read_obj(path: Path) -> dict:
             if any(math.isnan(c) or math.isinf(c) for c in xyz):
                 raise ObjError("non-finite")
             pos.append(xyz)
+            texts.append(tuple(args[:3]))
             # `v x y z r g b`: stored as single precision, then 0..1 → 0..255.
             colors.append(tuple(byte(f32(float(a))) for a in args[3:6]) if len(args) == 6 else None)
         elif kw == "vt":
@@ -149,7 +151,7 @@ def read_obj(path: Path) -> dict:
     for i, slot in forward:
         if i >= totals[slot]:
             raise ObjError("forward reference out of range")
-    return {"positions": pos, "colors": colors, "elements": elements, "mtllibs": mtllibs}
+    return {"positions": pos, "texts": texts, "colors": colors, "elements": elements, "mtllibs": mtllibs}
 
 
 def f32(x: float) -> float:
@@ -183,7 +185,7 @@ def read_xyz(path: Path) -> dict:
                 continue  # column names
         rows.append(t)
     if not rows:
-        return {"positions": [], "colors": [], "elements": [], "mtllibs": []}
+        return {"positions": [], "texts": [], "colors": [], "elements": [], "mtllibs": []}
     sep = ";" if ";" in rows[0] else ("," if "," in rows[0] and len(rows[0].split()) < 3 else None)
     split = (lambda r: [x.strip() for x in r.split(sep)]) if sep else (lambda r: r.split())
     table = [split(r) for r in rows]
@@ -221,7 +223,8 @@ def read_xyz(path: Path) -> dict:
     pos = [tuple(r[:3]) for r in vals]
     colors = [tuple(int(v) for v in r[rgb_at:rgb_at + 3]) if rgb_at is not None else None for r in vals]
     stem = path.stem
-    return {"positions": pos, "colors": colors, "elements": [("p", list(range(len(pos))), stem, None, None, False)], "mtllibs": []}
+    texts = [tuple(r[:3]) for r in table]
+    return {"positions": pos, "texts": texts, "colors": colors, "elements": [("p", list(range(len(pos))), stem, None, None, False)], "mtllibs": []}
 
 
 def read_mtl(path: Path) -> tuple[dict, dict]:
@@ -301,7 +304,7 @@ def read_bundle(files: list[Path], name: str) -> dict:
     n_obj = sum(ext(p) == ".obj" for p in geometry)
     several = len(parts) > 1
 
-    merged = {"positions": [], "colors": [], "elements": [], "mtllibs": []}
+    merged = {"positions": [], "texts": [], "colors": [], "elements": [], "mtllibs": []}
     palette, textured, meaning = {}, set(), {}
     for p, doc in parts:
         colors, textures = {}, {}
@@ -335,6 +338,7 @@ def read_bundle(files: list[Path], name: str) -> dict:
                 textured.add(new)
         v0 = len(merged["positions"])
         merged["positions"] += doc["positions"]
+        merged["texts"] += doc["texts"]
         merged["colors"] += doc["colors"]
         for kind, idx, o, g, mat, uv in doc["elements"]:
             if several and o is None:
@@ -447,7 +451,7 @@ def hash_from_obj(obj: dict, up: str) -> str:
 def read_dxf(path: Path):
     doc = ezdxf.readfile(path)
     auditor = doc.audit()
-    faces, lines, points, structure = [], [], [], []
+    faces, lines, points, structure, acis = [], [], [], [], []
     for e in doc.modelspace():
         t = e.dxftype()
         color = e.dxf.true_color if e.dxf.hasattr("true_color") else None
@@ -468,6 +472,8 @@ def read_dxf(path: Path):
             verts = [tuple(e.dxf.location)]
             points.append(record(verts))
             structure.append(structure_record(layer, rgb, "p", verts))
+        elif t in ("SURFACE", "3DSOLID"):
+            acis.append((t, layer, bytes(e.sab)))
         else:
             raise AssertionError(f"unexpected entity {t}")
     layer_colors = {l.dxf.name: l.dxf.get("true_color") for l in doc.layers}
@@ -475,7 +481,7 @@ def read_dxf(path: Path):
         "custom": dict(doc.header.custom_vars),
         "acadver": doc.header.get("$ACADVER"),
     }
-    return parity_hash(faces, lines, points), auditor, structure, layer_colors, header
+    return parity_hash(faces, lines, points), auditor, structure, layer_colors, header, acis
 
 
 def read_dwg(path: Path, binary: Path):
@@ -485,7 +491,7 @@ def read_dwg(path: Path, binary: Path):
         raise AssertionError("DWG does not read back: " + proc.stderr.strip())
     dump = json.loads(proc.stdout)
     unpack = lambda v: tuple(struct.unpack(">d", bytes.fromhex(c))[0] for c in v)
-    faces, lines, points, structure = [], [], [], []
+    faces, lines, points, structure, acis = [], [], [], [], []
     for e in dump["entities"]:
         t, layer = e["t"], e.get("layer")
         rgb = None if e.get("color") is None else tuple(bytes.fromhex(e["color"]))
@@ -501,6 +507,8 @@ def read_dwg(path: Path, binary: Path):
         elif t == "point":
             points.append(record(vs))
             structure.append(structure_record(layer, rgb, "p", vs))
+        elif t in ("surface", "solid"):
+            acis.append(("SURFACE" if t == "surface" else "3DSOLID", layer, bytes.fromhex(e["sab"])))
         else:
             raise AssertionError(f"unexpected entity {t}")
     layer_colors = {name: None if c is None or len(c) != 6 else int(c, 16) for name, c in dump["layers"].items()}
@@ -510,11 +518,94 @@ def read_dwg(path: Path, binary: Path):
         errors = [None] * dump["problems"]
 
     header = {"custom": dump["custom"], "acadver": dump["version"]}
-    return parity_hash(faces, lines, points), Audit, structure, layer_colors, header
+    return parity_hash(faces, lines, points), Audit, structure, layer_colors, header, acis
+
+
+# ---------------------------------------------------------------- curved surfaces
+def quantum(text: str) -> float:
+    """The precision a number's text states: 1.234560 → 1e-6, 1.5e-3 → 1e-4, 12 → 1."""
+    t = text.lstrip("+-")
+    mant, _, exp = t.lower().partition("e")
+    decimals = len(mant.split(".", 1)[1]) if "." in mant else 0
+    return 10.0 ** ((int(exp) if exp else 0) - decimals)
+
+
+def surface_of(sab: bytes):
+    """The single face's surface in an ACIS body, read with ezdxf's SAB parser, as
+    (kind, distance function)."""
+    from ezdxf.acis import sab as sabmod
+
+    builder = sabmod.parse_sab(sab)
+    faces = [e for e in builder.entities if e.name == "face"]
+    if len(faces) != 1:
+        raise AssertionError(f"expected one face, got {len(faces)}")
+    # face data: pattern, next, loop, shell, subshell, surface, ...
+    surf = faces[0].data[5].value
+    vals = [t.value for t in surf.data[1:] if t.tag in (0x06, 0x13, 0x14)]
+    sub = lambda a, b: tuple(x - y for x, y in zip(a, b))
+    dot = lambda a, b: sum(x * y for x, y in zip(a, b))
+    norm = lambda a: math.sqrt(dot(a, a))
+    if surf.name == "cone-surface":
+        center, axis, major, _ratio, sin, cos, _scale = vals[:7]
+        r0 = norm(major)
+
+        def d(p):
+            v = sub(p, center)
+            h = dot(v, axis)
+            rho = norm(sub(v, tuple(h * a for a in axis)))
+            return (rho - (r0 + h * sin / cos)) * cos
+
+        return ("cylinder" if sin == 0 else "cone"), d
+    if surf.name == "sphere-surface":
+        center, radius = vals[0], vals[1]
+        return "sphere", lambda p: norm(sub(p, center)) - radius
+    if surf.name == "torus-surface":
+        center, axis, major, minor = vals[:4]
+
+        def d(p):
+            v = sub(p, center)
+            z = dot(v, axis)
+            rho = norm(sub(v, tuple(z * a for a in axis)))
+            return math.hypot(rho - major, z) - minor
+
+        return "torus", d
+    raise AssertionError(f"unexpected surface {surf.name}")
+
+
+def check_curves(obj: dict, up: str, report: dict, acis: list) -> list[str]:
+    """Every vertex of every face each surface was recognized from lies on the surface
+    read back from the file, within its own stated precision (see crates/obj2cad-curves)."""
+    regions = report.get("curves", [])
+    if len(regions) != len(acis):
+        return [f"{len(regions)} regions in the report, {len(acis)} surfaces in the file"]
+    faces = [idx for kind, idx, *_ in obj["elements"] if kind == "f"]
+    P = [transform(p, up) for p in obj["positions"]]
+    used = sorted({i for f in faces for i in f})
+    if not used:
+        return []
+    lo = [min(P[i][a] for i in used) for a in range(3)]
+    hi = [max(P[i][a] for i in used) for a in range(3)]
+    size = math.dist(lo, hi)
+    floor = 1e-12 * (max(abs(c) for i in used for c in P[i]) + size)
+    cap = max(1e-6 * size, floor)
+
+    def tol(i):
+        t = 0.5 * math.sqrt(sum(quantum(x) ** 2 for x in obj["texts"][i]))
+        return max(min(t, cap), floor)
+
+    problems = []
+    for region, (_, _, sab) in zip(regions, acis):
+        kind, d = surface_of(sab)
+        if kind != region["kind"]:
+            problems.append(f"report says {region['kind']}, file has {kind}")
+        worst = max(abs(d(P[i])) / tol(i) for f in region["faces"] for i in faces[f])
+        if worst > 1.0 + 1e-9:
+            problems.append(f"{kind}: a vertex is {worst:.3g} tolerances off the surface")
+    return problems
 
 
 # ---------------------------------------------------------------- driver
-def check(binary: Path, obj_path: Path, out_dir: Path, up: str, fmt: str, expect_invalid: bool) -> tuple[bool, str]:
+def check(binary: Path, obj_path: Path, out_dir: Path, up: str, fmt: str, expect_invalid: bool, curves: bool = False) -> tuple[bool, str]:
     """`obj_path`: an .obj or .xyz file, or a folder holding one bundle."""
     stem = f"{obj_path.parent.name}_{obj_path.stem}" if obj_path.stem == "model" else obj_path.stem
     ext = ".dwg" if fmt == "dwg" else ".dxf"
@@ -523,6 +614,8 @@ def check(binary: Path, obj_path: Path, out_dir: Path, up: str, fmt: str, expect
     cmd = [str(binary), "convert", str(obj_path), "-o", str(dxf), "--report", str(rep), "--format", fmt, "--quiet"]
     if up != "auto":
         cmd += ["--up", up]
+    if curves:
+        cmd += ["--curves"]
     t0 = time.perf_counter()
     proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8")
     elapsed = time.perf_counter() - t0
@@ -544,7 +637,7 @@ def check(binary: Path, obj_path: Path, out_dir: Path, up: str, fmt: str, expect
 
     h_rust = report["parity_hash"]
     h_obj = hash_from_obj(obj, applied_up)
-    h_dxf, auditor, structure, layer_colors, header = read_dwg(dxf, binary) if fmt == "dwg" else read_dxf(dxf)
+    h_dxf, auditor, structure, layer_colors, header, acis = read_dwg(dxf, binary) if fmt == "dwg" else read_dxf(dxf)
     problems = []
     if h_obj != h_rust:
         problems.append("OBJ readers disagree on geometry")
@@ -567,10 +660,14 @@ def check(binary: Path, obj_path: Path, out_dir: Path, up: str, fmt: str, expect
         problems.append("custom property parity hash missing/wrong")
     if header["acadver"] != "AC1032":
         problems.append(f"unexpected version {header['acadver']}")
+    if acis and not curves:
+        problems.append("surfaces written without --curves")
+    problems += check_curves(obj, applied_up, report, acis)
     if problems:
         return False, "; ".join(problems)
     up_note = "upright" if applied_up == "y_up_to_z_up" else "as-is"
-    return True, f"{report['output']['faces']} faces, {len(used_layers)} layers, {up_note}, {elapsed:.2f}s"
+    kinds = "".join(f", {r['kind']}" for r in report.get("curves", []))
+    return True, f"{report['output']['faces']} faces, {len(used_layers)} layers, {up_note}{kinds}, {elapsed:.2f}s"
 
 
 def main() -> int:
@@ -580,6 +677,7 @@ def main() -> int:
     ap.add_argument("--up", default="auto", choices=["auto", "as-is", "y-to-z"])
     ap.add_argument("--format", default="dxf", choices=["dxf", "dxf-binary", "dwg"])
     ap.add_argument("--keep", type=Path, help="keep outputs in this folder")
+    ap.add_argument("--curves", action="store_true", help="also recognize curved surfaces and verify them")
     a = ap.parse_args()
 
     binary = a.bin if a.bin.exists() else a.bin.with_suffix(".exe")
@@ -603,13 +701,13 @@ def main() -> int:
         out.mkdir(parents=True, exist_ok=True)
         for obj in objs:
             try:
-                ok, msg = check(binary, obj, out, a.up, a.format, "invalid" in obj.parts)
+                ok, msg = check(binary, obj, out, a.up, a.format, "invalid" in obj.parts, a.curves)
             except Exception as e:  # a harness crash is a failure, not a pass
                 ok, msg = False, f"harness error: {type(e).__name__}: {e}"
             failures += not ok
             label = f"{obj.parent.name}/{obj.name}" if obj.stem == "model" else obj.name
             print(f"{'PASS' if ok else 'FAIL'}  {label:<40} {msg}", flush=True)
-    print(f"\n{len(objs) - failures}/{len(objs)} passed (up {a.up}, {a.format})")
+    print(f"\n{len(objs) - failures}/{len(objs)} passed (up {a.up}, {a.format}{', curves' if a.curves else ''})")
     return 1 if failures else 0
 
 

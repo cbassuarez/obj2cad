@@ -89,6 +89,8 @@ struct Settings {
     created_unix: Option<f64>,
     /// Record the source file name in the drawing's properties.
     include_name: bool,
+    /// Also write recognized curved surfaces.
+    curves: bool,
 }
 
 impl Default for Settings {
@@ -103,6 +105,7 @@ impl Default for Settings {
             format: Format::Dxf,
             created_unix: None,
             include_name: true,
+            curves: false,
         }
     }
 }
@@ -236,6 +239,7 @@ impl Session {
             default_layer: b.stem.clone(),
             keep_loose_points: s.keep_loose_points,
             exclude_layers: s.exclude_layers.clone(),
+            curves: s.curves,
         })
     }
 
@@ -263,7 +267,8 @@ impl Session {
 
     /// Step 1: the canonical bytes whose SHA-256 is the parity hash. The caller digests
     /// them natively. Only settings that move geometry change it (up axis, loose points,
-    /// excluded layers), so callers can cache it across the others.
+    /// excluded layers), so callers can cache it across the others. (Curved surfaces are
+    /// written next to the mesh; the hash covers the mesh, so they aren't computed here.)
     pub fn parity_stream(&self, settings: &str) -> Result<Vec<u8>, JsError> {
         Ok(hash::parity_stream(&self.model(&settings_from(settings)?)?))
     }
@@ -279,7 +284,11 @@ impl Session {
     ) -> Result<Conversion, JsError> {
         let s = settings_from(settings)?;
         let t0 = now();
-        let model = self.model(&s)?;
+        let mut model = self.model(&s)?;
+        let curves = model
+            .options
+            .curves
+            .then(|| obj2cad_curves::add_to(&mut model).to_string());
         let (b, h) = self.loaded()?;
         let t1 = now();
 
@@ -296,6 +305,10 @@ impl Session {
         ];
         if s.include_name {
             props.push(("obj2cad.source_name", b.name.as_str()));
+        }
+        let curves_label = curves.map(|n| obj2cad_curves::label(&n));
+        if let Some(c) = &curves_label {
+            props.push(("obj2cad.curves", c.as_str()));
         }
         let meta = Meta {
             properties: &props,

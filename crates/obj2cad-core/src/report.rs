@@ -1,7 +1,7 @@
 //! The parity report written next to every conversion.
 
 use crate::bundle::FileEntry;
-use crate::convert::{CadModel, Omissions, Options, UpAxis};
+use crate::convert::{CadModel, Omissions, Options, Region, UpAxis};
 use crate::diag::Diagnostic;
 use crate::obj::SourceCounts;
 use serde::Serialize;
@@ -26,6 +26,8 @@ pub struct Report {
     pub texture_colored_faces: u64,
     /// Every file in the bundle and what it was used for (empty for a single file).
     pub files: Vec<FileEntry>,
+    /// Curved surfaces written next to the mesh, in the order of their entities.
+    pub curves: Vec<Region>,
     pub layers: Vec<LayerSummary>,
     pub diagnostics: Vec<Diagnostic>,
 }
@@ -45,6 +47,8 @@ pub struct LayerSummary {
     pub faces: u64,
     pub polylines: u64,
     pub points: u64,
+    /// Curved surfaces (ACIS bodies).
+    pub surfaces: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -128,6 +132,11 @@ pub fn build(model: &CadModel, source: &Source, parity: &str, written: Written) 
         points[p.layer as usize] += 1;
         add(p.layer, p.color);
     }
+    let mut surfaces = vec![0u64; n];
+    for s in &model.surfaces {
+        surfaces[s.layer as usize] += 1;
+        add(s.layer, s.color);
+    }
     Report {
         schema: "obj2cad-report-v3",
         engine_version: crate::VERSION,
@@ -173,6 +182,11 @@ pub fn build(model: &CadModel, source: &Source, parity: &str, written: Written) 
         point_cloud: model.point_cloud,
         omissions: model.omissions.clone(),
         texture_colored_faces: model.texture_colored_faces,
+        curves: model
+            .surfaces
+            .iter()
+            .filter_map(|s| s.region.clone())
+            .collect(),
         files: if source.files.len() > 1 {
             source.files.to_vec()
         } else {
@@ -195,6 +209,7 @@ pub fn build(model: &CadModel, source: &Source, parity: &str, written: Written) 
                 faces: faces[i],
                 polylines: polylines[i],
                 points: points[i],
+                surfaces: surfaces[i],
             })
             .collect(),
         diagnostics: model.diagnostics.clone(),

@@ -118,8 +118,97 @@ impl Preview {
             out.point_colors.extend_from_slice(&color(p.color, p.layer));
             push_group(&mut out.point_groups, p.layer, start, 1);
         }
+        // Recognized curved surfaces: their exact edges (closed surfaces, a few circles),
+        // drawn as lines over the mesh on their own layer.
+        let mut by_layer: Vec<usize> = (0..model.surfaces.len()).collect();
+        by_layer.sort_by_key(|&i| model.surfaces[i].layer);
+        for i in by_layer {
+            let s = &model.surfaces[i];
+            let start = (out.lines.len() / 3) as u32;
+            let rgb = color(s.color, s.layer);
+            for poly in outline(&s.body) {
+                for w in poly.windows(2) {
+                    for p in w {
+                        out.lines
+                            .extend([0, 1, 2].map(|a| (p[a] - origin[a]) as f32));
+                        out.line_colors.extend_from_slice(&rgb);
+                    }
+                }
+            }
+            push_group(
+                &mut out.line_groups,
+                s.layer,
+                start,
+                (out.lines.len() / 3) as u32 - start,
+            );
+        }
         out
     }
+}
+
+/// Polylines that show an ACIS body: its edges, sampled; for closed faces (no edges), a
+/// few circles on the surface.
+fn outline(body: &obj2cad_acis::Body) -> Vec<Vec<[f64; 3]>> {
+    use obj2cad_acis::{Curve, Surface};
+    let mut out = Vec::new();
+    let circle = |center: [f64; 3], normal: [f64; 3], radius: f64| {
+        let u = obj2cad_acis::perpendicular(normal);
+        let c = Curve::Circle {
+            center,
+            normal,
+            u_dir: u,
+            radius,
+        };
+        (0..=64)
+            .map(|k| c.point(std::f64::consts::TAU * f64::from(k) / 64.0))
+            .collect::<Vec<_>>()
+    };
+    for e in &body.edges {
+        let n = if matches!(e.curve, Curve::Line { .. }) {
+            1
+        } else {
+            48
+        };
+        out.push(
+            (0..=n)
+                .map(|k| {
+                    e.curve
+                        .point(e.t0 + (e.t1 - e.t0) * f64::from(k) / f64::from(n))
+                })
+                .collect(),
+        );
+    }
+    for f in body.faces.iter().filter(|f| f.loops.is_empty()) {
+        match f.surface {
+            Surface::Sphere {
+                center,
+                radius,
+                u_dir,
+                pole,
+            } => {
+                out.push(circle(center, pole, radius));
+                out.push(circle(center, u_dir, radius));
+                out.push(circle(center, obj2cad_acis::cross(pole, u_dir), radius));
+            }
+            Surface::Torus {
+                center,
+                axis,
+                major,
+                minor,
+                u_dir,
+            } => {
+                out.push(circle(center, axis, major + minor));
+                out.push(circle(center, axis, major - minor));
+                let up = obj2cad_acis::scale(axis, minor);
+                out.push(circle(obj2cad_acis::add(center, up), axis, major));
+                out.push(circle(obj2cad_acis::sub(center, up), axis, major));
+                let tube = obj2cad_acis::add(center, obj2cad_acis::scale(u_dir, major));
+                out.push(circle(tube, obj2cad_acis::cross(axis, u_dir), minor));
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Append `count` items at `start` to `layer`'s group, merging with the previous group

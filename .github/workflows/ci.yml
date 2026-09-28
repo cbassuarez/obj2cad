@@ -50,6 +50,10 @@ jobs:
         run: python tests/harness/parity.py --up auto --format dxf-binary --keep acceptance/dxf-binary tests/fixtures
       - name: Parity harness (DWG)
         run: python tests/harness/parity.py --up auto --format dwg --keep acceptance/dwg tests/fixtures
+      - name: Curved surfaces (every vertex re-checked against the surface read back)
+        run: |
+          python tests/harness/parity.py --curves --up auto --keep acceptance/curves tests/fixtures
+          python tests/harness/parity.py --curves --up auto --format dwg --keep acceptance/curves-dwg tests/fixtures
       - name: AutoCAD acceptance files (see docs/ACCEPTANCE.md)
         if: matrix.os == 'ubuntu-latest'
         run: |

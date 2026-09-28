@@ -513,6 +513,7 @@ export function App() {
               onLayerMode={(layerMode: LayerMode) => changePrefs({ layerMode })}
               onFormat={(format: Format) => changePrefs({ format })}
               onIncludeName={(includeName) => changePrefs({ includeName })}
+              onCurves={(curves) => changePrefs({ curves })}
               onDownload={download}
               onDownloadVisible={(hidden) => void downloadVisible(hidden)}
               onDownloadReport={() => void downloadReport()}

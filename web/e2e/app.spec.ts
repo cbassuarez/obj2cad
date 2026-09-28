@@ -17,8 +17,8 @@ const input = (page: Page) => page.locator('input[accept^=".obj"]');
 
 type Format = "dxf" | "dxf-binary" | "dwg";
 
-async function open(page: Page, files: string[], format: Format = "dxf") {
-  await page.addInitScript((f) => localStorage.setItem("obj2cad.prefs.v1", JSON.stringify({ format: f })), format);
+async function open(page: Page, files: string[], format: Format = "dxf", curves = false) {
+  await page.addInitScript(([f, c]) => localStorage.setItem("obj2cad.prefs.v1", JSON.stringify({ format: f, curves: c })), [format, curves] as const);
   await page.goto("/");
   await input(page).setInputFiles(files);
 }
@@ -31,9 +31,9 @@ async function download(page: Page): Promise<{ name: string; bytes: Buffer }> {
   return { name: d.suggestedFilename(), bytes: readFileSync((await d.path())!) };
 }
 
-function cliOutput(inputs: string | string[], format: Format): Buffer {
+function cliOutput(inputs: string | string[], format: Format, extra: string[] = []): Buffer {
   const out = path.join(mkdtempSync(path.join(tmpdir(), "obj2cad-e2e-")), `out.${format === "dwg" ? "dwg" : "dxf"}`);
-  execFileSync(cli, ["convert", ...[inputs].flat(), "-o", out, "--format", format, "--quiet"]);
+  execFileSync(cli, ["convert", ...[inputs].flat(), "-o", out, "--format", format, "--quiet", ...extra]);
   return readFileSync(out);
 }
 
@@ -105,6 +105,31 @@ test("several loose models: combine into one drawing", async ({ page }) => {
   await page.getByRole("button", { name: "Combine into one drawing" }).click();
   const got = await download(page);
   expect(got.bytes.equals(cliOutput(files, "dxf")), "web and CLI outputs differ").toBe(true);
+});
+
+for (const format of ["dxf", "dwg"] as const) {
+  for (const name of objs("curves")) {
+    test(`${name} with curved surfaces (${format}) matches the command-line tool`, async ({ page }) => {
+      const obj = path.join(fixtures, "curves", name);
+      await open(page, [obj], format, true);
+      const got = await download(page);
+      expect(got.bytes.equals(cliOutput(obj, format, ["--curves"])), "web and CLI outputs differ").toBe(true);
+    });
+  }
+}
+
+test("curved surfaces are listed and get their own layer", async ({ page }) => {
+  await open(page, [path.join(fixtures, "curves", "capsule.obj")], "dxf", true);
+  await expect(downloadButton(page)).toBeEnabled();
+  await expect(page.getByText("Curved surfaces: 1 cylinder, 2 spheres")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Hide layer Curves" })).toBeVisible();
+  // Off by default, from the download menu.
+  await open(page, [path.join(fixtures, "curves", "capsule.obj")]);
+  await expect(downloadButton(page)).toBeEnabled();
+  await expect(page.getByText(/^Curved surfaces:/)).toHaveCount(0);
+  await page.getByRole("button", { name: "Download options" }).click();
+  await page.getByRole("menuitem", { name: "Curved surfaces" }).click();
+  await expect(page.getByText("Curved surfaces: 1 cylinder, 2 spheres")).toBeVisible();
 });
 
 for (const name of objs("invalid")) {

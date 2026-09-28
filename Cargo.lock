@@ -426,10 +426,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "obj2cad-acis"
+version = "0.2.0"
+
+[[package]]
 name = "obj2cad-cli"
 version = "0.2.0"
 dependencies = [
+ "obj2cad-acis",
  "obj2cad-core",
+ "obj2cad-curves",
  "obj2cad-dwg",
  "obj2cad-dxf",
  "serde_json",
@@ -442,6 +448,7 @@ version = "0.2.0"
 dependencies = [
  "jpeg-decoder",
  "memchr",
+ "obj2cad-acis",
  "obj2cad-dxf",
  "png",
  "proptest",
@@ -450,10 +457,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "obj2cad-curves"
+version = "0.2.0"
+dependencies = [
+ "obj2cad-acis",
+ "obj2cad-core",
+]
+
+[[package]]
 name = "obj2cad-dwg"
 version = "0.2.0"
 dependencies = [
  "acadrust",
+ "obj2cad-acis",
  "obj2cad-core",
 ]
 
@@ -462,6 +478,7 @@ name = "obj2cad-dxf"
 version = "0.2.0"
 dependencies = [
  "itoa",
+ "obj2cad-acis",
  "obj2cad-core",
  "ryu",
 ]
@@ -473,7 +490,9 @@ dependencies = [
  "earcut",
  "getrandom 0.3.4",
  "js-sys",
+ "obj2cad-acis",
  "obj2cad-core",
+ "obj2cad-curves",
  "obj2cad-dwg",
  "obj2cad-dxf",
  "serde",

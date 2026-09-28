@@ -70,6 +70,8 @@ export interface Report {
   options: { units: Units; up_axis: UpAxis; layer_mode: LayerMode; keep_loose_points: boolean; exclude_layers: string[] };
   texture_colored_faces: number;
   files: BundleFile[];
+  /** Curved surfaces written next to the mesh (crates/obj2cad-curves). */
+  curves: { kind: "cylinder" | "cone" | "sphere" | "torus"; faces: number[]; max_deviation: number; tolerance: number }[];
   omissions: {
     freeform_surfaces: number;
     freeform_curves: number;
@@ -80,7 +82,7 @@ export interface Report {
     excluded_lines: number;
     excluded_points: number;
   };
-  layers: { name: string; source: string; color: string; entity_colors: string[]; more_colors: boolean; faces: number; polylines: number; points: number }[];
+  layers: { name: string; source: string; color: string; entity_colors: string[]; more_colors: boolean; faces: number; polylines: number; points: number; surfaces: number }[];
   diagnostics: { severity: "info" | "warning"; code: string; line: number; count: number; message: string }[];
 }
 

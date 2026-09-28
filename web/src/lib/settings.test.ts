@@ -11,8 +11,9 @@ describe("preferences", () => {
   });
 
   it("keep valid values and drop unknown ones", () => {
-    const p = loadPrefs(store(JSON.stringify({ format: "dwg", layerMode: "nope", houseUnits: "meters", includeName: false })));
-    expect(p).toEqual({ format: "dwg", layerMode: "objects", houseUnits: "meters", includeName: false });
+    const p = loadPrefs(store(JSON.stringify({ format: "dwg", layerMode: "nope", houseUnits: "meters", includeName: false, curves: "yes" })));
+    expect(p).toEqual({ format: "dwg", layerMode: "objects", houseUnits: "meters", includeName: false, curves: false });
+    expect(loadPrefs(store(JSON.stringify({ curves: true }))).curves).toBe(true);
     expect(loadPrefs(store(JSON.stringify({ houseUnits: "unitless" }))).houseUnits).toBeNull();
     expect(loadPrefs(store(JSON.stringify({ houseUnits: "parsecs" }))).houseUnits).toBeNull();
   });
@@ -36,13 +37,16 @@ describe("engine settings", () => {
     const upright = engineSettings(DEFAULT_PREFS, { ...AUTO, up: "y_up_to_z_up" });
     const units = engineSettings(DEFAULT_PREFS, { ...AUTO, units: "meters" });
     const layers = engineSettings({ ...DEFAULT_PREFS, layerMode: "materials" }, AUTO);
+    const curves = engineSettings({ ...DEFAULT_PREFS, curves: true }, AUTO);
     // Orientation turns the existing preview; units only relabel it.
     expect(previewKey(upright)).toBe(previewKey(base));
     expect(previewKey(units)).toBe(previewKey(base));
     expect(previewKey(layers)).not.toBe(previewKey(base));
-    // The parity hash follows geometry, never labels.
+    expect(previewKey(curves)).not.toBe(previewKey(base));
+    // The parity hash follows the mesh, never labels (curved surfaces sit next to it).
     expect(geometryKey(upright)).not.toBe(geometryKey(base));
     expect(geometryKey(units)).toBe(geometryKey(base));
     expect(geometryKey(layers)).toBe(geometryKey(base));
+    expect(geometryKey(curves)).toBe(geometryKey(base));
   });
 });

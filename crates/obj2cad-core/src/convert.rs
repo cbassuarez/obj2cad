@@ -109,6 +109,9 @@ pub struct Options {
     /// Output layer names to leave out (for "visible layers only").
     #[serde(default)]
     pub exclude_layers: Vec<String>,
+    /// Also write curved surfaces recognized in the mesh (the mesh itself is unchanged).
+    #[serde(default)]
+    pub curves: bool,
 }
 
 fn default_layer() -> String {
@@ -124,6 +127,7 @@ impl Default for Options {
             default_layer: default_layer(),
             keep_loose_points: false,
             exclude_layers: Vec::new(),
+            curves: false,
         }
     }
 }
@@ -168,6 +172,8 @@ pub struct MeshEntity {
     /// Faces as indices into `vertices`: `face_offsets[i]..face_offsets[i+1]`.
     pub face_offsets: Vec<u32>,
     pub face_indices: Vec<u32>,
+    /// Index of each face in the source document (`ObjDocument::faces`).
+    pub source_faces: Vec<u32>,
 }
 
 impl MeshEntity {
@@ -196,6 +202,22 @@ pub struct SurfaceEntity {
     pub layer: u32,
     pub color: Option<[u8; 3]>,
     pub body: obj2cad_acis::Body,
+    /// What it was recognized from, for the report (`None` for test bodies).
+    pub region: Option<Region>,
+}
+
+/// The mesh region a surface was recognized from. Every vertex of every face in it lies
+/// on the surface within that vertex's tolerance.
+#[derive(Debug, Clone, Serialize)]
+pub struct Region {
+    /// `cylinder`, `cone`, `sphere` or `torus`.
+    pub kind: &'static str,
+    /// Source faces (indices into `ObjDocument::faces`) that lie on the surface.
+    pub faces: Vec<u32>,
+    /// Largest distance of any of their vertices from the surface, in model units.
+    pub max_deviation: f64,
+    /// Largest distance allowed for any of them (each vertex's own precision).
+    pub tolerance: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -633,6 +655,7 @@ pub fn convert_with<'a>(
                         vertices: Vec::new(),
                         face_offsets: vec![0],
                         face_indices: Vec::new(),
+                        source_faces: Vec::new(),
                     });
                     open.insert(key, meshes.len() - 1);
                     meshes.len() - 1
@@ -661,6 +684,7 @@ pub fn convert_with<'a>(
             m.face_indices.push(li);
         }
         m.face_offsets.push(m.face_indices.len() as u32);
+        m.source_faces.push(fi as u32);
     }
     let face_vertices: usize = {
         let mut seen = vec![false; doc.positions.len()];
