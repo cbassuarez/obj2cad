@@ -78,6 +78,9 @@ def read_obj(path: Path) -> dict:
     forward = []
     obj = grp = mat = None
     mtllibs = []
+    weights: dict[int, float] = {}
+    splines, curv_count = [], 0
+    cstype = deg = pending = None
 
     def ref(tok: str, n: int, slot: int) -> int:
         i = int(tok)
@@ -115,8 +118,26 @@ def read_obj(path: Path) -> dict:
                 raise ObjError("non-finite")
             pos.append(xyz)
             texts.append(tuple(args[:3]))
+            if len(args) == 4 and float(args[3]) != 1.0:
+                weights[len(pos) - 1] = float(args[3])
             # `v x y z r g b`: stored as single precision, then 0..1 → 0..255.
             colors.append(tuple(byte(f32(float(a))) for a in args[3:6]) if len(args) == 6 else None)
+        elif kw == "cstype":
+            cstype = (len(args) == 2 and args[0] == "rat", args[-1]) if args and len(args) <= 2 else None
+        elif kw == "deg":
+            deg = int(args[0]) if args else None
+        elif kw == "curv":
+            curv_count += 1
+            pending = {"range": (float(args[0]), float(args[1])), "cps": [ref(a, len(pos), 0) for a in args[2:]], "parm": None}
+        elif kw == "parm":
+            if args and args[0] == "u" and pending is not None:
+                pending["parm"] = [float(a) for a in args[1:]]
+        elif kw == "end":
+            if pending is not None:
+                sp = spline_of(pending, cstype, deg)
+                if sp is not None:
+                    splines.append({**sp, "o": obj, "g": grp, "m": mat})
+            pending = None
         elif kw == "vt":
             nvt += 1
         elif kw == "vn":
@@ -151,7 +172,41 @@ def read_obj(path: Path) -> dict:
     for i, slot in forward:
         if i >= totals[slot]:
             raise ObjError("forward reference out of range")
-    return {"positions": pos, "texts": texts, "colors": colors, "elements": elements, "mtllibs": mtllibs}
+    for sp in splines:
+        sp["weights"] = [weights.get(i, 1.0) for i in sp["cps"]] if sp["rational"] else None
+    return {"positions": pos, "texts": texts, "colors": colors, "elements": elements, "mtllibs": mtllibs,
+            "splines": splines, "curves_left_out": curv_count - len(splines)}
+
+
+def spline_of(p: dict, cstype, deg):
+    """A free-form curve as a B-spline, or None when it can't be written exactly: only
+    B-spline and Bezier curves whose range is their whole knot domain."""
+    if cstype is None or deg is None or p["parm"] is None:
+        return None
+    rational, kind = cstype
+    n = len(p["cps"])
+    if deg < 1 or n < deg + 1:
+        return None
+    if kind == "bspline":
+        if len(p["parm"]) != n + deg + 1:
+            return None
+        knots = p["parm"]
+    elif kind == "bezier":
+        breaks = p["parm"]
+        if (n - 1) % deg or len(breaks) != (n - 1) // deg + 1:
+            return None
+        knots = [breaks[0]] * (deg + 1) + [b for b in breaks[1:-1] for _ in range(deg)] + [breaks[-1]] * (deg + 1)
+    else:
+        return None
+    if any(b < a for a, b in zip(knots, knots[1:])) or p["range"] != (knots[deg], knots[n]):
+        return None
+    return {"degree": deg, "knots": knots, "cps": p["cps"], "rational": rational}
+
+
+def spline_record(degree: int, knots, verts, weights) -> bytes:
+    b = struct.pack(">II", degree, len(knots)) + b"".join(struct.pack(">d", k) for k in knots)
+    b += record(verts)
+    return b + b"".join(struct.pack(">d", w) for w in (weights or []))
 
 
 def f32(x: float) -> float:
@@ -185,7 +240,7 @@ def read_xyz(path: Path) -> dict:
                 continue  # column names
         rows.append(t)
     if not rows:
-        return {"positions": [], "texts": [], "colors": [], "elements": [], "mtllibs": []}
+        return {"positions": [], "texts": [], "colors": [], "elements": [], "mtllibs": [], "splines": [], "curves_left_out": 0}
     sep = ";" if ";" in rows[0] else ("," if "," in rows[0] and len(rows[0].split()) < 3 else None)
     split = (lambda r: [x.strip() for x in r.split(sep)]) if sep else (lambda r: r.split())
     table = [split(r) for r in rows]
@@ -224,7 +279,8 @@ def read_xyz(path: Path) -> dict:
     colors = [tuple(int(v) for v in r[rgb_at:rgb_at + 3]) if rgb_at is not None else None for r in vals]
     stem = path.stem
     texts = [tuple(r[:3]) for r in table]
-    return {"positions": pos, "texts": texts, "colors": colors, "elements": [("p", list(range(len(pos))), stem, None, None, False)], "mtllibs": []}
+    return {"positions": pos, "texts": texts, "colors": colors, "elements": [("p", list(range(len(pos))), stem, None, None, False)], "mtllibs": [],
+            "splines": [], "curves_left_out": 0}
 
 
 def read_mtl(path: Path) -> tuple[dict, dict]:
@@ -304,7 +360,7 @@ def read_bundle(files: list[Path], name: str) -> dict:
     n_obj = sum(ext(p) == ".obj" for p in geometry)
     several = len(parts) > 1
 
-    merged = {"positions": [], "texts": [], "colors": [], "elements": [], "mtllibs": []}
+    merged = {"positions": [], "texts": [], "colors": [], "elements": [], "mtllibs": [], "splines": [], "curves_left_out": 0}
     palette, textured, meaning = {}, set(), {}
     for p, doc in parts:
         colors, textures = {}, {}
@@ -344,6 +400,10 @@ def read_bundle(files: list[Path], name: str) -> dict:
             if several and o is None:
                 o = p.stem
             merged["elements"].append((kind, [i + v0 for i in idx], o, g, rename.get(mat, mat), uv))
+        for sp in doc["splines"]:
+            o = sp["o"] if sp["o"] is not None or not several else p.stem
+            merged["splines"].append({**sp, "cps": [i + v0 for i in sp["cps"]], "o": o, "m": rename.get(sp["m"], sp["m"])})
+        merged["curves_left_out"] += doc["curves_left_out"]
     if len(geometry) == 1:
         stem = geometry[0].stem
     else:
@@ -367,7 +427,7 @@ def expected_structure(obj: dict, stem: str, up: str, palette: dict, textured: s
     layer mode (objects; groups when the file has no objects). Faces colored from a
     texture get color "T" (the harness can't decode images the way the engine does)."""
     P = [transform(p, up) for p in obj["positions"]]
-    has_objects = any(e[2] is not None for e in obj["elements"])
+    has_objects = any(e[2] is not None for e in obj["elements"]) or any(sp["o"] is not None for sp in obj.get("splines", []))
     taken, by_source, default = {"0"}, {}, [None]
 
     def unique(base: str) -> str:
@@ -402,7 +462,11 @@ def expected_structure(obj: dict, stem: str, up: str, palette: dict, textured: s
             if kind == "f" and uv and m in textured:
                 color = "T"
             records.append(structure_record(layer, color, kind, [P[i] for i in idx]))
-    if not obj["elements"] and P:  # point cloud
+    for sp in obj.get("splines", []):
+        layer = layer_of(sp["o"], sp["g"])
+        color = palette.get(sp["m"]) if sp["m"] is not None else None
+        records.append(structure_record(layer, color, "s", [P[i] for i in sp["cps"]], sp))
+    if not obj["elements"] and not obj.get("splines") and P:  # point cloud
         layer = default_layer()
         records += [structure_record(layer, vcolor[i], "p", [p]) for i, p in enumerate(P)]
     return records
@@ -413,9 +477,10 @@ def without_color(rec: bytes) -> bytes:
     return layer + b"\0" + rest
 
 
-def structure_record(layer: str, color, kind: str, verts) -> bytes:
+def structure_record(layer: str, color, kind: str, verts, spline=None) -> bytes:
     c = "-" if color is None else color if isinstance(color, str) else "%02x%02x%02x" % tuple(color)
-    return f"{layer}\0{c}\0{kind}\0".encode() + record(verts)
+    body = spline_record(spline["degree"], spline["knots"], verts, spline["weights"]) if spline else record(verts)
+    return f"{layer}\0{c}\0{kind}\0".encode() + body
 
 
 # ---------------------------------------------------------------- canonical geometry hash
@@ -428,9 +493,10 @@ def record(vertices) -> bytes:
     return b"".join(struct.pack(">d", c) for v in vertices for c in v)
 
 
-def parity_hash(faces, lines, points) -> str:
+def parity_hash(faces, lines, points, splines=()) -> str:
     h = hashlib.sha256(b"obj2cad-parity-v1\0")
-    for tag, recs in ((b"f", faces), (b"l", lines), (b"p", points)):
+    kinds = [(b"f", faces), (b"l", lines), (b"p", points)] + ([(b"s", splines)] if splines else [])
+    for tag, recs in kinds:
         recs = sorted(recs)
         h.update(tag + struct.pack("<Q", len(recs)))
         for r in recs:
@@ -443,15 +509,16 @@ def hash_from_obj(obj: dict, up: str) -> str:
     faces = [record(P[i] for i in idx) for k, idx, *_ in obj["elements"] if k == "f"]
     lines = [record(P[i] for i in idx) for k, idx, *_ in obj["elements"] if k == "l"]
     points = [record([P[i]]) for k, idx, *_ in obj["elements"] if k == "p" for i in idx]
-    if not obj["elements"]:
+    splines = [spline_record(sp["degree"], sp["knots"], [P[i] for i in sp["cps"]], sp["weights"]) for sp in obj.get("splines", [])]
+    if not obj["elements"] and not splines:
         points = [record([p]) for p in P]  # point cloud
-    return parity_hash(faces, lines, points)
+    return parity_hash(faces, lines, points, splines)
 
 
 def read_dxf(path: Path):
     doc = ezdxf.readfile(path)
     auditor = doc.audit()
-    faces, lines, points, structure, acis = [], [], [], [], []
+    faces, lines, points, structure, acis, splines = [], [], [], [], [], []
     for e in doc.modelspace():
         t = e.dxftype()
         color = e.dxf.true_color if e.dxf.hasattr("true_color") else None
@@ -474,6 +541,11 @@ def read_dxf(path: Path):
             structure.append(structure_record(layer, rgb, "p", verts))
         elif t in ("SURFACE", "3DSOLID"):
             acis.append((t, layer, bytes(e.sab)))
+        elif t == "SPLINE":
+            sp = {"degree": e.dxf.degree, "knots": list(e.knots), "weights": list(e.weights) if e.dxf.flags & 4 else None}
+            verts = [tuple(v) for v in e.control_points]
+            splines.append(spline_record(sp["degree"], sp["knots"], verts, sp["weights"]))
+            structure.append(structure_record(layer, rgb, "s", verts, sp))
         else:
             raise AssertionError(f"unexpected entity {t}")
     layer_colors = {l.dxf.name: l.dxf.get("true_color") for l in doc.layers}
@@ -481,7 +553,7 @@ def read_dxf(path: Path):
         "custom": dict(doc.header.custom_vars),
         "acadver": doc.header.get("$ACADVER"),
     }
-    return parity_hash(faces, lines, points), auditor, structure, layer_colors, header, acis
+    return parity_hash(faces, lines, points, splines), auditor, structure, layer_colors, header, acis
 
 
 def read_dwg(path: Path, binary: Path):
@@ -491,7 +563,7 @@ def read_dwg(path: Path, binary: Path):
         raise AssertionError("DWG does not read back: " + proc.stderr.strip())
     dump = json.loads(proc.stdout)
     unpack = lambda v: tuple(struct.unpack(">d", bytes.fromhex(c))[0] for c in v)
-    faces, lines, points, structure, acis = [], [], [], [], []
+    faces, lines, points, structure, acis, splines = [], [], [], [], [], []
     for e in dump["entities"]:
         t, layer = e["t"], e.get("layer")
         rgb = None if e.get("color") is None else tuple(bytes.fromhex(e["color"]))
@@ -507,6 +579,11 @@ def read_dwg(path: Path, binary: Path):
         elif t == "point":
             points.append(record(vs))
             structure.append(structure_record(layer, rgb, "p", vs))
+        elif t == "spline":
+            num = lambda h: struct.unpack(">d", bytes.fromhex(h))[0]
+            sp = {"degree": e["degree"], "knots": [num(k) for k in e["knots"]], "weights": [num(w) for w in e["weights"]] if e["rational"] else None}
+            splines.append(spline_record(sp["degree"], sp["knots"], vs, sp["weights"]))
+            structure.append(structure_record(layer, rgb, "s", vs, sp))
         elif t in ("surface", "solid"):
             acis.append(("SURFACE" if t == "surface" else "3DSOLID", layer, bytes.fromhex(e["sab"])))
         else:
@@ -518,7 +595,7 @@ def read_dwg(path: Path, binary: Path):
         errors = [None] * dump["problems"]
 
     header = {"custom": dump["custom"], "acadver": dump["version"]}
-    return parity_hash(faces, lines, points), Audit, structure, layer_colors, header, acis
+    return parity_hash(faces, lines, points, splines), Audit, structure, layer_colors, header, acis
 
 
 # ---------------------------------------------------------------- curved surfaces
@@ -662,6 +739,8 @@ def check(binary: Path, obj_path: Path, out_dir: Path, up: str, fmt: str, expect
         problems.append(f"unexpected version {header['acadver']}")
     if acis and not curves:
         problems.append("surfaces written without --curves")
+    if report["omissions"]["freeform_curves"] != obj["curves_left_out"]:
+        problems.append(f"{report['omissions']['freeform_curves']} free-form curves reported left out, harness counts {obj['curves_left_out']}")
     problems += check_curves(obj, applied_up, report, acis)
     if problems:
         return False, "; ".join(problems)

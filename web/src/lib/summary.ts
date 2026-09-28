@@ -56,7 +56,7 @@ export function summarize(r: Report): Summary {
     has("vertex_colors_dropped") && "vertex colors",
   ].filter((x): x is string => Boolean(x));
 
-  const other = r.output.polylines + r.output.points;
+  const other = r.output.polylines + r.output.points + (r.output.splines ?? 0);
   const shapes = { count: r.output.faces + other, noun: other ? "shapes" : "faces" };
   const files = r.files ?? [];
   const named = (role: string) => files.filter((f) => f.role === role).map((f) => f.name);

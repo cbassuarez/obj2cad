@@ -10,7 +10,9 @@
 
 use acadrust::entities::solid3d::AcisData;
 use acadrust::entities::surface::SurfaceKind;
-use acadrust::entities::{Mesh, MeshFace, Point, Polyline3D, Solid3D, Surface, Vertex3DPolyline};
+use acadrust::entities::{
+    Mesh, MeshFace, Point, Polyline3D, Solid3D, Spline, Surface, Vertex3DPolyline,
+};
 use acadrust::tables::TableEntry;
 use acadrust::{CadDocument, Color, DwgWriter, DxfVersion, EntityType, Layer, Vector2, Vector3};
 use obj2cad_core::convert::CadModel;
@@ -116,6 +118,17 @@ pub fn document(model: &CadModel, meta: &Meta) -> Result<CadDocument, Error> {
             .collect();
         doc.add_entity(EntityType::Polyline3D(polyline))
             .map_err(fail)?;
+    }
+    for c in &model.splines {
+        let mut spline = Spline::new();
+        spline.common.layer = model.layers[c.layer as usize].name.clone();
+        spline.common.color = color(c.color);
+        spline.degree = c.degree as i32;
+        spline.flags.rational = c.weights.is_some();
+        spline.knots = c.knots.clone();
+        spline.control_points = c.control.iter().map(|&v| v3(model.position(v))).collect();
+        spline.weights = c.weights.clone().unwrap_or_default();
+        doc.add_entity(EntityType::Spline(spline)).map_err(fail)?;
     }
     for p in &model.points {
         let mut point = Point::new();

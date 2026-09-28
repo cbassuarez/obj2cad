@@ -109,6 +109,28 @@ impl Preview {
                 (out.lines.len() / 3) as u32 - start,
             );
         }
+        // Free-form curves, sampled for display (the file keeps them exact).
+        let mut by_layer: Vec<usize> = (0..model.splines.len()).collect();
+        by_layer.sort_by_key(|&i| model.splines[i].layer);
+        for i in by_layer {
+            let c = &model.splines[i];
+            let start = (out.lines.len() / 3) as u32;
+            let rgb = color(c.color, c.layer);
+            let cps: Vec<[f64; 3]> = c.control.iter().map(|&v| rel(v)).collect();
+            let pts = sample_spline(c.degree as usize, &c.knots, &cps, c.weights.as_deref());
+            for w in pts.windows(2) {
+                for p in w {
+                    out.lines.extend(p.map(|x| x as f32));
+                    out.line_colors.extend_from_slice(&rgb);
+                }
+            }
+            push_group(
+                &mut out.line_groups,
+                c.layer,
+                start,
+                (out.lines.len() / 3) as u32 - start,
+            );
+        }
         let mut by_layer: Vec<usize> = (0..model.points.len()).collect();
         by_layer.sort_by_key(|&i| model.points[i].layer);
         for i in by_layer {
@@ -144,6 +166,61 @@ impl Preview {
         }
         out
     }
+}
+
+/// Points along a (rational) B-spline over its knot domain, 16 per knot span.
+fn sample_spline(
+    deg: usize,
+    knots: &[f64],
+    cps: &[[f64; 3]],
+    weights: Option<&[f64]>,
+) -> Vec<[f64; 3]> {
+    let n = cps.len();
+    if n <= deg || knots.len() != n + deg + 1 {
+        return cps.to_vec();
+    }
+    let w = |i: usize| weights.map_or(1.0, |w| w[i]);
+    // de Boor in homogeneous coordinates.
+    let eval = |t: f64| -> [f64; 3] {
+        let mut k = deg;
+        while k + 1 < n && knots[k + 1] <= t {
+            k += 1;
+        }
+        let mut d: Vec<[f64; 4]> = (0..=deg)
+            .map(|j| {
+                let i = k + j - deg;
+                let p = cps[i];
+                [p[0] * w(i), p[1] * w(i), p[2] * w(i), w(i)]
+            })
+            .collect();
+        for r in 1..=deg {
+            for j in (r..=deg).rev() {
+                let i = k + j - deg;
+                let den = knots[i + deg + 1 - r] - knots[i];
+                let a = if den == 0.0 {
+                    0.0
+                } else {
+                    (t - knots[i]) / den
+                };
+                let prev = d[j - 1];
+                for (x, p) in d[j].iter_mut().zip(prev) {
+                    *x = (1.0 - a) * p + a * *x;
+                }
+            }
+        }
+        let h = d[deg];
+        [h[0] / h[3], h[1] / h[3], h[2] / h[3]]
+    };
+    let (lo, hi) = (knots[deg], knots[n]);
+    let spans = knots[deg..=n]
+        .windows(2)
+        .filter(|w| w[1] > w[0])
+        .count()
+        .max(1);
+    let steps = 16 * spans;
+    (0..=steps)
+        .map(|s| eval(lo + (hi - lo) * s as f64 / steps as f64))
+        .collect()
 }
 
 /// Polylines that show an ACIS body: its edges, sampled; for closed faces (no edges), a
@@ -355,6 +432,21 @@ mod tests {
     fn layer_colors_come_from_the_engine() {
         let p = preview("o a\nv 0 0 0\nv 1 0 0\nv 1 1 0\nf 1 2 3\n");
         assert_eq!(&p.colors[..3], &obj2cad_core::convert::layer_color(1));
+    }
+
+    #[test]
+    fn rational_splines_sample_exactly_onto_their_circle() {
+        let w = std::f64::consts::FRAC_1_SQRT_2;
+        let pts = sample_spline(
+            2,
+            &[0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            &[[10.0, 0.0, 0.0], [10.0, 10.0, 0.0], [0.0, 10.0, 0.0]],
+            Some(&[1.0, w, 1.0]),
+        );
+        assert_eq!(pts.len(), 17);
+        assert!(pts
+            .iter()
+            .all(|p| ((p[0] * p[0] + p[1] * p[1]).sqrt() - 10.0).abs() < 1e-9));
     }
 
     #[test]

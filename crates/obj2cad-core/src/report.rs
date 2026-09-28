@@ -77,6 +77,8 @@ pub struct Output {
     pub faces: u64,
     pub polylines: u64,
     pub points: u64,
+    /// Free-form curves, as B-splines.
+    pub splines: u64,
     pub vertices_written: u64,
     pub unreferenced_vertices_skipped: u64,
     pub bounds: Option<([f64; 3], [f64; 3])>,
@@ -128,6 +130,10 @@ pub fn build(model: &CadModel, source: &Source, parity: &str, written: Written) 
         polylines[l.layer as usize] += 1;
         add(l.layer, l.color);
     }
+    for c in &model.splines {
+        polylines[c.layer as usize] += 1;
+        add(c.layer, c.color);
+    }
     for p in &model.points {
         points[p.layer as usize] += 1;
         add(p.layer, p.color);
@@ -162,6 +168,7 @@ pub fn build(model: &CadModel, source: &Source, parity: &str, written: Written) 
             faces: faces.iter().sum(),
             polylines: model.polylines.len() as u64,
             points: model.points.len() as u64,
+            splines: model.splines.len() as u64,
             vertices_written: model
                 .meshes
                 .iter()

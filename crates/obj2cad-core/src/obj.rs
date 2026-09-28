@@ -208,6 +208,10 @@ pub struct ObjDocument {
     pub diagnostics: Vec<Diagnostic>,
     /// Texture coordinates (`vt` u, v), kept for coloring faces from textures.
     pub texcoords: Vec<[f32; 2]>,
+    /// Vertex weights (`v x y z w`) for rational curves; empty when every weight is 1.
+    pub weights: Vec<f64>,
+    /// Free-form curves that convert exactly (see [`FreeformCurve`]).
+    pub curves: Vec<FreeformCurve>,
     /// Texture coordinate of each face corner, parallel to `faces.indices`
     /// ([`NO_UV`] where a corner has none). Empty when no face uses texture coordinates.
     pub face_uvs: Vec<u32>,
@@ -217,6 +221,20 @@ pub struct ObjDocument {
 
 /// A face corner without a texture coordinate.
 pub const NO_UV: u32 = u32::MAX;
+
+/// A free-form curve (`cstype`, `deg`, `curv`, `parm u`, `end`) as a B-spline: Bézier
+/// curves are written as B-splines with their segment breaks as knots (exact).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FreeformCurve {
+    pub degree: u32,
+    pub rational: bool,
+    /// Control vertices (0-based indices into `positions`).
+    pub control: Vec<u32>,
+    pub knots: Vec<f64>,
+    /// Index into [`ObjDocument::attrs`].
+    pub attr: u32,
+    pub line: u64,
+}
 
 impl ObjDocument {
     /// The exact source text of coordinate `axis` (0..3) of vertex `v`.
@@ -260,6 +278,22 @@ fn is_keyword(kw: &[u8]) -> bool {
         .any(|k| k.as_bytes() == kw)
 }
 
+/// Free-form state: the current `cstype` and `deg`, and a `curv` waiting for its `end`.
+#[derive(Default)]
+struct Freeform {
+    /// (rational, kind): kind is `bspline`, `bezier`, or another (unsupported) type.
+    cstype: Option<(bool, Vec<u8>)>,
+    degree: Option<u32>,
+    pending: Option<PendingCurve>,
+}
+
+struct PendingCurve {
+    range: (f64, f64),
+    control: Vec<u32>,
+    parm: Option<Vec<f64>>,
+    line: u64,
+}
+
 /// Deferred check for an index that pointed past the elements defined so far. The OBJ
 /// spec numbers vertices by their order in the file, so a later definition is valid.
 struct Forward {
@@ -297,6 +331,7 @@ struct Parser {
     in_header: bool,
     scratch: Vec<u32>,
     scratch_uv: Vec<u32>,
+    freeform: Freeform,
     objects: Names,
     groups: Names,
     materials: Names,
@@ -344,6 +379,7 @@ pub fn parse_with_progress(
         in_header: true,
         scratch: Vec::new(),
         scratch_uv: Vec::new(),
+        freeform: Freeform::default(),
         objects: Names::default(),
         groups: Names::default(),
         materials: Names::default(),
@@ -442,6 +478,16 @@ pub fn parse_with_progress(
             more: issues,
             truncated,
         });
+    }
+
+    // A curve still waiting for its `end` is left out, never silently.
+    if let Some(c) = p.freeform.pending.take() {
+        p.diags.push(
+            Severity::Warning,
+            Code::FreeformNotConverted,
+            c.line,
+            || "free-form curve left out: no `end`".into(),
+        );
     }
 
     let has_color = p.doc.counts.vertices_with_color;
@@ -602,6 +648,10 @@ impl Parser {
                 self.doc.counts.smoothing_statements += 1;
                 Ok(())
             }
+            b"cstype" | b"deg" | b"curv" | b"parm" | b"end" => {
+                self.doc.counts.freeform_statements += 1;
+                self.freeform_statement(kw, rest)
+            }
             _ => {
                 // A keyword behind invisible bytes (zero-width space, a stray BOM, UTF-16)
                 // must not be skipped: dropping a `v` line would shift every later index.
@@ -687,7 +737,7 @@ impl Parser {
 
     fn vertex(&mut self, rest: &[u8]) -> Result<(), ParseIssue> {
         match self.read_vertex(rest) {
-            Ok((p, text, color, weighted)) => {
+            Ok((p, text, color, weight)) => {
                 for t in text {
                     self.doc.coord_text.extend_from_slice(t);
                     let end = u32::try_from(self.doc.coord_text.len()).map_err(|_| ParseIssue {
@@ -697,8 +747,14 @@ impl Parser {
                     })?;
                     self.doc.coord_offsets.push(end);
                 }
-                if weighted {
+                if let Some(w) = weight {
                     self.doc.counts.weighted_vertices += 1;
+                    if self.doc.weights.is_empty() {
+                        self.doc.weights.resize(self.doc.positions.len(), 1.0);
+                    }
+                    self.doc.weights.push(w);
+                } else if !self.doc.weights.is_empty() {
+                    self.doc.weights.push(1.0);
                 }
                 if color.is_some() {
                     self.doc.counts.vertices_with_color += 1;
@@ -723,7 +779,7 @@ impl Parser {
     fn read_vertex<'b>(
         &mut self,
         rest: &'b [u8],
-    ) -> Result<([f64; 3], [&'b [u8]; 3], Option<[f32; 3]>, bool), ParseIssue> {
+    ) -> Result<([f64; 3], [&'b [u8]; 3], Option<[f32; 3]>, Option<f64>), ParseIssue> {
         // No allocation: keep the first 7 tokens, validate any beyond that immediately.
         let mut toks: [&[u8]; 7] = [&[]; 7];
         let mut count = 0usize;
@@ -745,10 +801,10 @@ impl Parser {
         for axis in 0..3 {
             p[axis] = self.number(toks[axis])?;
         }
-        let (mut color, mut weighted) = (None, false);
+        let (mut color, mut weight) = (None, None);
         match count {
             3 => {}
-            4 => weighted = self.number(toks[3])? != 1.0,
+            4 => weight = Some(self.number(toks[3])?).filter(|&w| w != 1.0),
             6 => {
                 let mut c = [0f32; 3];
                 for i in 0..3 {
@@ -767,7 +823,136 @@ impl Parser {
                     });
             }
         }
-        Ok((p, [toks[0], toks[1], toks[2]], color, weighted))
+        Ok((p, [toks[0], toks[1], toks[2]], color, weight))
+    }
+
+    /// `cstype`, `deg`, `curv`, `parm` and `end`. A curve that can't be written exactly
+    /// is left out with a warning; it never fails the file.
+    fn freeform_statement(&mut self, kw: &[u8], rest: &[u8]) -> Result<(), ParseIssue> {
+        let line = self.line;
+        match kw {
+            b"cstype" => {
+                let t: Vec<&[u8]> = tokens(rest).collect();
+                self.freeform.cstype = match t.as_slice() {
+                    [b"rat", k] => Some((true, k.to_vec())),
+                    [k] => Some((false, k.to_vec())),
+                    _ => None,
+                };
+            }
+            b"deg" => {
+                let d: Vec<u32> = tokens(rest)
+                    .filter_map(|t| std::str::from_utf8(t).ok()?.parse().ok())
+                    .collect();
+                self.freeform.degree = d.first().copied();
+            }
+            b"curv" => {
+                self.doc.counts.freeform_curves += 1;
+                let mut t = tokens(rest);
+                let (Some(a), Some(b)) = (t.next(), t.next()) else {
+                    return self.issue(
+                        ErrorKind::WrongArity,
+                        "`curv` needs a parameter range and control vertices",
+                    );
+                };
+                let range = (self.number(a)?, self.number(b)?);
+                let count = self.doc.positions.len() as i64;
+                let mut control = Vec::new();
+                for tok in t {
+                    control.push(self.index(tok, count, 0)?);
+                }
+                self.freeform.pending = Some(PendingCurve {
+                    range,
+                    control,
+                    parm: None,
+                    line,
+                });
+            }
+            b"parm" => {
+                let mut t = tokens(rest);
+                let dir = t.next();
+                let mut values = Vec::new();
+                for tok in t {
+                    values.push(self.number(tok)?);
+                }
+                if let (Some(b"u"), Some(p)) = (dir, self.freeform.pending.as_mut()) {
+                    p.parm = Some(values);
+                }
+            }
+            _ => {
+                // `end`
+                if let Some(p) = self.freeform.pending.take() {
+                    match self.finish_curve(p) {
+                        Ok(c) => self.doc.curves.push(c),
+                        Err(why) => self.diags.push(
+                            Severity::Warning,
+                            Code::FreeformNotConverted,
+                            line,
+                            || format!("free-form curve left out: {why}"),
+                        ),
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Check a finished `curv` and express it as a B-spline, exactly.
+    fn finish_curve(&mut self, p: PendingCurve) -> Result<FreeformCurve, String> {
+        let (rational, kind) = self.freeform.cstype.clone().ok_or("no `cstype`")?;
+        let deg = self.freeform.degree.ok_or("no `deg`")?;
+        let n = p.control.len();
+        if deg == 0 || n < deg as usize + 1 {
+            return Err(format!("degree {deg} needs more than {n} control vertices"));
+        }
+        let parm = p.parm.ok_or("no `parm u`")?;
+        let knots = match kind.as_slice() {
+            b"bspline" => {
+                if parm.len() != n + deg as usize + 1 {
+                    return Err(format!(
+                        "{} knots for {n} control vertices of degree {deg}",
+                        parm.len()
+                    ));
+                }
+                parm
+            }
+            b"bezier" => {
+                // n = segments × deg + 1; `parm` gives the segment breaks.
+                if (n - 1) % deg as usize != 0 || parm.len() != (n - 1) / deg as usize + 1 {
+                    return Err(format!("{n} control vertices and {} breaks don't make Bézier segments of degree {deg}", parm.len()));
+                }
+                let mut k = vec![parm[0]; deg as usize + 1];
+                for &b in &parm[1..parm.len() - 1] {
+                    k.extend(std::iter::repeat_n(b, deg as usize));
+                }
+                k.extend(std::iter::repeat_n(parm[parm.len() - 1], deg as usize + 1));
+                k
+            }
+            other => {
+                return Err(format!(
+                    "`{}` curves aren't supported",
+                    String::from_utf8_lossy(other)
+                ))
+            }
+        };
+        if knots.windows(2).any(|w| w[1] < w[0]) {
+            return Err("knots decrease".into());
+        }
+        // The curve must cover its whole knot domain (trimming would move control points).
+        let (lo, hi) = (knots[deg as usize], knots[n]);
+        if p.range != (lo, hi) {
+            return Err(format!(
+                "the range {}..{} isn't the knot domain {lo}..{hi}",
+                p.range.0, p.range.1
+            ));
+        }
+        Ok(FreeformCurve {
+            degree: deg,
+            rational,
+            control: p.control,
+            knots,
+            attr: self.attr_id(),
+            line: p.line,
+        })
     }
 
     fn attr_id(&mut self) -> u32 {
@@ -1131,12 +1316,26 @@ mod tests {
             (d.counts.freeform_surfaces, d.counts.freeform_curves),
             (1, 1)
         );
+        assert!(d.curves.is_empty());
         let diag = d
             .diagnostics
             .iter()
             .find(|x| x.code == Code::FreeformNotConverted)
             .unwrap();
-        assert_eq!((diag.line, diag.count), (2, 4));
+        // The surface, and the curve that never ends.
+        assert_eq!((diag.line, diag.count), (4, 2));
+    }
+
+    #[test]
+    fn freeform_curves_become_exact_b_splines() {
+        let d = ok("v 0 0 0\nv 1 1 0 0.5\nv 2 0 0\nv 3 1 0\nv 4 0 0\n\
+                    cstype rat bspline\ndeg 2\ncurv 0 1 1 2 3\nparm u 0 0 0 1 1 1\nend\n\
+                    cstype bezier\ndeg 2\ncurv 0 2 1 2 3 4 5\nparm u 0 1 2\nend\n");
+        assert_eq!(d.curves.len(), 2);
+        assert_eq!(d.weights, [1.0, 0.5, 1.0, 1.0, 1.0]);
+        assert!(d.curves[0].rational);
+        assert_eq!(d.curves[1].knots, [0.0, 0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 2.0]);
+        assert_eq!(d.curves[1].control, [0, 1, 2, 3, 4]);
     }
 
     #[test]

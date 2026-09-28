@@ -366,6 +366,7 @@ fn handles_needed(model: &CadModel) -> u64 {
             .map(|l| 2 + l.vertices.len() as u64)
             .sum::<u64>()
         + model.points.len() as u64
+        + model.splines.len() as u64
         + model.surfaces.len() as u64
 }
 
@@ -569,6 +570,26 @@ fn entities(out: &mut Out, model: &CadModel, meta: &Meta) -> io::Result<()> {
             out.int(70, 32);
         }
         out.entity_head("SEQEND", &h, layer, None);
+        out.maybe_flush()?;
+    }
+    for c in &model.splines {
+        let layer = &model.layers[c.layer as usize].name;
+        out.entity_head("SPLINE", MODEL_SPACE_RECORD, layer, c.color);
+        out.str(100, "AcDbSpline");
+        out.int(70, if c.weights.is_some() { 4 } else { 0 });
+        out.int(71, i64::from(c.degree));
+        out.int(72, c.knots.len() as i64);
+        out.int(73, c.control.len() as i64);
+        out.int(74, 0);
+        for &k in &c.knots {
+            out.real(40, k);
+        }
+        for &w in c.weights.iter().flatten() {
+            out.real(41, w);
+        }
+        for &v in &c.control {
+            out.xyz(model, v);
+        }
         out.maybe_flush()?;
     }
     for p in &model.points {

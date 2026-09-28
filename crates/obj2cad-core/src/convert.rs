@@ -220,6 +220,19 @@ pub struct Region {
     pub tolerance: f64,
 }
 
+/// A B-spline from an OBJ free-form curve: the control points are source vertices
+/// (exact), the knots and weights the file's own numbers.
+#[derive(Debug, Clone)]
+pub struct SplineEntity {
+    pub layer: u32,
+    pub color: Option<[u8; 3]>,
+    pub degree: u32,
+    pub knots: Vec<f64>,
+    pub control: Vec<u32>,
+    /// One per control point, for rational curves.
+    pub weights: Option<Vec<f64>>,
+}
+
 #[derive(Debug, Clone)]
 pub struct PointEntity {
     pub layer: u32,
@@ -258,6 +271,8 @@ pub struct CadModel<'a> {
     pub meshes: Vec<MeshEntity>,
     pub polylines: Vec<PolylineEntity>,
     pub points: Vec<PointEntity>,
+    /// Free-form curves from the file.
+    pub splines: Vec<SplineEntity>,
     /// Curved surfaces recognized in the mesh (empty unless requested).
     pub surfaces: Vec<SurfaceEntity>,
     /// Parser diagnostics plus everything conversion could not carry over.
@@ -326,6 +341,9 @@ impl CadModel<'_> {
         }
         for p in &self.points {
             take(p.vertex);
+        }
+        for c in &self.splines {
+            c.control.iter().for_each(|&v| take(v));
         }
         for s in &self.surfaces {
             if let Some((a, b)) = s.body.bounds() {
@@ -747,12 +765,43 @@ pub fn convert_with<'a>(
         }
     }
 
+    let mut splines = Vec::new();
+    for c in &doc.curves {
+        c.control
+            .iter()
+            .for_each(|&v| referenced[v as usize] = true);
+        let layer = layer_of_attr[c.attr as usize];
+        if excluded.contains(&layer) {
+            omissions.excluded_lines += 1;
+            continue;
+        }
+        splines.push(SplineEntity {
+            layer,
+            color: color_of_attr(c.attr),
+            degree: c.degree,
+            knots: c.knots.clone(),
+            control: c.control.clone(),
+            weights: c.rational.then(|| {
+                c.control
+                    .iter()
+                    .map(|&v| doc.weights.get(v as usize).copied().unwrap_or(1.0))
+                    .collect()
+            }),
+        });
+    }
+    // Only the free-form curves that couldn't be written are left out.
+    omissions.freeform_curves = doc
+        .counts
+        .freeform_curves
+        .saturating_sub(doc.curves.len() as u64);
+
     // Loose vertices: a file of nothing but vertices is a point cloud, written as points.
     // In other files they are usually leftovers, kept only on request.
     let unreferenced = referenced.iter().filter(|r| !**r).count() as u64;
     let point_cloud = doc.faces.is_empty()
         && doc.lines.is_empty()
         && doc.points.is_empty()
+        && doc.curves.is_empty()
         && !doc.positions.is_empty();
     if unreferenced > 0 && (point_cloud || options.keep_loose_points) {
         let layer = table.default_layer();
@@ -800,6 +849,7 @@ pub fn convert_with<'a>(
         meshes,
         polylines,
         points,
+        splines,
         surfaces: Vec::new(),
         diagnostics,
         unreferenced_vertices: unreferenced,
@@ -811,6 +861,23 @@ pub fn convert_with<'a>(
 
 fn note_dropped(doc: &ObjDocument, d: &mut Diagnostics) {
     let c = &doc.counts;
+    // Rational curves carry their control vertices' weights; other weights are lost.
+    let weights_lost = if c.weighted_vertices == 0 {
+        0
+    } else {
+        let mut carried = vec![false; doc.positions.len()];
+        for curve in doc.curves.iter().filter(|x| x.rational) {
+            curve
+                .control
+                .iter()
+                .for_each(|&v| carried[v as usize] = true);
+        }
+        doc.weights
+            .iter()
+            .enumerate()
+            .filter(|&(v, &w)| w != 1.0 && !carried[v])
+            .count() as u64
+    };
     // Points carry their vertex's color; faces and lines carry one color per entity.
     let colors_lost = if c.vertices_with_color == 0 {
         0
@@ -840,7 +907,7 @@ fn note_dropped(doc: &ObjDocument, d: &mut Diagnostics) {
             "parameter-space vertices (vp) were not written",
         ),
         (
-            c.weighted_vertices,
+            weights_lost,
             Code::VertexWeightDropped,
             "homogeneous vertex weights (w ≠ 1) were not written",
         ),

@@ -556,6 +556,20 @@ fn merge(
         add(&mut out.faces, &d.faces);
         add(&mut out.lines, &d.lines);
         add(&mut out.points, &d.points);
+        if !d.weights.is_empty() || !out.weights.is_empty() {
+            out.weights.resize(v0 as usize, 1.0);
+            if d.weights.is_empty() {
+                out.weights.resize(v0 as usize + d.positions.len(), 1.0);
+            } else {
+                out.weights.extend_from_slice(&d.weights);
+            }
+        }
+        out.curves
+            .extend(d.curves.iter().map(|c| obj::FreeformCurve {
+                control: c.control.iter().map(|&v| v + v0).collect(),
+                attr: attr_map[c.attr as usize],
+                ..c.clone()
+            }));
         out.mtllibs.extend(d.mtllibs.iter().cloned());
         if !header_taken && !d.header_comments.is_empty() && kind(file) == Kind::Obj {
             out.header_comments = d.header_comments.clone();

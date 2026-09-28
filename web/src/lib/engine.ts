@@ -63,6 +63,8 @@ export interface Report {
     faces: number;
     polylines: number;
     points: number;
+    /** Free-form curves, as B-splines. */
+    splines: number;
     vertices_written: number;
     unreferenced_vertices_skipped: number;
     bounds: [[number, number, number], [number, number, number]] | null;
@@ -188,5 +190,5 @@ export async function sha256Hex(blob: Blob): Promise<string> {
   return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-/** Nothing was written: no faces, lines or points. */
-export const isEmpty = (r: Report) => r.output.faces + r.output.polylines + r.output.points === 0;
+/** Nothing was written: no faces, lines, curves or points. */
+export const isEmpty = (r: Report) => r.output.faces + r.output.polylines + r.output.points + (r.output.splines ?? 0) === 0;

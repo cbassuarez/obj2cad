@@ -499,7 +499,11 @@ fn convert_cmd(args: Vec<String>) -> Result<(), String> {
             name,
             output.display(),
             rep.output.faces,
-            rep.output.mesh_entities + rep.output.polylines + rep.output.points,
+            rep.output.mesh_entities
+                + rep.output.polylines
+                + rep.output.points
+                + rep.output.splines
+                + model.surfaces.len() as u64,
             &parity[..12],
             auto(choices.units.is_some()),
             auto(choices.up_axis.is_some()),
@@ -541,6 +545,13 @@ fn dwg_dump(bytes: Vec<u8>) -> Result<String, String> {
             }),
             EntityType::Point(p) => json!({
                 "t": "point", "layer": p.common.layer, "color": color(&p.common.color), "v": [bits(&p.location)],
+            }),
+            EntityType::Spline(x) => json!({
+                "t": "spline", "layer": x.common.layer, "color": color(&x.common.color),
+                "degree": x.degree, "rational": x.flags.rational,
+                "knots": x.knots.iter().map(|k| format!("{:016x}", k.to_bits())).collect::<Vec<_>>(),
+                "v": x.control_points.iter().map(bits).collect::<Vec<_>>(),
+                "weights": x.weights.iter().map(|w| format!("{:016x}", w.to_bits())).collect::<Vec<_>>(),
             }),
             EntityType::Surface(x) => json!({
                 "t": "surface", "layer": x.common.layer, "color": color(&x.common.color),
