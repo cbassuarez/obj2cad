@@ -65,7 +65,11 @@ pub fn document(model: &CadModel, meta: &Meta) -> Result<CadDocument, Error> {
         h.model_space_extents_max = v3(hi);
     }
     doc.summary_info.last_saved_by = "obj2cad".into();
-    doc.summary_info.custom_properties = meta.properties.iter().map(|&(k, v)| (k.to_owned(), v.to_owned())).collect();
+    doc.summary_info.custom_properties = meta
+        .properties
+        .iter()
+        .map(|&(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
 
     if let Some(view) = fitted_view(model) {
         if let Some(vp) = doc.vports.get_mut("*Active") {
@@ -89,7 +93,10 @@ pub fn document(model: &CadModel, meta: &Meta) -> Result<CadDocument, Error> {
         mesh.common.color = color(m.color);
         mesh.blend_crease = false;
         mesh.vertices = m.vertices.iter().map(|&v| v3(model.position(v))).collect();
-        mesh.faces = m.faces().map(|f| MeshFace::new(f.iter().map(|&i| i as usize).collect())).collect();
+        mesh.faces = m
+            .faces()
+            .map(|f| MeshFace::new(f.iter().map(|&i| i as usize).collect()))
+            .collect();
         doc.add_entity(EntityType::Mesh(mesh)).map_err(fail)?;
     }
     for l in &model.polylines {
@@ -100,9 +107,13 @@ pub fn document(model: &CadModel, meta: &Meta) -> Result<CadDocument, Error> {
         polyline.vertices = l
             .vertices
             .iter()
-            .map(|&v| Vertex3DPolyline { layer: layer.clone(), ..Vertex3DPolyline::new(v3(model.position(v))) })
+            .map(|&v| Vertex3DPolyline {
+                layer: layer.clone(),
+                ..Vertex3DPolyline::new(v3(model.position(v)))
+            })
             .collect();
-        doc.add_entity(EntityType::Polyline3D(polyline)).map_err(fail)?;
+        doc.add_entity(EntityType::Polyline3D(polyline))
+            .map_err(fail)?;
     }
     for p in &model.points {
         let mut point = Point::new();
@@ -125,10 +136,16 @@ mod tests {
     use acadrust::DwgReader;
     use obj2cad_core::{convert, parse, Options, UpAxis};
 
-    const META: Meta = Meta { properties: &[("obj2cad.parity", "exact")], fingerprint_seed: "seed", created_unix: Some(1_700_000_000.0) };
+    const META: Meta = Meta {
+        properties: &[("obj2cad.parity", "exact")],
+        fingerprint_seed: "seed",
+        created_unix: Some(1_700_000_000.0),
+    };
 
     fn read(bytes: &[u8]) -> CadDocument {
-        DwgReader::from_stream(std::io::Cursor::new(bytes.to_vec())).read().expect("obj2cad's DWG reads back")
+        DwgReader::from_stream(std::io::Cursor::new(bytes.to_vec()))
+            .read()
+            .expect("obj2cad's DWG reads back")
     }
 
     fn bits(v: &Vector3) -> [u64; 3] {
@@ -138,38 +155,104 @@ mod tests {
     /// Every coordinate, face, line, point, layer and color comes back exactly.
     fn assert_round_trip(src: &str, up: UpAxis) {
         let doc = parse(src.as_bytes()).unwrap();
-        let model = convert(&doc, None, Options { up_axis: up, ..Options::default() });
+        let model = convert(
+            &doc,
+            None,
+            Options {
+                up_axis: up,
+                ..Options::default()
+            },
+        );
         let back = read(&write(&model, &META).unwrap());
 
-        let meshes: Vec<&Mesh> = back.entities().filter_map(|e| if let EntityType::Mesh(m) = e { Some(m) } else { None }).collect();
+        let meshes: Vec<&Mesh> = back
+            .entities()
+            .filter_map(|e| {
+                if let EntityType::Mesh(m) = e {
+                    Some(m)
+                } else {
+                    None
+                }
+            })
+            .collect();
         assert_eq!(meshes.len(), model.meshes.len());
         for (m, got) in model.meshes.iter().zip(&meshes) {
             assert_eq!(got.common.layer, model.layers[m.layer as usize].name);
             assert_eq!(got.common.color, color(m.color));
-            let want: Vec<[u64; 3]> = m.vertices.iter().map(|&v| model.position(v).map(f64::to_bits)).collect();
+            let want: Vec<[u64; 3]> = m
+                .vertices
+                .iter()
+                .map(|&v| model.position(v).map(f64::to_bits))
+                .collect();
             assert_eq!(got.vertices.iter().map(bits).collect::<Vec<_>>(), want);
-            let faces: Vec<Vec<usize>> = m.faces().map(|f| f.iter().map(|&i| i as usize).collect()).collect();
-            assert_eq!(got.faces.iter().map(|f| f.vertices.clone()).collect::<Vec<_>>(), faces);
+            let faces: Vec<Vec<usize>> = m
+                .faces()
+                .map(|f| f.iter().map(|&i| i as usize).collect())
+                .collect();
+            assert_eq!(
+                got.faces
+                    .iter()
+                    .map(|f| f.vertices.clone())
+                    .collect::<Vec<_>>(),
+                faces
+            );
         }
 
-        let lines: Vec<&Polyline3D> = back.entities().filter_map(|e| if let EntityType::Polyline3D(l) = e { Some(l) } else { None }).collect();
+        let lines: Vec<&Polyline3D> = back
+            .entities()
+            .filter_map(|e| {
+                if let EntityType::Polyline3D(l) = e {
+                    Some(l)
+                } else {
+                    None
+                }
+            })
+            .collect();
         assert_eq!(lines.len(), model.polylines.len());
         for (l, got) in model.polylines.iter().zip(&lines) {
-            let want: Vec<[u64; 3]> = l.vertices.iter().map(|&v| model.position(v).map(f64::to_bits)).collect();
-            assert_eq!(got.vertices.iter().map(|v| bits(&v.position)).collect::<Vec<_>>(), want);
+            let want: Vec<[u64; 3]> = l
+                .vertices
+                .iter()
+                .map(|&v| model.position(v).map(f64::to_bits))
+                .collect();
+            assert_eq!(
+                got.vertices
+                    .iter()
+                    .map(|v| bits(&v.position))
+                    .collect::<Vec<_>>(),
+                want
+            );
         }
 
-        let points: Vec<&Point> = back.entities().filter_map(|e| if let EntityType::Point(p) = e { Some(p) } else { None }).collect();
+        let points: Vec<&Point> = back
+            .entities()
+            .filter_map(|e| {
+                if let EntityType::Point(p) = e {
+                    Some(p)
+                } else {
+                    None
+                }
+            })
+            .collect();
         assert_eq!(points.len(), model.points.len());
         for (p, got) in model.points.iter().zip(&points) {
-            assert_eq!(bits(&got.location), model.position(p.vertex).map(f64::to_bits));
+            assert_eq!(
+                bits(&got.location),
+                model.position(p.vertex).map(f64::to_bits)
+            );
         }
 
         for layer in model.layers.iter().skip(1) {
-            let got = back.layers.get(&layer.name).unwrap_or_else(|| panic!("layer {}", layer.name));
+            let got = back
+                .layers
+                .get(&layer.name)
+                .unwrap_or_else(|| panic!("layer {}", layer.name));
             assert_eq!(got.color, rgb(layer.color), "layer {}", layer.name);
         }
-        assert_eq!(back.header.insertion_units, model.options.units.insunits() as i16);
+        assert_eq!(
+            back.header.insertion_units,
+            model.options.units.insunits() as i16
+        );
     }
 
     const SIGNED_ZEROS: &str = "o part\nv -0.000000 0.0 -0\nv 1 -0.0 0\nv 0.1 0.2 0.30000000000000004\nv 1e-320 -1.7976931348623157e308 2.2250738585072014e-308\nf 1 2 3\nf 2 3 4\nl 1 3 4\np 2\n";
@@ -201,10 +284,21 @@ mod tests {
     #[test]
     fn header_carries_units_dates_and_properties() {
         let doc = parse(SIGNED_ZEROS.as_bytes()).unwrap();
-        let model = convert(&doc, None, Options { units: obj2cad_core::Units::Millimeters, ..Options::default() });
+        let model = convert(
+            &doc,
+            None,
+            Options {
+                units: obj2cad_core::Units::Millimeters,
+                ..Options::default()
+            },
+        );
         let back = read(&write(&model, &META).unwrap());
         assert_eq!(back.header.insertion_units, 4);
         assert!((back.header.create_date_julian - META.julian_date()).abs() < 1e-6);
-        assert!(back.summary_info.custom_properties.iter().any(|(k, v)| k == "obj2cad.parity" && v == "exact"));
+        assert!(back
+            .summary_info
+            .custom_properties
+            .iter()
+            .any(|(k, v)| k == "obj2cad.parity" && v == "exact"));
     }
 }

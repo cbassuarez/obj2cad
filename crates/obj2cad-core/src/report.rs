@@ -133,8 +133,16 @@ pub fn build(model: &CadModel, source: &Source, parity: &str, written: Written) 
             faces: faces.iter().sum(),
             polylines: model.polylines.len() as u64,
             points: model.points.len() as u64,
-            vertices_written: model.meshes.iter().map(|m| m.vertices.len() as u64).sum::<u64>()
-                + model.polylines.iter().map(|l| l.vertices.len() as u64).sum::<u64>()
+            vertices_written: model
+                .meshes
+                .iter()
+                .map(|m| m.vertices.len() as u64)
+                .sum::<u64>()
+                + model
+                    .polylines
+                    .iter()
+                    .map(|l| l.vertices.len() as u64)
+                    .sum::<u64>()
                 + model.points.len() as u64,
             unreferenced_vertices_skipped: model.omissions.loose_points,
             bounds: model.bounds(),

@@ -9,7 +9,10 @@ mod preview;
 
 use obj2cad_core::hints::{self, Choices, Hints, UnitsSource};
 use obj2cad_core::mtl::Palette;
-use obj2cad_core::{convert as to_cad, hash, mtl, parse_with_progress, report, CadModel, LayerMode, Meta, ObjDocument, Options, ParseError, Units, UpAxis};
+use obj2cad_core::{
+    convert as to_cad, hash, mtl, parse_with_progress, report, CadModel, LayerMode, Meta,
+    ObjDocument, Options, ParseError, Units, UpAxis,
+};
 use preview::Preview;
 use serde::Deserialize;
 use std::cell::RefCell;
@@ -136,18 +139,39 @@ impl Session {
     /// object `{kind, line, message, issues, truncated}` when the file can't be read
     /// without guessing. `source_sha256` comes from the browser's native digest.
     #[wasm_bindgen(constructor)]
-    pub fn new(obj: &[u8], name: String, source_sha256: String, progress: Option<js_sys::Function>) -> Result<Session, JsValue> {
+    pub fn new(
+        obj: &[u8],
+        name: String,
+        source_sha256: String,
+        progress: Option<js_sys::Function>,
+    ) -> Result<Session, JsValue> {
         let t = now();
         let doc = parse_with_progress(obj, |done, total| {
             if let Some(f) = &progress {
-                let _ = f.call2(&JsValue::NULL, &JsValue::from_f64(done as f64), &JsValue::from_f64(total as f64));
+                let _ = f.call2(
+                    &JsValue::NULL,
+                    &JsValue::from_f64(done as f64),
+                    &JsValue::from_f64(total as f64),
+                );
             }
         })
         .map_err(|e| parse_error(&e))?;
         let parse_ms = now() - t;
         let hints = hints::hints(&doc);
-        let stem = name.rsplit_once('.').map_or(name.as_str(), |(s, _)| s).to_owned();
-        Ok(Session { doc, palette: None, stem, name, source_len: obj.len() as u64, source_sha: source_sha256, parse_ms, hints })
+        let stem = name
+            .rsplit_once('.')
+            .map_or(name.as_str(), |(s, _)| s)
+            .to_owned();
+        Ok(Session {
+            doc,
+            palette: None,
+            stem,
+            name,
+            source_len: obj.len() as u64,
+            source_sha: source_sha256,
+            parse_ms,
+            hints,
+        })
     }
 
     /// Attach (or replace) the material library.
@@ -174,7 +198,11 @@ impl Session {
     }
 
     fn options(&self, s: &Settings) -> Options {
-        let choices = Choices { units: s.units, default_units: s.default_units, up_axis: s.up_axis };
+        let choices = Choices {
+            units: s.units,
+            default_units: s.default_units,
+            up_axis: s.up_axis,
+        };
         let (units, up_axis) = hints::resolve(&self.hints, &choices);
         Options {
             units,
@@ -199,13 +227,23 @@ impl Session {
 
     /// Step 2: convert and write. The file goes to `sink(chunk: Uint8Array)` in pieces of
     /// about 1 MB. The report's `output.sha256` is left empty (hashed on demand).
-    pub fn convert(&self, settings: &str, parity: &str, want_preview: bool, sink: &js_sys::Function) -> Result<Conversion, JsError> {
+    pub fn convert(
+        &self,
+        settings: &str,
+        parity: &str,
+        want_preview: bool,
+        sink: &js_sys::Function,
+    ) -> Result<Conversion, JsError> {
         let s = settings_from(settings)?;
         let t0 = now();
         let model = self.model(&s);
         let t1 = now();
 
-        let exact = if model.omissions.is_partial() { "partial" } else { "exact" };
+        let exact = if model.omissions.is_partial() {
+            "partial"
+        } else {
+            "exact"
+        };
         let mut props = vec![
             ("obj2cad.version", obj2cad_core::VERSION),
             ("obj2cad.source_sha256", self.source_sha.as_str()),
@@ -215,27 +253,54 @@ impl Session {
         if s.include_name {
             props.push(("obj2cad.source_name", self.name.as_str()));
         }
-        let meta = Meta { properties: &props, fingerprint_seed: &self.source_sha, created_unix: s.created_unix };
-        let mut out = JsSink { f: sink, written: 0 };
+        let meta = Meta {
+            properties: &props,
+            fingerprint_seed: &self.source_sha,
+            created_unix: s.created_unix,
+        };
+        let mut out = JsSink {
+            f: sink,
+            written: 0,
+        };
         match s.format {
-            Format::Dxf => obj2cad_dxf::write_to(&model, &meta, obj2cad_dxf::Format::Ascii, &mut out),
-            Format::DxfBinary => obj2cad_dxf::write_to(&model, &meta, obj2cad_dxf::Format::Binary, &mut out),
+            Format::Dxf => {
+                obj2cad_dxf::write_to(&model, &meta, obj2cad_dxf::Format::Ascii, &mut out)
+            }
+            Format::DxfBinary => {
+                obj2cad_dxf::write_to(&model, &meta, obj2cad_dxf::Format::Binary, &mut out)
+            }
             #[cfg(feature = "dwg")]
             Format::Dwg => {
-                let bytes = obj2cad_dwg::write(&model, &meta).map_err(|e| JsError::new(&e.to_string()))?;
-                bytes.chunks(1 << 20).try_for_each(|c| out.write_all(c)).map(|()| bytes.len() as u64)
+                let bytes =
+                    obj2cad_dwg::write(&model, &meta).map_err(|e| JsError::new(&e.to_string()))?;
+                bytes
+                    .chunks(1 << 20)
+                    .try_for_each(|c| out.write_all(c))
+                    .map(|()| bytes.len() as u64)
             }
             #[cfg(not(feature = "dwg"))]
-            Format::Dwg => return Err(JsError::new("this engine module has no DWG writer (load the DWG module)")),
+            Format::Dwg => {
+                return Err(JsError::new(
+                    "this engine module has no DWG writer (load the DWG module)",
+                ))
+            }
         }
         .map_err(|e| JsError::new(&format!("writing the file: {e}")))?;
         let t2 = now();
 
         let rep = report::build(
             &model,
-            &report::Source { name: &self.name, len: self.source_len, sha256: &self.source_sha },
+            &report::Source {
+                name: &self.name,
+                len: self.source_len,
+                sha256: &self.source_sha,
+            },
             parity,
-            report::Written { format: s.format.id(), bytes: out.written, sha256: None },
+            report::Written {
+                format: s.format.id(),
+                bytes: out.written,
+                sha256: None,
+            },
         );
         let report = serde_json::to_string(&rep).map_err(|e| JsError::new(&e.to_string()))?;
         let t3 = now();
@@ -266,7 +331,12 @@ impl Session {
             "parse_ms": self.parse_ms, "convert_ms": t1 - t0, "write_ms": t2 - t1, "report_ms": t3 - t2, "preview_ms": t4 - t3,
         })
         .to_string();
-        Ok(Conversion { report, decisions, timings, preview })
+        Ok(Conversion {
+            report,
+            decisions,
+            timings,
+            preview,
+        })
     }
 }
 
@@ -279,7 +349,9 @@ struct JsSink<'a> {
 impl Write for JsSink<'_> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let chunk = js_sys::Uint8Array::from(buf);
-        self.f.call1(&JsValue::NULL, &chunk).map_err(|_| std::io::Error::other("the output callback failed"))?;
+        self.f
+            .call1(&JsValue::NULL, &chunk)
+            .map_err(|_| std::io::Error::other("the output callback failed"))?;
         self.written += buf.len() as u64;
         Ok(buf.len())
     }
@@ -356,7 +428,9 @@ impl Conversion {
     }
     /// Where the preview's origin is in drawing coordinates.
     pub fn origin(&self) -> Vec<f64> {
-        self.preview.as_ref().map_or_else(Vec::new, |p| p.origin.to_vec())
+        self.preview
+            .as_ref()
+            .map_or_else(Vec::new, |p| p.origin.to_vec())
     }
 }
 

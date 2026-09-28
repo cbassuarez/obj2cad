@@ -25,14 +25,25 @@ impl Meta<'_> {
     }
 
     pub fn version_guid(&self) -> String {
-        guid(&format!("version:{}:{}", self.fingerprint_seed, crate::VERSION))
+        guid(&format!(
+            "version:{}:{}",
+            self.fingerprint_seed,
+            crate::VERSION
+        ))
     }
 }
 
 /// Deterministic GUID-shaped string derived from a hash.
 pub fn guid(seed: &str) -> String {
     let h = sha256_hex(seed.as_bytes()).to_uppercase();
-    format!("{{{}-{}-{}-{}-{}}}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32])
+    format!(
+        "{{{}-{}-{}-{}-{}}}",
+        &h[0..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..32]
+    )
 }
 
 /// Drawings open in AutoCAD's "SE Isometric" direction, like the web preview.
@@ -55,7 +66,11 @@ pub fn fitted_view(model: &CadModel) -> Option<View> {
     let d = norm(VIEW_DIRECTION);
     // Screen up: world Z projected onto the view plane; screen right: perpendicular.
     let up = norm([-d[2] * d[0], -d[2] * d[1], 1.0 - d[2] * d[2]]);
-    let right = [up[1] * d[2] - up[2] * d[1], up[2] * d[0] - up[0] * d[2], up[0] * d[1] - up[1] * d[0]];
+    let right = [
+        up[1] * d[2] - up[2] * d[1],
+        up[2] * d[0] - up[0] * d[2],
+        up[0] * d[1] - up[1] * d[0],
+    ];
     let (mut h, mut w) = (0.0f64, 0.0f64);
     for i in 0..8 {
         let c = [0, 1, 2].map(|a| if i >> a & 1 == 1 { hi[a] } else { lo[a] } - target[a]);

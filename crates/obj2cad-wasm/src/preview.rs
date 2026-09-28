@@ -31,7 +31,10 @@ const MAX_EXTENT: f64 = 1e12;
 
 impl Preview {
     pub fn build(model: &CadModel) -> Self {
-        let origin = model.bounds().map(|(lo, hi)| [0, 1, 2].map(|a| lo[a] / 2.0 + hi[a] / 2.0)).unwrap_or([0.0; 3]);
+        let origin = model
+            .bounds()
+            .map(|(lo, hi)| [0, 1, 2].map(|a| lo[a] / 2.0 + hi[a] / 2.0))
+            .unwrap_or([0.0; 3]);
         let nv: usize = model.meshes.iter().map(|m| m.vertices.len()).sum();
         let refs: usize = model.meshes.iter().map(|m| m.face_indices.len()).sum();
         let mut out = Preview {
@@ -49,8 +52,9 @@ impl Preview {
             origin,
             available: true,
         };
-        let displayable =
-            model.bounds().is_none_or(|(lo, hi)| (0..3).all(|a| (hi[a] - lo[a]).is_finite() && hi[a] - lo[a] < MAX_EXTENT));
+        let displayable = model.bounds().is_none_or(|(lo, hi)| {
+            (0..3).all(|a| (hi[a] - lo[a]).is_finite() && hi[a] - lo[a] < MAX_EXTENT)
+        });
         if !displayable {
             out.available = false;
             return out;
@@ -60,7 +64,8 @@ impl Preview {
             let p = model.position(v);
             [0, 1, 2].map(|a| p[a] - origin[a])
         };
-        let color = |c: Option<[u8; 3]>, layer: u32| c.unwrap_or(model.layers[layer as usize].color);
+        let color =
+            |c: Option<[u8; 3]>, layer: u32| c.unwrap_or(model.layers[layer as usize].color);
 
         let mut tri = Triangulator::default();
         for m in &model.meshes {
@@ -75,11 +80,13 @@ impl Preview {
             for f in m.faces() {
                 tri.triangulate(f, &local, base, &mut out.indices);
                 for k in 0..f.len() {
-                    out.edges.extend_from_slice(&[base + f[k], base + f[(k + 1) % f.len()]]);
+                    out.edges
+                        .extend_from_slice(&[base + f[k], base + f[(k + 1) % f.len()]]);
                 }
             }
             let (i1, e1) = (out.indices.len() as u32, out.edges.len() as u32);
-            out.groups.extend_from_slice(&[m.layer, i0, i1 - i0, e0, e1 - e0]);
+            out.groups
+                .extend_from_slice(&[m.layer, i0, i1 - i0, e0, e1 - e0]);
         }
 
         // Lines and points, grouped by layer so the viewer can hide layers.
@@ -95,7 +102,12 @@ impl Preview {
                     out.line_colors.extend_from_slice(&rgb);
                 }
             }
-            push_group(&mut out.line_groups, l.layer, start, (out.lines.len() / 3) as u32 - start);
+            push_group(
+                &mut out.line_groups,
+                l.layer,
+                start,
+                (out.lines.len() / 3) as u32 - start,
+            );
         }
         let mut by_layer: Vec<usize> = (0..model.points.len()).collect();
         by_layer.sort_by_key(|&i| model.points[i].layer);
@@ -152,7 +164,8 @@ impl Triangulator {
             return fan(out);
         }
         if earcut::utils3d::project3d_to_2d(&self.ring, n, &mut self.flat) {
-            self.earcut.earcut(self.flat.iter().copied(), &[] as &[u32], &mut self.tris);
+            self.earcut
+                .earcut(self.flat.iter().copied(), &[] as &[u32], &mut self.tris);
         } else {
             self.tris.clear();
         }
@@ -187,7 +200,11 @@ fn is_convex(ring: &[[f64; 3]], normal: [f64; 3]) -> bool {
     (0..n).all(|i| {
         let (p, c, q) = (ring[(i + n - 1) % n], ring[i], ring[(i + 1) % n]);
         let (e1, e2) = (sub(c, p), sub(q, c));
-        let cross = [e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]];
+        let cross = [
+            e1[1] * e2[2] - e1[2] * e2[1],
+            e1[2] * e2[0] - e1[0] * e2[2],
+            e1[0] * e2[1] - e1[1] * e2[0],
+        ];
         cross[0] * normal[0] + cross[1] * normal[1] + cross[2] * normal[2] >= -1e-12 * scale * scale
     })
 }
