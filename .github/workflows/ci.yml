@@ -21,7 +21,7 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Toolchain (from rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
@@ -33,7 +33,7 @@ jobs:
         run: cargo test --workspace
       - name: Build CLI
         run: cargo build --release -p obj2cad-cli
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Harness dependencies
@@ -42,7 +42,7 @@ jobs:
         run: python tests/harness/parity.py --up as-is --keep acceptance tests/fixtures
       - name: Upload AutoCAD acceptance files (see docs/ACCEPTANCE.md)
         if: matrix.os == 'ubuntu-latest'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: acceptance-${{ github.sha }}
           path: acceptance/
@@ -53,13 +53,13 @@ jobs:
     name: Performance budget (docs/PERFORMANCE.md, M4)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release -p obj2cad-cli
       - name: Benchmark
         run: ./target/release/obj2cad bench --synthetic 1000 --runs 5 --json | tee bench.json | python3 tests/harness/bench_budget.py 1500
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: bench-${{ github.sha }}
           path: bench.json
@@ -68,13 +68,13 @@ jobs:
     name: Web app
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
           tool: wasm-bindgen-cli@0.2.129
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
           cache: npm
