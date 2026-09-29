@@ -24,18 +24,35 @@ M1 and M2 are measured in the real app: drop the file, open "Technical details" 
 |---|---|---|
 | Parse | 391 | once per file; the parsed `Session` stays in WebAssembly memory |
 | Convert | 16 | layers, colors, entities |
-| Parity hash | 456 → 240 on re-run | canonical bytes in Rust, SHA-256 by the browser's native (hardware) digest |
+| Parity hash | 456 → 240 on re-run | measured with the browser's digest; now in Rust, after the preview (below) |
 | Write DXF | 274 | 125 MB of text |
 | Output SHA-256 | 97 | native digest |
 | Preview buffers | 31 | float32, display only |
+
+Since 0.6 the order is: parse, convert, **preview** (the model is shown), then parity hash
+and write while it is; Download waits for the file. The figures above predate that.
 
 ## What made it fast
 
 - **Parse once per file.** Changing a setting re-runs conversion only (`Session` in
   `crates/obj2cad-wasm`).
-- **Native digests in the browser.** SHA-256 in WebAssembly has no hardware
-  acceleration; `crypto.subtle` does. The parity hash feeds Rust's canonical byte
-  stream to the browser digest, so it matches the CLI exactly (checked on fixtures).
+- **The model before the file.** The preview is built right after conversion and shown
+  with a provisional report (no hash, no size yet); the parity hash and the file follow
+  while the model is on screen, and Download waits for them ("Writing the DXF…"). The
+  loading screen names each step, with progress where it can be counted, and can cancel.
+- **Parity hash inside the engine.** Computed from the model the conversion already built
+  and streamed straight into SHA-256 (the same bytes as `hash::parity_stream`, so it
+  matches the CLI; the harness checks every fixture). It used to go to the browser's
+  hardware digest, which is faster at SHA-256 itself, but that meant building the model
+  twice, growing WebAssembly memory (which never shrinks) by the whole canonical stream
+  (62 MB for 730k faces) and copying it again into JS: slower overall in measurements,
+  and double the peak memory on the largest files. Records sort by a 128-bit prefix
+  before comparing bytes (native: 150 → 107 ms on 730k faces).
+- **The file is assembled on the main thread.** The writer's pieces are transferred from
+  the worker as they are (no copy); building one `Blob` from them there took a large
+  fraction of a second, and about 40 ms on the main thread.
+- **One draw per layer** in the preview, however many colors a layer has (a textured
+  model can have hundreds).
 - **Writer:** direct byte output, no `format!`; the source token is copied verbatim when it
   is plain decimal (no re-parse: parsing is correctly rounded and sign-symmetric, so the
   text round-trips by construction, and a debug assertion checks it).

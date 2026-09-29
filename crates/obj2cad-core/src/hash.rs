@@ -17,12 +17,36 @@ use crate::convert::CadModel;
 use sha2::{Digest, Sha256};
 
 pub fn parity_hash(model: &CadModel) -> String {
-    sha256_hex(&parity_stream(model))
+    let mut h = Sha256::new();
+    write_parity(model, &mut h);
+    hex(&h.finalize())
 }
 
-/// The exact bytes `parity_hash` digests. Exposed so the web app can hash it with the
-/// browser's hardware-accelerated SHA-256; the result is identical.
+/// The exact bytes `parity_hash` digests (for tests and tools; hashing streams them).
 pub fn parity_stream(model: &CadModel) -> Vec<u8> {
+    let mut out = Vec::new();
+    write_parity(model, &mut out);
+    out
+}
+
+/// Where the parity bytes go: a hasher, or a buffer.
+trait Out {
+    fn put(&mut self, bytes: &[u8]);
+}
+
+impl Out for Sha256 {
+    fn put(&mut self, bytes: &[u8]) {
+        self.update(bytes);
+    }
+}
+
+impl Out for Vec<u8> {
+    fn put(&mut self, bytes: &[u8]) {
+        self.extend_from_slice(bytes);
+    }
+}
+
+fn write_parity(model: &CadModel, out: &mut impl Out) {
     // All records of one kind live in a single flat buffer; sorting offsets instead of
     // owned vectors avoids one allocation per face.
     struct Records {
@@ -46,15 +70,31 @@ pub fn parity_stream(model: &CadModel) -> Vec<u8> {
             self.spans
                 .push((start as u32, (self.bytes.len() - start) as u32));
         }
-        fn append_to(mut self, out: &mut Vec<u8>, tag: u8) {
+        fn write(self, out: &mut impl Out, tag: u8) {
             let bytes = &self.bytes;
-            let rec = |&(s, l): &(u32, u32)| &bytes[s as usize..(s + l) as usize];
-            self.spans.sort_unstable_by(|a, b| rec(a).cmp(rec(b)));
-            out.push(tag);
-            out.extend_from_slice(&(self.spans.len() as u64).to_le_bytes());
-            for span in &self.spans {
-                out.extend_from_slice(&span.1.to_le_bytes());
-                out.extend_from_slice(rec(span));
+            let rec = |s: u32, l: u32| &bytes[s as usize..(s + l) as usize];
+            // Bytewise order, compared first as a big-endian integer of each record's
+            // first 16 bytes (zero-padded), which orders the same way and is far cheaper.
+            let prefix = |s: u32, l: u32| {
+                let mut k = [0u8; 16];
+                let r = rec(s, l);
+                let n = r.len().min(16);
+                k[..n].copy_from_slice(&r[..n]);
+                u128::from_be_bytes(k)
+            };
+            let mut keyed: Vec<(u128, u32, u32)> = self
+                .spans
+                .iter()
+                .map(|&(s, l)| (prefix(s, l), s, l))
+                .collect();
+            keyed.sort_unstable_by(|a, b| {
+                a.0.cmp(&b.0).then_with(|| rec(a.1, a.2).cmp(rec(b.1, b.2)))
+            });
+            out.put(&[tag]);
+            out.put(&(keyed.len() as u64).to_le_bytes());
+            for &(_, s, l) in &keyed {
+                out.put(&l.to_le_bytes());
+                out.put(rec(s, l));
             }
         }
     }
@@ -76,13 +116,10 @@ pub fn parity_stream(model: &CadModel) -> Vec<u8> {
         points.push(model, std::iter::once(p.vertex));
     }
 
-    let mut out = Vec::with_capacity(
-        32 + refs * 24 + n_faces * 4 + lines.bytes.len() + points.bytes.len() * 2,
-    );
-    out.extend_from_slice(b"obj2cad-parity-v1\0");
-    faces.append_to(&mut out, b'f');
-    lines.append_to(&mut out, b'l');
-    points.append_to(&mut out, b'p');
+    out.put(b"obj2cad-parity-v1\0");
+    faces.write(out, b'f');
+    lines.write(out, b'l');
+    points.write(out, b'p');
     // Splines (free-form curves), only when there are any, so every other file keeps its
     // hash: degree (u32 BE), knot count (u32 BE), knots, control points, weights (bits).
     if !model.splines.is_empty() {
@@ -108,9 +145,8 @@ pub fn parity_stream(model: &CadModel) -> Vec<u8> {
                 .spans
                 .push((start as u32, (splines.bytes.len() - start) as u32));
         }
-        splines.append_to(&mut out, b's');
+        splines.write(out, b's');
     }
-    out
 }
 
 pub fn sha256_hex(bytes: &[u8]) -> String {

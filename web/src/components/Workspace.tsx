@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { PreparingView } from "@/components/WorkspaceSkeleton";
 import { AnimatePresence, motion } from "motion/react";
 import { Viewer, type AxisDirs } from "@/viewer/Viewer";
 import { AxisGizmo } from "@/components/AxisGizmo";
@@ -101,26 +102,39 @@ export function Workspace({
     };
   }, []);
 
-  // New buffers: rebuild (and re-frame only for a new file).
+  /** The preview the viewer shows (`id`); until it matches `preview`, "Preparing". */
+  const [drawn, setDrawn] = useState<number | null>(null);
+  // New buffers: rebuild (and re-frame only for a new file). A frame later, so the panels
+  // and "Preparing the 3D view" are on screen while a large model is built.
   useEffect(() => {
     const v = viewer.current;
     if (!v || !preview) return;
-    v.show(preview.buffers, preview.builtUp, shownFile.current !== preview.fileId);
-    shownFile.current = preview.fileId;
-    v.setEdges(edges);
-    setSelected(null);
-    setHovered(null);
+    let timer = 0;
+    const frame = requestAnimationFrame(() => {
+      timer = window.setTimeout(() => {
+        v.show(preview.buffers, preview.builtUp, shownFile.current !== preview.fileId);
+        shownFile.current = preview.fileId;
+        v.setEdges(edges);
+        setSelected(null);
+        setHovered(null);
+        setDrawn(preview.id);
+      });
+    });
+    return () => {
+      cancelAnimationFrame(frame);
+      clearTimeout(timer);
+    };
     // `edges` is applied on its own below; new buffers must not re-run on toggles.
   }, [preview]);
 
   // A new orientation turns the existing preview.
-  useEffect(() => viewer.current?.setOrientation(decisions.up_axis), [decisions.up_axis, preview]);
+  useEffect(() => viewer.current?.setOrientation(decisions.up_axis), [decisions.up_axis, drawn]);
   const shownUnit = displayUnit(decisions.units, prefs.showIn);
   useEffect(() => viewer.current?.setUnit(unitSymbol(shownUnit.unit), shownUnit.factor), [shownUnit.unit, shownUnit.factor]);
   useEffect(() => viewer.current?.setEdges(edges), [edges]);
   // Layers left out of the drawing are hidden in the viewer (after each rebuild too).
-  useEffect(() => viewer.current?.setHidden(hidden), [hidden, preview]);
-  useEffect(() => viewer.current?.highlight(hovered ?? selected), [hovered, selected, preview]);
+  useEffect(() => viewer.current?.setHidden(hidden), [hidden, drawn]);
+  useEffect(() => viewer.current?.highlight(hovered ?? selected), [hovered, selected, drawn]);
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => e.key === "Escape" && setSelected(null);
     window.addEventListener("keydown", onKey);
@@ -193,6 +207,7 @@ export function Workspace({
     <main className="relative flex h-dvh flex-col overflow-hidden bg-viewport lg:block">
       <div className="relative min-h-[200px] flex-1 lg:absolute lg:inset-0">
         <div ref={host} className="absolute inset-0" />
+        {preview && available && drawn !== preview.id && <PreparingView />}
         {!available && (
           <div className="absolute inset-0 grid place-items-center p-6">
             <div className="panel px-5 py-4 text-[13.5px] font-semibold">No preview for this model</div>

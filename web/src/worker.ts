@@ -9,8 +9,11 @@ import { geometryKey } from "@/lib/settings";
 type Module = typeof core;
 type Kind = "core" | "dwg";
 
+/** What the engine is doing. `read` and `parse` count bytes of `total`; `write` counts
+ *  the bytes written so far (the total isn't known in advance, so `total` is 0); the
+ *  others are steps without a count. `engine`: waiting for an engine module to load. */
 export interface Progress {
-  stage: "read" | "parse";
+  stage: "engine" | "read" | "parse" | "hash" | "curves" | "write" | "preview";
   done: number;
   total: number;
 }
@@ -51,7 +54,8 @@ export interface PreviewBuffers {
 }
 
 export interface Converted {
-  file: Blob;
+  /** The file, in the pieces the writer produced (transferred, not copied). */
+  parts: ArrayBuffer[];
   report: string;
   decisions: string;
   timings: Record<string, number>;
@@ -67,10 +71,20 @@ export interface SourceFile {
 
 export type Request =
   | { id: number; type: "open"; sources: SourceFile[]; name: string; dwg: boolean }
-  | { id: number; type: "convert"; settings: EngineSettings; preview: boolean };
+  | { id: number; type: "convert"; settings: EngineSettings; preview: boolean; early: boolean }
+  | { id: number; type: "warm"; dwg: boolean };
+
+/** The model, ready to show before its file is written (a provisional report: no parity
+ *  hash, no output size). */
+export interface Early {
+  preview: PreviewBuffers;
+  report: string;
+  decisions: string;
+}
 
 export type Reply =
   | { id: number; type: "progress"; progress: Progress }
+  | { id: number; type: "early"; early: Early }
   | { id: number; type: "ok"; result: unknown }
   | { id: number; type: "error"; failure: Failure };
 
@@ -80,6 +94,7 @@ const post = (msg: Reply, transfer: Transferable[] = []) => (self as DedicatedWo
 
 let panicMessage: string | null = null;
 const modules: Partial<Record<Kind, Promise<Module>>> = {};
+const ready = new Set<Kind>();
 
 function engine(kind: Kind): Promise<Module> {
   const onPanic = (m: string) => {
@@ -89,11 +104,13 @@ function engine(kind: Kind): Promise<Module> {
     kind === "core"
       ? initCore().then(() => {
           core.on_panic(onPanic);
+          ready.add("core");
           return core;
         })
       : import("./wasm/obj2cad_wasm_dwg.js").then(async (m) => {
           await m.default();
           m.on_panic(onPanic);
+          ready.add("dwg");
           return m as unknown as Module;
         });
   return modules[kind]!;
@@ -140,6 +157,7 @@ async function read(file: File, progress: (done: number) => void): Promise<Uint8
 class ReadError extends Error {}
 
 async function load(id: number, sources: SourceFile[], name: string, kind: Kind): Promise<Open> {
+  if (!ready.has(kind)) post({ id, type: "progress", progress: { stage: "engine", done: 0, total: 0 } });
   const mod = await engine(kind).catch((e: unknown) => {
     throw Object.assign(new Error(String(e instanceof Error ? e.message : e)), { engineFailed: true });
   });
@@ -164,48 +182,75 @@ async function load(id: number, sources: SourceFile[], name: string, kind: Kind)
   return { kind, session, sources, name, parity: new Map() };
 }
 
-function convert(o: Open, settings: EngineSettings, wantPreview: boolean): Promise<Converted> {
-  return (async () => {
-    const t0 = performance.now();
-    const json = JSON.stringify(settings);
-    const key = geometryKey(settings);
-    let parity = o.parity.get(key);
-    if (!parity) {
-      parity = await sha256(o.session.parity_stream(json) as Uint8Array<ArrayBuffer>);
-      o.parity.set(key, parity);
-    }
-    const chunks: Uint8Array<ArrayBuffer>[] = [];
-    const c = o.session.convert(json, parity, wantPreview, (chunk: Uint8Array<ArrayBuffer>) => chunks.push(chunk));
-    try {
-      const preview: PreviewBuffers | null = c.has_preview()
-        ? {
-            positions: c.take_positions(),
-            colors: c.take_colors(),
-            indices: c.take_indices(),
-            edges: c.take_edges(),
-            groups: c.take_groups(),
-            lines: c.take_lines(),
-            lineColors: c.take_line_colors(),
-            lineGroups: c.take_line_groups(),
-            points: c.take_points(),
-            pointColors: c.take_point_colors(),
-            pointGroups: c.take_point_groups(),
-            origin: Array.from(c.origin()),
-            available: c.preview_available(),
+/** Move a conversion's preview buffers out of the engine. */
+function takePreview(c: core.Conversion): PreviewBuffers | null {
+  return c.has_preview()
+    ? {
+        positions: c.take_positions(),
+        colors: c.take_colors(),
+        indices: c.take_indices(),
+        edges: c.take_edges(),
+        groups: c.take_groups(),
+        lines: c.take_lines(),
+        lineColors: c.take_line_colors(),
+        lineGroups: c.take_line_groups(),
+        points: c.take_points(),
+        pointColors: c.take_point_colors(),
+        pointGroups: c.take_point_groups(),
+        origin: Array.from(c.origin()),
+        available: c.preview_available(),
+      }
+    : null;
+}
+
+const buffers = (p: PreviewBuffers) =>
+  [p.positions, p.colors, p.indices, p.edges, p.groups, p.lines, p.lineColors, p.lineGroups, p.points, p.pointColors, p.pointGroups].map((a) => a.buffer);
+
+function convert(id: number, o: Open, settings: EngineSettings, wantPreview: boolean, early: boolean): Converted {
+  const t0 = performance.now();
+  const json = JSON.stringify(settings);
+  const key = geometryKey(settings);
+  const progress = (stage: Progress["stage"], done = 0) => post({ id, type: "progress", progress: { stage, done, total: 0 } });
+  const parts: ArrayBuffer[] = [];
+  let written = 0;
+  let reported = 0;
+  const c = o.session.convert(
+    json,
+    o.parity.get(key) ?? "",
+    wantPreview,
+    (chunk: Uint8Array<ArrayBuffer>) => {
+      parts.push(chunk.buffer);
+      written += chunk.length;
+      // Every 8 MB is plenty to show the file growing.
+      if (written - reported >= 8 << 20) progress("write", (reported = written));
+    },
+    (stage: string) => progress(stage as Progress["stage"]),
+    // The model goes to the app as soon as it can be shown; the file follows.
+    !early
+      ? undefined
+      : (first: core.Conversion) => {
+          try {
+            const preview = takePreview(first);
+            if (preview) post({ id, type: "early", early: { preview, report: first.report(), decisions: first.decisions() } }, buffers(preview));
+          } finally {
+            first.free();
           }
-        : null;
-      return {
-        file: new Blob(chunks, { type: "application/octet-stream" }),
-        report: c.report(),
-        decisions: c.decisions(),
-        timings: JSON.parse(c.timings()) as Record<string, number>,
-        preview,
-        ms: performance.now() - t0,
-      };
-    } finally {
-      c.free();
-    }
-  })();
+        },
+  );
+  try {
+    o.parity.set(key, c.parity());
+    const preview = takePreview(c);
+    return {
+      parts,
+      report: c.report(),
+      decisions: c.decisions(),
+      timings: JSON.parse(c.timings()) as Record<string, number>,
+      preview,
+      ms: performance.now() - t0,
+    };
+  } finally {
+    c.free();
+  }
 }
 
 function failure(err: unknown): Failure {
@@ -226,19 +271,19 @@ self.onmessage = async (e: MessageEvent<Request>) => {
     return;
   }
   try {
-    if (req.type === "open") {
+    if (req.type === "warm") {
+      // Compile an engine module ahead of need (the DWG writer, for people who use it).
+      await engine(req.dwg ? "dwg" : "core");
+      post({ id: req.id, type: "ok", result: null });
+    } else if (req.type === "open") {
       open = await load(req.id, req.sources, req.name, req.dwg ? "dwg" : "core");
       post({ id: req.id, type: "ok", result: JSON.parse(open.session.inspect()) });
     } else {
       if (!open) throw new Error("no file is open");
       // DWG needs the larger engine: move the open file into it once.
       if (req.settings.format === "dwg" && open.kind !== "dwg") open = await load(req.id, open.sources, open.name, "dwg");
-      const r = await convert(open, req.settings, req.preview);
-      const p = r.preview;
-      const transfer = p
-        ? [p.positions, p.colors, p.indices, p.edges, p.groups, p.lines, p.lineColors, p.lineGroups, p.points, p.pointColors, p.pointGroups].map((a) => a.buffer)
-        : [];
-      post({ id: req.id, type: "ok", result: r }, transfer);
+      const r = convert(req.id, open, req.settings, req.preview, req.early);
+      post({ id: req.id, type: "ok", result: r }, [...(r.preview ? buffers(r.preview) : []), ...r.parts]);
     }
   } catch (err) {
     post({ id: req.id, type: "error", failure: failure(err) });

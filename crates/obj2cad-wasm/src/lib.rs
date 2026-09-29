@@ -265,33 +265,93 @@ impl Session {
         Ok(convert_with(&b.doc, &materials, self.options(s)?))
     }
 
-    /// Step 1: the canonical bytes whose SHA-256 is the parity hash. The caller digests
-    /// them natively. Only settings that move geometry change it (up axis, loose points,
-    /// excluded layers), so callers can cache it across the others. (Curved surfaces are
-    /// written next to the mesh; the hash covers the mesh, so they aren't computed here.)
-    pub fn parity_stream(&self, settings: &str) -> Result<Vec<u8>, JsError> {
-        Ok(hash::parity_stream(&self.model(&settings_from(settings)?)?))
-    }
-
-    /// Step 2: convert and write. The file goes to `sink(chunk: Uint8Array)` in pieces of
-    /// about 1 MB. The report's `output.sha256` is left empty (hashed on demand).
+    /// Convert and write. The file goes to `sink(chunk: Uint8Array)` in pieces of about
+    /// 1 MB. The report's `output.sha256` is left empty (hashed on demand).
+    ///
+    /// `parity` is the parity hash when the caller already has it for these settings, or
+    /// empty to compute it here (read it back with `Conversion::parity`). Only settings
+    /// that move geometry change it (up axis, loose points, excluded layers), so callers
+    /// can cache it across the others. It covers the mesh, not the curved surfaces
+    /// written next to it.
+    ///
+    /// The model can be shown before the file exists: with `early`, the preview is built
+    /// first and `early(conversion)` receives it with a provisional report (no parity
+    /// hash, no output size) before the hash and the file are made; the returned
+    /// conversion then has no preview.
+    ///
+    /// `stage(name)` is called as each step starts: `"curves"`, `"preview"`, `"hash"`,
+    /// `"write"`.
+    #[allow(clippy::too_many_arguments)]
     pub fn convert(
         &self,
         settings: &str,
         parity: &str,
         want_preview: bool,
         sink: &js_sys::Function,
+        stage: Option<js_sys::Function>,
+        early: Option<js_sys::Function>,
     ) -> Result<Conversion, JsError> {
+        let stage = |name: &str| {
+            if let Some(f) = &stage {
+                let _ = f.call1(&JsValue::NULL, &JsValue::from_str(name));
+            }
+        };
         let s = settings_from(settings)?;
         let t0 = now();
         let mut model = self.model(&s)?;
-        let curves = model
-            .options
-            .curves
-            .then(|| obj2cad_curves::add_to(&mut model).to_string());
+        // Curved surfaces sit next to the mesh (they don't change it, or its hash).
+        let curves = model.options.curves.then(|| {
+            stage("curves");
+            obj2cad_curves::add_to(&mut model).to_string()
+        });
         let (b, h) = self.loaded()?;
+        let decisions = decisions(&s, &model, h);
+        let source = report::Source {
+            name: &b.name,
+            len: b.source_len,
+            sha256: &b.source_sha256,
+            files: &b.files,
+        };
         let t1 = now();
 
+        let mut preview = want_preview.then(|| {
+            stage("preview");
+            Preview::build(&model)
+        });
+        let t_preview = now();
+        if let (Some(f), true) = (&early, preview.is_some()) {
+            let provisional = report::build(
+                &model,
+                &source,
+                "",
+                report::Written {
+                    format: s.format.id(),
+                    bytes: 0,
+                    sha256: None,
+                },
+            );
+            let first = Conversion {
+                parity: String::new(),
+                report: serde_json::to_string(&provisional)
+                    .map_err(|e| JsError::new(&e.to_string()))?,
+                decisions: decisions.clone(),
+                timings: "{}".into(),
+                preview: preview.take(),
+            };
+            let _ = f.call1(&JsValue::NULL, &JsValue::from(first));
+        }
+
+        let t_hash0 = now();
+        let parity = if parity.is_empty() {
+            stage("hash");
+            hash::parity_hash(&model)
+        } else {
+            parity.to_owned()
+        };
+        let parity = parity.as_str();
+        let t_hash = now();
+
+        stage("write");
         let exact = if model.omissions.is_partial() {
             "partial"
         } else {
@@ -347,12 +407,7 @@ impl Session {
 
         let rep = report::build(
             &model,
-            &report::Source {
-                name: &b.name,
-                len: b.source_len,
-                sha256: &b.source_sha256,
-                files: &b.files,
-            },
+            &source,
             parity,
             report::Written {
                 format: s.format.id(),
@@ -362,39 +417,41 @@ impl Session {
         );
         let report = serde_json::to_string(&rep).map_err(|e| JsError::new(&e.to_string()))?;
         let t3 = now();
-        let preview = want_preview.then(|| Preview::build(&model));
-        let t4 = now();
-
-        // What was chosen, and where it came from, for the dock.
-        let units_from = if s.units.is_some() {
-            "chosen"
-        } else {
-            match h.units_source {
-                UnitsSource::Exporter => "file",
-                _ if s.default_units.is_some() => "default",
-                UnitsSource::Assumed => "assumed",
-            }
-        };
-        let decisions = serde_json::json!({
-            "units": model.options.units,
-            "units_from": units_from,
-            "up_axis": model.options.up_axis,
-            "up_from": if s.up_axis.is_some() { "chosen" } else { "detected" },
-            "detected_units": hints::resolve(h, &Choices { units: None, default_units: s.default_units, up_axis: None }).0,
-            "detected_up_axis": h.up_axis,
-        })
-        .to_string();
         let timings = serde_json::json!({
-            "parse_ms": self.parse_ms, "convert_ms": t1 - t0, "write_ms": t2 - t1, "report_ms": t3 - t2, "preview_ms": t4 - t3,
+            "parse_ms": self.parse_ms, "convert_ms": t1 - t0, "preview_ms": t_preview - t1,
+            "hash_ms": t_hash - t_hash0, "write_ms": t2 - t_hash, "report_ms": t3 - t2,
         })
         .to_string();
         Ok(Conversion {
+            parity: parity.to_owned(),
             report,
             decisions,
             timings,
             preview,
         })
     }
+}
+
+/// Units and up direction as resolved, and where each came from, as JSON (for the app).
+fn decisions(s: &Settings, model: &CadModel, h: &Hints) -> String {
+    let units_from = if s.units.is_some() {
+        "chosen"
+    } else {
+        match h.units_source {
+            UnitsSource::Exporter => "file",
+            _ if s.default_units.is_some() => "default",
+            UnitsSource::Assumed => "assumed",
+        }
+    };
+    serde_json::json!({
+        "units": model.options.units,
+        "units_from": units_from,
+        "up_axis": model.options.up_axis,
+        "up_from": if s.up_axis.is_some() { "chosen" } else { "detected" },
+        "detected_units": hints::resolve(h, &Choices { units: None, default_units: s.default_units, up_axis: None }).0,
+        "detected_up_axis": h.up_axis,
+    })
+    .to_string()
 }
 
 /// Streams the output file to JS in the chunks the writer produces.
@@ -422,6 +479,7 @@ impl Write for JsSink<'_> {
 /// they are empty when no preview was requested or the model can't be displayed.
 #[wasm_bindgen]
 pub struct Conversion {
+    parity: String,
     report: String,
     decisions: String,
     timings: String,
@@ -450,7 +508,7 @@ take! {
     take_indices: indices -> Vec<u32>;
     /// True polygon edges (index pairs), not the display triangles.
     take_edges: edges -> Vec<u32>;
-    /// Per mesh: `[layer, index_start, index_count, edge_start, edge_count]`.
+    /// Per layer: `[layer, index_start, index_count, edge_start, edge_count]`.
     take_groups: groups -> Vec<u32>;
     take_lines: lines -> Vec<f32>;
     take_line_colors: line_colors -> Vec<u8>;
@@ -464,6 +522,10 @@ take! {
 
 #[wasm_bindgen]
 impl Conversion {
+    /// The parity hash written into the file (computed, or the one passed in).
+    pub fn parity(&self) -> String {
+        self.parity.clone()
+    }
     /// Report JSON (see `obj2cad_core::report`).
     pub fn report(&self) -> String {
         self.report.clone()

@@ -99,6 +99,22 @@ for (const format of ["dxf", "dwg"] as const) {
   }
 }
 
+test("opening a large file names each step and can be cancelled; the next file still converts", async ({ page }) => {
+  const big = path.join(mkdtempSync(path.join(tmpdir(), "obj2cad-e2e-")), "big.obj");
+  execFileSync(cli, ["synth", "900", big]); // about 1.6 million faces
+  await open(page, [big]);
+  const loading = page.getByRole("status", { name: "Opening big.obj" });
+  await expect(loading).toBeVisible();
+  await expect(loading.getByText("Reading the model")).toBeVisible();
+  await loading.getByRole("button", { name: "Cancel" }).click();
+  await expect(page.getByRole("heading", { name: "OBJ to DWG / DXF" })).toBeVisible();
+  const obj = path.join(fixtures, "edge", "cube_materials.obj");
+  const mtl = path.join(fixtures, "edge", "cube_materials.mtl");
+  await input(page).setInputFiles([obj, mtl]);
+  const got = await download(page);
+  expect(got.bytes.equals(cliOutput(obj, "dxf")), "web and CLI outputs differ").toBe(true);
+});
+
 test("loose files with a point cloud make one drawing, like the command-line tool", async ({ page }) => {
   const site = path.join(fixtures, "bundle", "site");
   const files = ["site.obj", "Site.MTL", "scan.xyz", "ground.png"].map((f) => path.join(site, f));

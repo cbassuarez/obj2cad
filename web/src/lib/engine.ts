@@ -7,7 +7,7 @@
 // the worker holds another one, that drawing is opened again first. Without this, opening
 // a file from the list while the list was still converting could show (and download)
 // another file's drawing under its name.
-import type { Converted, Failure, ParseFailure, PreviewBuffers, Progress, Reply, Request, SourceFile } from "@/worker";
+import type { Converted, Early as EarlyReply, Failure, ParseFailure, PreviewBuffers, Progress, Reply, Request, SourceFile } from "@/worker";
 import type { EngineSettings, LayerMode, UpAxis, Units } from "@/lib/settings";
 
 export type { Failure, ParseFailure, PreviewBuffers, Progress };
@@ -96,6 +96,14 @@ export interface Report {
   diagnostics: { severity: "info" | "warning"; code: string; line: number; count: number; message: string }[];
 }
 
+/** The model, shown before its file is written: the report is provisional (no parity
+ *  hash, no output size). */
+export interface Early {
+  preview: PreviewBuffers;
+  report: Report;
+  decisions: Decisions;
+}
+
 export interface Result {
   file: Blob;
   report: Report;
@@ -104,6 +112,9 @@ export interface Result {
   timings: Record<string, number>;
   ms: number;
 }
+
+/** The failure of calls stopped by a restart (a crash elsewhere, or a cancelled open). */
+export const RESTARTED = "the engine was restarted";
 
 export class EngineError extends Error {
   constructor(public failure: Failure) {
@@ -116,6 +127,7 @@ interface Pending {
   resolve: (r: unknown) => void;
   reject: (e: EngineError) => void;
   progress?: (p: Progress) => void;
+  early?: (e: EarlyReply) => void;
 }
 
 /** The files of one drawing, as the app holds them (`Job` in lib/files.ts). A drawing is
@@ -147,6 +159,10 @@ class Engine {
         p.progress?.(msg.progress);
         return;
       }
+      if (msg.type === "early") {
+        p.early?.(msg.early);
+        return;
+      }
       this.pending.delete(msg.id);
       if (msg.type === "ok") p.resolve(msg.result);
       else {
@@ -171,14 +187,14 @@ class Engine {
   /** Replace the worker (after a crash). The open file is lost and must be opened again. */
   restart() {
     this.worker.terminate();
-    this.failAll({ kind: "crash", message: "the engine was restarted" });
+    this.failAll({ kind: "crash", message: RESTARTED });
     this.start();
   }
 
-  private call<T>(req: Without<Request, "id">, progress?: (p: Progress) => void): Promise<T> {
+  private call<T>(req: Without<Request, "id">, progress?: (p: Progress) => void, early?: (e: EarlyReply) => void): Promise<T> {
     const id = ++this.seq;
     return new Promise<T>((resolve, reject) => {
-      this.pending.set(id, { resolve: resolve as (r: unknown) => void, reject, progress });
+      this.pending.set(id, { resolve: resolve as (r: unknown) => void, reject, progress, early });
       this.worker.postMessage({ ...req, id } as Request);
     });
   }
@@ -197,17 +213,29 @@ class Engine {
     return info;
   }
 
+  /** Load an engine module ahead of need, so the first DWG isn't kept waiting on it. */
+  warm(dwg: boolean): void {
+    void this.call({ type: "warm", dwg }).catch(() => undefined);
+  }
+
   /** Read the files of one drawing. Its `name` names it when it holds several models. */
   open(d: Drawing, dwg: boolean, progress?: (p: Progress) => void): Promise<Inspection> {
     return this.serial(() => this.load(d, dwg, progress));
   }
 
-  convert(d: Drawing, settings: EngineSettings, preview: boolean, progress?: (p: Progress) => void): Promise<Result> {
+  /** Convert the drawing. With `early`, the preview comes to it as soon as the model can be
+   *  shown, and the result then has no preview. */
+  convert(d: Drawing, settings: EngineSettings, preview: boolean, progress?: (p: Progress) => void, early?: (e: Early) => void): Promise<Result> {
     return this.serial(async () => {
-      if (this.loaded !== d) await this.load(d, settings.format === "dwg");
-      const r = await this.call<Converted>({ type: "convert", settings, preview }, progress);
+      if (this.loaded !== d) await this.load(d, settings.format === "dwg", progress);
+      const onEarly =
+        early &&
+        ((e: EarlyReply) => early({ preview: e.preview, report: JSON.parse(e.report) as Report, decisions: JSON.parse(e.decisions) as Decisions }));
+      const r = await this.call<Converted>({ type: "convert", settings, preview, early: early !== undefined }, progress, onEarly);
       return {
-        file: r.file,
+        // Assembled here from the transferred pieces: fast on this thread, while in the
+        // worker it held back the result by a large fraction of a second.
+        file: new Blob(r.parts, { type: "application/octet-stream" }),
         report: JSON.parse(r.report) as Report,
         decisions: JSON.parse(r.decisions) as Decisions,
         preview: r.preview,
