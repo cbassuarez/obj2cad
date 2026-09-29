@@ -427,11 +427,11 @@ dependencies = [
 
 [[package]]
 name = "obj2cad-acis"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "obj2cad-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "obj2cad-acis",
  "obj2cad-core",
@@ -444,7 +444,7 @@ dependencies = [
 
 [[package]]
 name = "obj2cad-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "jpeg-decoder",
  "memchr",
@@ -458,7 +458,7 @@ dependencies = [
 
 [[package]]
 name = "obj2cad-curves"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "obj2cad-acis",
  "obj2cad-core",
@@ -466,7 +466,7 @@ dependencies = [
 
 [[package]]
 name = "obj2cad-dwg"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "acadrust",
  "obj2cad-acis",
@@ -475,7 +475,7 @@ dependencies = [
 
 [[package]]
 name = "obj2cad-dxf"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "itoa",
  "obj2cad-acis",
@@ -485,7 +485,7 @@ dependencies = [
 
 [[package]]
 name = "obj2cad-wasm"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "earcut",
  "getrandom 0.3.4",

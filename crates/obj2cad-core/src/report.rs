@@ -49,6 +49,10 @@ pub struct LayerSummary {
     pub points: u64,
     /// Curved surfaces (ACIS bodies).
     pub surfaces: u64,
+    /// The file of a bundle this layer's geometry came from (absent for a single file,
+    /// or when the layer holds geometry of several files).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -217,6 +221,7 @@ pub fn build(model: &CadModel, source: &Source, parity: &str, written: Written) 
                 polylines: polylines[i],
                 points: points[i],
                 surfaces: surfaces[i],
+                file: l.file.clone(),
             })
             .collect(),
         diagnostics: model.diagnostics.clone(),

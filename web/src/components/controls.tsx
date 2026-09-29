@@ -7,7 +7,7 @@ import { Tip } from "@/components/ui/tooltip";
 import type { Decisions, Report } from "@/lib/engine";
 import { canPickSaveLocation } from "@/lib/files";
 import { bytes, fmt, measure } from "@/lib/format";
-import { UNITS, formatInfo, unitName, unitSymbol, type Format, type UpAxis, type Units } from "@/lib/settings";
+import { UNITS, displayUnit, formatInfo, unitName, unitSymbol, type Format, type UpAxis, type Units } from "@/lib/settings";
 import { cn, shortcut } from "@/lib/utils";
 import type { ViewName } from "@/viewer/Viewer";
 
@@ -20,7 +20,7 @@ const VIEWS: { value: ViewName; label: string }[] = [
   { value: "right", label: "Right" },
 ];
 
-const UNITS_FROM: Record<Decisions["units_from"], string | undefined> = { chosen: undefined, file: "auto", size: "auto", default: "default", none: undefined };
+const UNITS_FROM: Record<Decisions["units_from"], string | undefined> = { chosen: undefined, file: "auto", default: "default", assumed: "assumed" };
 
 export const shortFormat = (f: Format) => formatInfo(f).label.replace(" (binary)", "");
 
@@ -37,6 +37,8 @@ export interface ResultProps {
   /** The file's exporter states its units. */
   unitsStated: boolean;
   houseUnits: Units | null;
+  /** The unit lengths are shown in (display only); `null` shows the file's unit. */
+  showIn: Units | null;
   includeName: boolean;
   /** Also write recognized curved surfaces. */
   curves: boolean;
@@ -48,6 +50,7 @@ export interface ResultProps {
   onUp: (u: UpAxis | null) => void;
   onUnits: (u: Units | null) => void;
   onHouseUnits: (u: Units | null) => void;
+  onShowIn: (u: Units | null) => void;
   onKeepLoose: (keep: boolean) => void;
   onFormat: (f: Format) => void;
   onIncludeName: (on: boolean) => void;
@@ -106,7 +109,7 @@ export function UnitsMenu({
         )}
       </Menu.Target>
       <Menu.Dropdown>
-        <Menu.Label>Units</Menu.Label>
+        <Menu.Label>The file's numbers are in</Menu.Label>
         {UNITS.map((u) => (
           <Menu.Item key={u.value} onClick={() => onUnits(u.value)} rightSection={decisions.units === u.value ? <Check className="size-3.5" /> : null}>
             {u.name}
@@ -125,13 +128,14 @@ export function UnitsMenu({
   );
 }
 
-/** "120 × 80 × 40 mm", or null when the drawing is empty. */
-export function sizeText(report: Report, decisions: Decisions): string | null {
+/** "120 × 80 × 40 mm" in the unit lengths are shown in, or null when the drawing is empty. */
+export function sizeText(report: Report, decisions: Decisions, showIn: Units | null): string | null {
   const b = report.output.bounds;
   if (!b) return null;
-  const symbol = unitSymbol(decisions.units);
+  const { unit, factor } = displayUnit(decisions.units, showIn);
+  const symbol = unitSymbol(unit);
   return `${b[1]
-    .map((hi, a) => hi - b[0][a])
+    .map((hi, a) => (hi - b[0][a]) * factor)
     .map(measure)
     .join(" × ")}${symbol ? ` ${symbol}` : ""}`;
 }

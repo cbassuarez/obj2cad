@@ -362,7 +362,23 @@ def read_bundle(files: list[Path], name: str) -> dict:
 
     merged = {"positions": [], "texts": [], "colors": [], "elements": [], "mtllibs": [], "splines": [], "curves_left_out": 0}
     palette, textured, meaning = {}, set(), {}
+    taken = {"o": set(), "g": set()}  # object/group names an earlier file already used
     for p, doc in parts:
+        own = {"o": {}, "g": {}}
+
+        def claim(kind, raw, stem=p.stem, own=own):
+            """A name another file already used gets this file's name: "Chair (b)"."""
+            if not several or raw is None:
+                return raw
+            if raw not in own[kind]:
+                name, i = raw, 2
+                while name in taken[kind]:
+                    name = f"{raw} ({stem})" if i == 2 else f"{raw} ({stem} {i})"
+                    i += 1
+                taken[kind].add(name)
+                own[kind][raw] = name
+            return own[kind][raw]
+
         colors, textures = {}, {}
         if ext(p) == ".obj":
             libs = [m for lib in doc["mtllibs"] for m in mtls if m.name.lower() == lib.replace("\\", "/").split("/")[-1].lower()]
@@ -399,10 +415,10 @@ def read_bundle(files: list[Path], name: str) -> dict:
         for kind, idx, o, g, mat, uv in doc["elements"]:
             if several and o is None:
                 o = p.stem
-            merged["elements"].append((kind, [i + v0 for i in idx], o, g, rename.get(mat, mat), uv))
+            merged["elements"].append((kind, [i + v0 for i in idx], claim("o", o), claim("g", g), rename.get(mat, mat), uv))
         for sp in doc["splines"]:
             o = sp["o"] if sp["o"] is not None or not several else p.stem
-            merged["splines"].append({**sp, "cps": [i + v0 for i in sp["cps"]], "o": o, "m": rename.get(sp["m"], sp["m"])})
+            merged["splines"].append({**sp, "cps": [i + v0 for i in sp["cps"]], "o": claim("o", o), "g": claim("g", sp.get("g")), "m": rename.get(sp["m"], sp["m"])})
         merged["curves_left_out"] += doc["curves_left_out"]
     if len(geometry) == 1:
         stem = geometry[0].stem

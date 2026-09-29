@@ -8,11 +8,11 @@ import { notifications } from "@mantine/notifications";
 import { Check, ChevronDown, CircleDot, Copy, ExternalLink, FileText, Info, MoreHorizontal, Palette, TriangleAlert } from "lucide-react";
 import { AnimatePresence, motion } from "motion/react";
 import { Button } from "@/components/ui/button";
-import { DownloadAfter, DownloadButton, Provenance, UnitsMenu, menuStyles, sizeText, unitsChanged, unitsLabel, unitsTag, upChanged, upTag, type ResultProps } from "@/components/controls";
+import { DownloadAfter, DownloadButton, Provenance, UnitsMenu, menuStyles, sizeText, unitsChanged, unitsTag, upChanged, upTag, type ResultProps } from "@/components/controls";
 import type { Report } from "@/lib/engine";
 import { problemUrl } from "@/lib/errors";
 import { bytes, cap, fmt } from "@/lib/format";
-import { FORMATS, UPS, type UpAxis } from "@/lib/settings";
+import { FORMATS, UNITS, UPS, displayUnit, unitName, type UpAxis, type Units } from "@/lib/settings";
 import { summarize, type Summary } from "@/lib/summary";
 import { cn } from "@/lib/utils";
 
@@ -247,10 +247,13 @@ function ValueMenu<T extends string>({
   options,
   onPick,
   disabled,
+  display,
   children,
 }: {
   label: string;
   value: T;
+  /** Trigger text, when it isn't the chosen option's label. */
+  display?: string;
   options: { value: T; label: string; beta?: boolean }[];
   onPick: (v: T) => void;
   disabled?: boolean;
@@ -261,7 +264,7 @@ function ValueMenu<T extends string>({
     <Menu position="bottom-start" offset={6} width={200} classNames={menuStyles}>
       <Menu.Target>
         <button type="button" className={token} disabled={disabled}>
-          {options.find((o) => o.value === value)!.label}
+          {display ?? options.find((o) => o.value === value)!.label}
           <ChevronDown className="size-3.5" />
         </button>
       </Menu.Target>
@@ -282,7 +285,9 @@ function ValueMenu<T extends string>({
 export function ResultCard(p: ResultProps) {
   const { report, decisions } = p;
   const s = summarize(report);
-  const size = sizeText(report, decisions);
+  const size = sizeText(report, decisions, p.showIn);
+  const shown = displayUnit(decisions.units, p.showIn).unit;
+  const fileUnit = decisions.units === "unitless" ? "no unit" : unitName(decisions.units).toLowerCase();
   const [details, setDetails] = useState(false);
   const copyHash = () =>
     void navigator.clipboard
@@ -327,19 +332,43 @@ export function ResultCard(p: ResultProps) {
           <Line label="Up" aside={<Provenance tag={upTag(decisions)} onReset={upChanged(decisions) ? () => p.onUp(null) : undefined} />}>
             <ValueMenu<UpAxis> label="Up direction" value={decisions.up_axis} options={UPS} onPick={p.onUp} />
           </Line>
-          <Line label="Units" aside={<Provenance tag={unitsTag(decisions)} onReset={unitsChanged(decisions) ? () => p.onUnits(null) : undefined} />}>
-            <UnitsMenu decisions={decisions} unitsStated={p.unitsStated} houseUnits={p.houseUnits} onUnits={p.onUnits} onHouseUnits={p.onHouseUnits}>
-              <button type="button" className={token}>
-                {unitsLabel(decisions)}
-                <ChevronDown className="size-3.5" />
-              </button>
-            </UnitsMenu>
-          </Line>
           {size && (
             <Line label="Size">
               <span className="num text-[13px]">{size}</span>
             </Line>
           )}
+          {/* What lengths are shown in: the viewer's choice, never the drawing's scale. */}
+          <Line label="Show in">
+            {decisions.units === "unitless" ? (
+              <span className="text-fg-3" title="The file has no unit to convert from">
+                The file's own numbers
+              </span>
+            ) : (
+              <ValueMenu<Units | "file">
+                label="Show lengths in"
+                value={p.showIn ?? "file"}
+                options={[...UNITS.filter((u) => u.value !== "unitless").map((u) => ({ value: u.value as Units | "file", label: u.name })), { value: "file", label: `The file's unit (${fileUnit})` }]}
+                display={unitName(shown)}
+                onPick={(v) => p.onShowIn(v === "file" ? null : v)}
+              />
+            )}
+          </Line>
+          {/* The drawing's own unit: detected, written to the file, correctable. */}
+          <div className="grid grid-cols-[92px_minmax(0,1fr)_auto] items-baseline gap-x-3 pb-1.5 text-[12px] text-fg-3">
+            <span />
+            <span className="min-w-0 truncate">
+              File in <span className="font-medium text-fg-2">{fileUnit}</span>
+              {unitsTag(decisions) && !unitsChanged(decisions) && <> · {unitsTag(decisions)}</>}
+            </span>
+            <span className="flex items-baseline gap-2">
+              {unitsChanged(decisions) && <Provenance onReset={() => p.onUnits(null)} />}
+              <UnitsMenu decisions={decisions} unitsStated={p.unitsStated} houseUnits={p.houseUnits} onUnits={p.onUnits} onHouseUnits={p.onHouseUnits}>
+                <button type="button" className="cursor-pointer font-semibold text-accent hover:underline" aria-label="Change the file's unit">
+                  Change
+                </button>
+              </UnitsMenu>
+            </span>
+          </div>
           <Line label="Format" aside={<span className="num text-[12px] text-fg-3">{bytes(report.output.bytes)}</span>}>
             <ValueMenu label="Format" value={p.format} options={FORMATS} onPick={p.onFormat} disabled={p.busy !== null}>
               <Menu.Divider />

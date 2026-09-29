@@ -31,8 +31,9 @@ traced back to its source.
 A model (`.obj`), or a bundle: a `.zip`, a folder, or several files with the model's
 material libraries (`.mtl`), texture images (`.jpg`, `.png`) and point clouds (`.xyz`).
 Files are matched by name, ignoring folders and case, and a bundle becomes one drawing
-(scan bundles share coordinates). The report lists every file as used, not used or
-missing.
+(scan bundles share coordinates). Each file keeps its own layers: a name two files both
+use gets the file's name added (`Chair (west)`), and the app lists layers under their file.
+The report lists every file as used, not used or missing.
 
 - **Point clouds** (`.xyz`): each point becomes a CAD point with its exact coordinate
   text, and RGB columns become its color. Column layouts that could mean two things
@@ -65,11 +66,12 @@ OBJ files store neither units nor which way is up, so obj2cad decides both:
 - **Up direction** is detected from the geometry: which way the model rests on a flat base,
   or which axis it lies flat along. Only when the shape is ambiguous does it fall back to
   the exporter's convention. Standing a model upright is an exact axis swap.
-- **Units** come from the exporter's convention (Blender: meters, SketchUp: inches, …) or
-  the model's size. Units only label the drawing (`$INSUNITS`); coordinates never change,
-  so a wrong guess can't damage geometry. A remembered "house unit" replaces the size
-  guess for files whose exporter doesn't state one. With no basis, the drawing stays
-  unitless. The app shows the resulting size in CAD next to the download.
+- **Units** come from the exporter's convention (Blender: meters, SketchUp: inches, …);
+  a file that doesn't name its exporter is taken as meters, or as your remembered "house
+  unit". Units only label the drawing (`$INSUNITS`); coordinates never change, so a wrong
+  guess can't damage geometry. In the app, "Show in" picks the unit sizes and dimensions
+  are displayed in; it never changes the file. The file's own unit is shown beneath it
+  and can be changed there.
 
 Both can be changed in one click. The command-line tool makes the same decisions by
 default, so the same file gives the same drawing (byte for byte) in both;

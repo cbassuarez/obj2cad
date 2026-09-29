@@ -215,6 +215,10 @@ pub struct ObjDocument {
     /// Texture coordinate of each face corner, parallel to `faces.indices`
     /// ([`NO_UV`] where a corner has none). Empty when no face uses texture coordinates.
     pub face_uvs: Vec<u32>,
+    /// A bundle of several files: their names, and the file of each attribute set (in
+    /// step with `attrs`). Empty for a single file.
+    pub files: Vec<String>,
+    pub attr_file: Vec<u32>,
     pub(crate) coord_text: Vec<u8>,
     pub(crate) coord_offsets: Vec<u32>,
 }

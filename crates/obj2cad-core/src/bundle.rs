@@ -412,8 +412,9 @@ type Renames = HashMap<(usize, String), String>;
 type Definitions = HashMap<String, (Option<[f64; 3]>, Option<MaterialTexture>)>;
 
 /// Concatenate documents. With several parts, unnamed geometry is named after its file
-/// (so each file gets its own layer), and materials that two files define differently
-/// are renamed "material (file)".
+/// (so each file gets its own layer), object and group names another file already used
+/// get the later file's name ("Chair (b)"), so two files never share a layer by accident,
+/// and materials that two files define differently are renamed "material (file)".
 fn merge(
     names: &[String],
     parts: Vec<(usize, ObjDocument)>,
@@ -486,11 +487,34 @@ fn merge(
     out.coord_offsets.push(0);
     let any_uvs = parts.iter().any(|(_, d)| !d.face_uvs.is_empty());
     let mut names_index: [HashMap<String, u32>; 3] = Default::default();
+    // Object and group names already used by an earlier file.
+    let mut taken: [std::collections::HashSet<String>; 2] = Default::default();
     let mut header_taken = false;
     let mut attr_index: HashMap<ElementAttrs, u32> = HashMap::new();
     for (pi, (fi, d)) in parts.into_iter().enumerate() {
         let file = &names[fi];
         let stem = stem_of(file).to_owned();
+        out.files.push(file.clone());
+        // This file's object/group names as written in the drawing.
+        let mut own: [HashMap<String, String>; 2] = Default::default();
+        let mut claim = |which: usize, raw: &str| -> String {
+            if let Some(n) = own[which].get(raw) {
+                return n.clone();
+            }
+            let mut n = raw.to_owned();
+            let mut i = 2;
+            while taken[which].contains(&n) {
+                n = if i == 2 {
+                    format!("{raw} ({stem})")
+                } else {
+                    format!("{raw} ({stem} {i})")
+                };
+                i += 1;
+            }
+            taken[which].insert(n.clone());
+            own[which].insert(raw.to_owned(), n.clone());
+            n
+        };
         let v0 = out.positions.len() as u32;
         let t0 = out.texcoords.len() as u32;
         // Coordinates and their text.
@@ -512,15 +536,17 @@ fn merge(
             .attrs
             .iter()
             .map(|a| {
-                let object = match a.object {
-                    Some(o) => d.objects[o as usize].clone(),
-                    None => stem.clone(),
-                };
+                let object = claim(
+                    0,
+                    a.object
+                        .map_or(stem.as_str(), |o| d.objects[o as usize].as_str()),
+                );
                 let a2 = ElementAttrs {
                     object: Some(intern(0, &object, &mut out.objects)),
-                    group: a
-                        .group
-                        .map(|g| intern(1, &d.groups[g as usize], &mut out.groups)),
+                    group: a.group.map(|g| {
+                        let group = claim(1, &d.groups[g as usize]);
+                        intern(1, &group, &mut out.groups)
+                    }),
                     material: a.material.map(|m| {
                         let raw = &d.materials[m as usize];
                         let n = renames.get(&(pi, raw.clone())).unwrap_or(raw);
@@ -529,6 +555,7 @@ fn merge(
                 };
                 *attr_index.entry(a2).or_insert_with(|| {
                     out.attrs.push(a2);
+                    out.attr_file.push(pi as u32);
                     (out.attrs.len() - 1) as u32
                 })
             })
@@ -695,6 +722,49 @@ mod tests {
             .diagnostics
             .iter()
             .any(|d| d.code == Code::MissingFile));
+    }
+
+    #[test]
+    fn files_never_share_a_layer_by_accident() {
+        let cube = b"o Cube\ng top\nv 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n";
+        let b = load(
+            vec![
+                file("a.obj", cube),
+                file("b.obj", cube),
+                file("scan.xyz", b"0 0 5\n1 1 5\n"),
+            ],
+            "site.zip",
+            |_, _| {},
+        )
+        .unwrap();
+        assert_eq!(b.doc.objects, ["Cube", "Cube (b)", "scan"]);
+        assert_eq!(b.doc.groups, ["top", "top (b)"]);
+        assert_eq!(b.doc.files, ["a.obj", "b.obj", "scan.xyz"]);
+        let layers = |mode| {
+            let options = crate::Options {
+                layer_mode: mode,
+                ..Default::default()
+            };
+            crate::convert(&b.doc, None, options)
+                .layers
+                .iter()
+                .filter(|l| !l.source.is_empty())
+                .map(|l| (l.name.clone(), l.file.clone()))
+                .collect::<Vec<_>>()
+        };
+        let named = |n: &str, f: &str| (n.to_owned(), Some(f.to_owned()));
+        assert_eq!(
+            layers(crate::LayerMode::Objects),
+            [
+                named("Cube", "a.obj"),
+                named("Cube (b)", "b.obj"),
+                named("scan", "scan.xyz")
+            ]
+        );
+        assert_eq!(
+            layers(crate::LayerMode::Groups)[..2],
+            [named("top", "a.obj"), named("top (b)", "b.obj")]
+        );
     }
 
     #[test]

@@ -1,9 +1,10 @@
 //! Settings the OBJ format does not record (units, up axis).
 //!
 //! Both are chosen automatically; the user can override either.
-//! The up axis is detected from the geometry (the rotation is exact). Units are a best
-//! guess from the exporter's convention or the model's size; they only label the drawing,
-//! so a wrong guess never changes a coordinate. With no basis, the drawing stays unitless.
+//! The up axis is detected from the geometry (the rotation is exact). Units come from the
+//! exporter's convention when the file names its exporter, else meters (what most OBJ
+//! exporters write); they only label the drawing, so a wrong guess never changes a
+//! coordinate.
 
 use crate::convert::{Units, UpAxis};
 use crate::obj::ObjDocument;
@@ -12,9 +13,10 @@ use serde::Serialize;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UnitsSource {
+    /// The exporter named in the file, and its convention.
     Exporter,
-    Size,
-    None,
+    /// Nothing in the file says: meters, the common OBJ convention.
+    Assumed,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -22,7 +24,7 @@ pub struct Hints {
     /// Exporter name if the leading comments identify one.
     pub exporter: Option<String>,
     pub units: Units,
-    /// Where the unit came from: the exporter's convention, the model's size, or nothing.
+    /// Where the unit came from: the exporter's convention, or assumed.
     pub units_source: UnitsSource,
     pub up_axis: UpAxis,
     /// True when the geometry itself decided the up axis (not just a default).
@@ -96,15 +98,11 @@ pub fn hints(doc: &ObjDocument) -> Hints {
             }
             Some((lo, hi))
         });
-    let size = bounds.map(|(lo, hi)| (0..3).map(|a| hi[a] - lo[a]).fold(0.0, f64::max));
-
-    // Only guess from size when it is a plausible physical size; extreme or degenerate
-    // extents (surveys in odd units, test files) get no suggestion rather than a bad one.
-    let (units, units_source) = match (known.and_then(|e| e.2), size) {
-        (Some(u), _) => (u, UnitsSource::Exporter),
-        (None, Some(s)) if s > 0.0 && s < 5.0 => (Units::Meters, UnitsSource::Size),
-        (None, Some(s)) if (5.0..50_000.0).contains(&s) => (Units::Millimeters, UnitsSource::Size),
-        _ => (Units::Unitless, UnitsSource::None),
+    // A model's size says little about its unit (a 6-unit building and a 6 mm part look
+    // alike), so without the exporter's word it is meters, whatever the size.
+    let (units, units_source) = match known.and_then(|e| e.2) {
+        Some(u) => (u, UnitsSource::Exporter),
+        None => (Units::Meters, UnitsSource::Assumed),
     };
     let (up_axis, up_axis_confident) = match (detect_up(doc, bounds), known.and_then(|e| e.3)) {
         (Some(axis), _) => (axis, true),
@@ -134,14 +132,13 @@ pub struct Choices {
 /// with the same choices always gives the same output.
 ///
 /// Units: an explicit choice, else the exporter's convention, else the house unit, else
-/// the size-based guess, else unitless. Up axis: an explicit choice, else detection.
+/// meters. Up axis: an explicit choice, else detection.
 pub fn resolve(h: &Hints, c: &Choices) -> (Units, UpAxis) {
     let units = c
         .units
         .or((h.units_source == UnitsSource::Exporter).then_some(h.units))
         .or(c.default_units)
-        .or((h.units_source == UnitsSource::Size).then_some(h.units))
-        .unwrap_or(Units::Unitless);
+        .unwrap_or(h.units);
     (units, c.up_axis.unwrap_or(h.up_axis))
 }
 
@@ -229,16 +226,20 @@ mod tests {
     }
 
     #[test]
-    fn absurd_sizes_get_no_guess() {
-        let d = parse(
-            b"v -1e308 0 0
-v 1e308 0 0
-",
-        )
-        .unwrap();
-        let h = hints(&d);
-        assert_eq!(h.units, Units::Unitless);
-        assert_eq!(h.units_source, UnitsSource::None);
+    fn without_an_exporter_it_is_meters_whatever_the_size() {
+        for src in [
+            &b"v 0 0 0\nv 0.004 0 0\n"[..],
+            b"v 0 0 0\nv 6 4 4.5\n",
+            b"v 0 0 0\nv 120 30 4\n",
+            b"v -1e308 0 0\nv 1e308 0 0\n",
+            b"v 1 2 3\n",
+        ] {
+            let h = hints(&parse(src).unwrap());
+            assert_eq!(
+                (h.units, h.units_source),
+                (Units::Meters, UnitsSource::Assumed)
+            );
+        }
     }
 
     /// Axis-aligned box with its min corner at `lo`, as OBJ quads with outward normals.
@@ -393,10 +394,15 @@ v 30 12 9
             default_units: Some(Units::Meters),
             ..Default::default()
         };
-        // The exporter's convention beats the house unit; the house unit beats a size guess.
-        assert_eq!(resolve(&blender, &house).0, Units::Meters);
-        assert_eq!(resolve(&unknown, &Choices::default()).0, Units::Millimeters);
-        assert_eq!(resolve(&unknown, &house).0, Units::Meters);
+        // The exporter's convention beats the house unit; the house unit beats the
+        // assumed meters.
+        let inches = Choices {
+            default_units: Some(Units::Inches),
+            ..Default::default()
+        };
+        assert_eq!(resolve(&blender, &inches).0, Units::Meters);
+        assert_eq!(resolve(&unknown, &Choices::default()).0, Units::Meters);
+        assert_eq!(resolve(&unknown, &inches).0, Units::Inches);
         // An explicit choice beats everything.
         let explicit = Choices {
             units: Some(Units::Inches),
@@ -410,9 +416,11 @@ v 30 12 9
     }
 
     #[test]
-    fn unknown_uses_size() {
-        let d = parse(b"v 0 0 0\nv 120 30 4\n").unwrap();
-        assert_eq!(hints(&d).units, Units::Millimeters);
-        assert_eq!(hints(&d).up_axis, UpAxis::AsIs);
+    fn exporters_state_their_convention() {
+        let d = parse(b"# SketchUp export\nv 0 0 0\nv 120 30 4\n").unwrap();
+        assert_eq!(
+            (hints(&d).units, hints(&d).units_source),
+            (Units::Inches, UnitsSource::Exporter)
+        );
     }
 }

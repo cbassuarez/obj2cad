@@ -37,6 +37,8 @@ const linear = (c: Uint8Array) => {
 };
 
 const FOV = 38;
+/** Dimension label numbers: up to 3 decimals, grouped thousands (like the result card). */
+const LENGTH = new Intl.NumberFormat("en-US", { maximumFractionDigits: 3 });
 const MARGIN = 1.35; // room for the dimension labels around the model
 
 export class Viewer {
@@ -61,6 +63,8 @@ export class Viewer {
   private edgesOn = false;
   private hasContent = false;
   private unit = "";
+  /** Display lengths = model lengths × this (the unit lengths are shown in). */
+  private unitFactor = 1;
   private hidden = new Set<number>();
   private theme: ViewerTheme = { grid: "#ddd8ce", gridMajor: "#cbc4b7", dim: "#2b55c7", edge: "#1c1d1f" };
   private resizeObserver: ResizeObserver;
@@ -254,9 +258,11 @@ export class Viewer {
     );
   }
 
-  /** Unit suffix for dimension labels ("mm", "in", or "" for unitless). */
-  setUnit(unit: string): void {
+  /** Unit suffix for dimension labels ("mm", "in", or "" for unitless), and the factor
+   *  from model lengths to that unit (display only). */
+  setUnit(unit: string, factor = 1): void {
     this.unit = unit;
+    this.unitFactor = factor;
     this.rebuildDims();
     this.requestRender();
   }
@@ -520,7 +526,8 @@ export class Viewer {
     const label = (at: THREE.Vector3, value: number) => {
       const el = document.createElement("div");
       el.className = "dim-label";
-      el.textContent = this.unit ? `${value.toFixed(3)} ${this.unit}` : value.toFixed(3);
+      const shown = LENGTH.format(value * this.unitFactor);
+      el.textContent = this.unit ? `${shown} ${this.unit}` : shown;
       const obj = new CSS2DObject(el);
       obj.position.copy(at);
       this.dims.add(obj);

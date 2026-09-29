@@ -700,6 +700,7 @@ fn acis_samples(dir: &Path) -> Result<(), String> {
             name: "Curves".into(),
             source: String::new(),
             color: obj2cad_core::convert::layer_color(1),
+            file: None,
         });
         model.surfaces.push(obj2cad_core::convert::SurfaceEntity {
             layer: 1,
