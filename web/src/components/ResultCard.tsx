@@ -282,8 +282,8 @@ export function ResultCard(p: ResultProps) {
       <div className="min-h-0 flex-1 overflow-y-auto px-5">
         <dl className="m-0 border-y border-line-soft py-1.5">
           <Line label="Contents">
-            <span className="num">{fmt(s.shapes.count)}</span> {s.shapes.count === 1 ? s.shapes.noun.slice(0, -1) : s.shapes.noun} on <span className="num">{fmt(p.layerCount)}</span>{" "}
-            {p.layerCount === 1 ? "layer" : "layers"}
+            <span className="num">{fmt(s.shapes.count)}</span> {s.shapes.count === 1 ? s.shapes.noun.slice(0, -1) : s.shapes.noun} on <span className="num">{fmt(p.layerCount - p.hiddenCount)}</span>
+            {p.hiddenCount > 0 && ` of ${fmt(p.layerCount)}`} {p.layerCount === 1 ? "layer" : "layers"}
           </Line>
           <Line label="Up" aside={<Provenance tag={upTag(decisions)} onReset={upChanged(decisions) ? () => p.onUp(null) : undefined} />}>
             <ValueMenu<UpAxis> label="Up direction" value={decisions.up_axis} options={UPS} onPick={p.onUp} />

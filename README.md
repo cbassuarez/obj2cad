@@ -46,6 +46,11 @@ its own OBJ reader, a DXF read-back through [ezdxf](https://github.com/mozman/ez
 ezdxf's audit, and a three-way parity-hash match (Rust source ↔ Python source ↔ DXF
 read-back). CI runs it on Windows, macOS and Linux for both axis modes.
 
+`tests/harness/web_parity.py` does the same for the web app's downloads: every fixture is
+opened and downloaded through the real app in a browser (DXF, binary DXF, DWG, a
+visible-layers download and a batch .zip), and each file must be byte-identical to the
+CLI's, with a report that describes it, and pass the same independent checks.
+
 ## Try it
 
 ```bash
@@ -71,6 +76,8 @@ Verify everything:
 ```bash
 pip install -r tests/harness/requirements.txt
 python tests/harness/parity.py --up as-is tests/fixtures
+(cd web && npm run build && npm run downloads -- ../web-downloads ../tests/fixtures)
+python tests/harness/web_parity.py web-downloads
 ```
 
 ## Releases and updates

@@ -88,3 +88,26 @@ jobs:
       - name: Build (wasm + typecheck + bundle)
         working-directory: web
         run: npm run build
+      # The files the browser saves must be the CLI's files, byte for byte, and the report
+      # the app saves must describe them (tests/harness/web_parity.py).
+      - name: Build CLI
+        run: cargo build --release -p obj2cad-cli
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Harness dependencies
+        run: pip install -r tests/harness/requirements.txt
+      - name: Browser
+        working-directory: web
+        run: npx playwright install --with-deps chromium
+      - name: Download every fixture through the app
+        working-directory: web
+        run: npm run downloads -- ../web-downloads ../tests/fixtures
+      - name: Web downloads match the CLI and verify independently
+        run: python tests/harness/web_parity.py web-downloads
+      - name: Upload the downloads (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-downloads-${{ github.sha }}
+          path: web-downloads/

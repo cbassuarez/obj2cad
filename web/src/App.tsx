@@ -73,6 +73,8 @@ export function App() {
   const [prefs, setPrefsState] = useState<Prefs>(loadPrefs);
   const [current, setCurrent] = useState<Current | null>(null);
   const [result, setResult] = useState<Result | null>(null);
+  /** The drawing without the layers hidden in the viewer: what Download saves then. */
+  const [visible, setVisible] = useState<Result | null>(null);
   const [preview, setPreview] = useState<PreviewState | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [loading, setLoading] = useState<{ name: string; progress: Progress | null }>({ name: "", progress: null });
@@ -89,6 +91,10 @@ export function App() {
   const prefsRef = useRef(prefs);
   const currentRef = useRef<Current | null>(null);
   const resultRef = useRef<Result | null>(null);
+  const visibleRef = useRef<Result | null>(null);
+  /** Names of the layers hidden in the viewer. */
+  const hiddenRef = useRef<string[]>([]);
+  const visibleToken = useRef(0);
   const batchRef = useRef<BatchItem[]>([]);
   const batchMtls = useRef<File[]>([]);
   const shownPreview = useRef<{ key: string; fileId: number } | null>(null);
@@ -177,6 +183,11 @@ export function App() {
     const key = previewKey(settings);
     const shown = shownPreview.current;
     const wantPreview = forcePreview || !shown || shown.key !== key || shown.fileId !== cur.id;
+    // A new preview shows every layer again; until then no visible-layers drawing is current.
+    if (wantPreview) hiddenRef.current = [];
+    ++visibleToken.current;
+    visibleRef.current = null;
+    setVisible(null);
     setBusy(label);
     setDownloaded(null);
     try {
@@ -194,6 +205,7 @@ export function App() {
         setPreview({ buffers: r.preview, builtUp: r.decisions.up_axis, id: ++seq.current, fileId: cur.id });
       }
       if (cur.batchItem !== null) updateBatch(cur.batchItem, { status: "done", result: r });
+      if (hiddenRef.current.length) await convertVisible(cur);
       return true;
     } catch (e) {
       if (token !== convertToken.current) return false;
@@ -203,6 +215,28 @@ export function App() {
       if (token === convertToken.current) setBusy(null);
     }
     // Stable: everything it reads is a ref or a state setter (openSingle is only called later).
+  }, []);
+
+  /** Convert the drawing without the hidden layers, so everything shown describes the download. */
+  const convertVisible = useCallback(async (cur: Current) => {
+    const token = ++visibleToken.current;
+    visibleRef.current = null;
+    setVisible(null);
+    const hidden = hiddenRef.current;
+    const full = resultRef.current;
+    const layers = full ? full.report.layers.filter((l) => l.faces + l.polylines + l.points > 0).length : 0;
+    if (!hidden.length || hidden.length >= layers) return; // nothing hidden, or nothing left to download
+    setBusy("Converting…");
+    try {
+      const r = await engine.convert(cur, engineSettings(prefsRef.current, cur.choices, cur.file, hidden), false);
+      if (token !== visibleToken.current) return;
+      visibleRef.current = r;
+      setVisible(r);
+    } catch (e) {
+      if (token === visibleToken.current) notifications.show({ color: "red", title: "Couldn't convert the visible layers", message: (e as Error).message });
+    } finally {
+      if (token === visibleToken.current) setBusy(null);
+    }
   }, []);
 
   /** Open one file into the workspace. */
@@ -349,32 +383,33 @@ export function App() {
     }
   };
 
+  /** What Download saves: the drawing, or without the hidden layers when some are hidden. */
+  const downloadable = () => {
+    const cur = currentRef.current;
+    const partial = hiddenRef.current.length > 0;
+    const r = partial ? visibleRef.current : resultRef.current;
+    return cur && r ? { r, name: `${stem(cur.file.name)}${partial ? " (visible layers)" : ""}` } : null;
+  };
+
   const download = (pickLocation: boolean) => {
-    const cur = currentRef.current;
-    const r = resultRef.current;
-    if (cur && r && !busy) void save(r.file, `${stem(cur.file.name)}.${ext()}`, pickLocation);
+    const d = downloadable();
+    if (d && !busy) void save(d.r.file, `${d.name}.${ext()}`, pickLocation);
   };
 
-  const downloadVisible = async (hiddenLayers: string[]) => {
+  const changeHidden = (names: string[]) => {
+    hiddenRef.current = names;
+    setDownloaded(null);
     const cur = currentRef.current;
-    if (!cur) return;
-    setBusy("Converting…");
-    try {
-      const r = await engine.convert(cur, engineSettings(prefsRef.current, cur.choices, cur.file, hiddenLayers), false);
-      await save(r.file, `${stem(cur.file.name)} (visible layers).${ext()}`);
-    } catch (e) {
-      notifications.show({ color: "red", title: "Couldn't convert the visible layers", message: (e as Error).message });
-    } finally {
-      setBusy(null);
-    }
+    if (cur) void convertVisible(cur);
   };
 
+  /** The report of exactly what Download saves. */
   const downloadReport = async () => {
-    const cur = currentRef.current;
-    const r = resultRef.current;
-    if (!cur || !r) return;
+    const d = downloadable();
+    if (!d) return;
+    const { r } = d;
     const report = { ...r.report, output: { ...r.report.output, sha256: await sha256Hex(r.file) } };
-    const saved = await saveFile(new Blob([JSON.stringify(report, null, 2)], { type: "application/json" }), `${stem(cur.file.name)}.report.json`).catch(() => null);
+    const saved = await saveFile(new Blob([JSON.stringify(report, null, 2)], { type: "application/json" }), `${d.name}.report.json`).catch(() => null);
     if (saved) notifications.show({ message: `Saved ${saved}` });
   };
 
@@ -479,6 +514,7 @@ export function App() {
           <Suspense fallback={<main className="h-dvh bg-viewport" />}>
             <Workspace
               result={result}
+              visible={visible}
               preview={preview}
               inspection={current?.inspection ?? null}
               prefs={prefs}
@@ -492,8 +528,7 @@ export function App() {
               onFormat={(format: Format) => changePrefs({ format })}
               onIncludeName={(includeName) => changePrefs({ includeName })}
               onDownload={download}
-              onDownloadVisible={(hidden) => void downloadVisible(hidden)}
-              onLayersChanged={() => setDownloaded(null)}
+              onHidden={changeHidden}
               onDownloadReport={() => void downloadReport()}
               onAddMtl={() => mtlInput.current?.click()}
               onAnother={() => void pick()}

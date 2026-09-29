@@ -24,6 +24,7 @@ export interface PreviewState {
 
 export function Workspace({
   result,
+  visible,
   preview,
   inspection,
   prefs,
@@ -37,13 +38,14 @@ export function Workspace({
   onFormat,
   onIncludeName,
   onDownload,
-  onDownloadVisible,
-  onLayersChanged,
+  onHidden,
   onDownloadReport,
   onAddMtl,
   onAnother,
 }: {
   result: Result;
+  /** The drawing without the hidden layers (while some are hidden and it is ready). */
+  visible: Result | null;
   preview: PreviewState | null;
   inspection: Inspection | null;
   prefs: Prefs;
@@ -57,9 +59,8 @@ export function Workspace({
   onFormat: (f: Format) => void;
   onIncludeName: (on: boolean) => void;
   onDownload: (pick: boolean) => void;
-  onDownloadVisible: (hiddenLayers: string[]) => void;
-  /** Layers were hidden or shown: what a download holds has changed. */
-  onLayersChanged: () => void;
+  /** The layers hidden in the viewer changed (their names): the download changes with them. */
+  onHidden: (names: string[]) => void;
   onDownloadReport: () => void;
   onAddMtl: () => void;
   onAnother: () => void;
@@ -100,29 +101,32 @@ export function Workspace({
   useEffect(() => viewer.current?.setUnit(unitSymbol(decisions.units)), [decisions.units]);
   useEffect(() => viewer.current?.setEdges(edges), [edges]);
 
+  const changeHidden = (next: Set<number>) => {
+    setHidden(next);
+    onHidden(report.layers.filter((_, i) => next.has(i)).map((l) => l.name));
+  };
+
   const toggleLayer = (layer: number) => {
     const next = new Set(hidden);
     if (next.has(layer)) next.delete(layer);
     else next.add(layer);
-    setHidden(next);
     viewer.current?.setLayerVisible(layer, !next.has(layer));
-    onLayersChanged();
+    changeHidden(next);
   };
 
   const showAll = () => {
     for (const layer of hidden) viewer.current?.setLayerVisible(layer, true);
-    setHidden(new Set());
-    onLayersChanged();
+    changeHidden(new Set());
   };
 
   const available = preview?.buffers.available ?? true;
   const layerCount = report.layers.filter((l) => l.faces + l.polylines + l.points > 0).length;
   /** The download, as the button and the keyboard make it: hidden layers left out. */
   const download = (pickLocation: boolean) => {
-    if (busy !== null) return;
-    if (hidden.size === 0) onDownload(pickLocation);
-    else if (hidden.size < layerCount) onDownloadVisible(report.layers.filter((_, i) => hidden.has(i)).map((l) => l.name));
+    if (busy === null && hidden.size < layerCount) onDownload(pickLocation);
   };
+  // Everything the card says describes the file Download saves.
+  const shown = hidden.size > 0 && visible ? visible : result;
   const downloadRef = useRef(download);
   downloadRef.current = download;
   useEffect(() => {
@@ -140,11 +144,11 @@ export function Workspace({
     viewer.current?.setOrtho(on);
   };
   const panel: ResultProps = {
-    report,
+    report: shown.report,
     decisions,
     format: prefs.format,
-    ms: result.ms,
-    timings: result.timings,
+    ms: shown.ms,
+    timings: shown.timings,
     exporter: inspection?.hints.exporter ?? null,
     busy,
     downloaded,
