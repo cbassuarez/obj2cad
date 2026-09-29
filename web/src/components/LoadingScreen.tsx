@@ -11,7 +11,7 @@ export function LoadingScreen({ name, progress }: { name: string; progress: Prog
   // Reading is the first half of the bar, parsing the second.
   const frac = progress ? (progress.stage === "read" ? 0 : 0.5) + (progress.done / Math.max(progress.total, 1)) * 0.5 : null;
   return (
-    <main className="paper flex min-h-dvh items-center justify-center px-4" role="status" aria-live="polite">
+    <main className="paper flex h-dvh items-center justify-center overflow-hidden px-4" role="status" aria-live="polite">
       <div className="panel flex w-full max-w-[420px] flex-col items-center gap-4 px-10 py-8">
         <motion.div animate={{ rotate: [0, 0, 120, 120] }} transition={{ duration: 1.8, repeat: Infinity, times: [0, 0.3, 0.7, 1] }}>
           <CubeArt className="size-12 text-accent" />
@@ -39,7 +39,7 @@ export function LoadingScreen({ name, progress }: { name: string; progress: Prog
 /** A file too large to be comfortable in a browser tab. */
 export function PreflightScreen({ name, size, onContinue, onCancel, cliUrl }: { name: string; size: number; onContinue: () => void; onCancel: () => void; cliUrl: string }) {
   return (
-    <main className="paper flex min-h-dvh items-center justify-center px-4" role="alertdialog" aria-labelledby="preflight-title">
+    <main className="paper flex h-dvh items-center justify-center overflow-hidden px-4" role="alertdialog" aria-labelledby="preflight-title">
       <div className="panel flex w-full max-w-[520px] flex-col gap-4 p-6">
         <div id="preflight-title" className="text-[16px] font-semibold">
           {name} is {bytes(size)}

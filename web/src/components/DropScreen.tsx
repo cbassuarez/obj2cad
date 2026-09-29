@@ -17,19 +17,19 @@ function CropMarks() {
 
 export function DropScreen({ onPick }: { onPick: () => void }) {
   return (
-    <main className="paper relative flex min-h-dvh flex-col items-center justify-center px-4 pt-24 pb-12">
+    <main className="paper relative flex h-dvh flex-col items-center justify-center overflow-hidden px-4 pt-[76px] pb-[clamp(16px,5vh,48px)]">
       <motion.div
         initial={{ opacity: 0, y: 12 }}
         animate={{ opacity: 1, y: 0 }}
         transition={{ duration: 0.5, ease: [0.2, 0.7, 0.2, 1] }}
-        className="flex w-full max-w-[720px] flex-col items-center gap-10"
+        className="flex max-h-[580px] min-h-0 w-full max-w-[720px] flex-1 flex-col items-center justify-center gap-[clamp(16px,4.5vh,40px)]"
       >
-        <div className="flex flex-col items-center gap-3 text-center">
-          <h1 className="font-display text-[clamp(36px,6vw,56px)] leading-none font-semibold tracking-[-0.035em]">OBJ to DWG / DXF</h1>
-          <p className="max-w-[560px] text-[16px] text-fg-2">Drop an .obj file, with its .mtl if it has one. Several files or a .zip work too.</p>
+        <div className="flex shrink-0 flex-col items-center gap-[clamp(6px,1.5vh,12px)] text-center">
+          <h1 className="m-0 font-display text-[clamp(28px,min(6vw,7vh),56px)] leading-none font-semibold tracking-[-0.035em]">OBJ to DWG / DXF</h1>
+          <p className="m-0 max-w-[560px] text-[clamp(14px,2.2vh,16px)] text-fg-2">Drop an .obj file, with its .mtl if it has one. Several files or a .zip work too.</p>
         </div>
 
-        <div className="relative w-full">
+        <div className="relative flex min-h-[150px] w-full flex-1 [@media(max-height:420px)]:min-h-[120px]">
           <CropMarks />
           <svg className="pointer-events-none absolute inset-0 size-full" aria-hidden="true">
             <motion.rect
@@ -46,8 +46,8 @@ export function DropScreen({ onPick }: { onPick: () => void }) {
               transition={{ duration: 1.6, ease: "linear", repeat: Infinity }}
             />
           </svg>
-          <div className="flex flex-col items-center gap-5 rounded-[4px] bg-accent-soft px-6 py-16 sm:py-20">
-            <CubeArt className="size-16 text-accent" />
+          <div className="flex w-full flex-col items-center justify-center gap-[clamp(10px,2.5vh,20px)] rounded-[4px] bg-accent-soft px-6 py-4">
+            <CubeArt className="size-[clamp(40px,8vh,64px)] shrink-0 text-accent [@media(max-height:480px)]:hidden" />
             <Button variant="primary" size="lg" onClick={onPick}>
               Choose files…
             </Button>

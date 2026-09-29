@@ -63,8 +63,8 @@ export function BatchScreen({
   const done = items.filter((i) => i.status === "done");
   const running = items.some((i) => i.status === "waiting" || i.status === "converting");
   return (
-    <main className="paper flex min-h-dvh justify-center px-4 pt-24 pb-12">
-      <motion.section initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="panel flex h-fit w-full max-w-[860px] flex-col" aria-label="Files">
+    <main className="paper flex h-dvh justify-center overflow-hidden px-4 pt-[76px] pb-4">
+      <motion.section initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="panel flex h-fit max-h-full min-h-0 w-full max-w-[860px] flex-col" aria-label="Files">
         <div className="flex flex-wrap items-center gap-3 border-b border-line-soft px-5 py-4">
           <h1 className="m-0 text-[16px] font-semibold">
             {fmt(items.length)} files
@@ -94,7 +94,7 @@ export function BatchScreen({
             {zipping ? "Zipping…" : "Download all (.zip)"}
           </Button>
         </div>
-        <ul className="m-0 list-none p-2">
+        <ul className="m-0 min-h-0 flex-1 list-none overflow-y-auto p-2">
           {items.map((item) => (
             <li key={item.id} className="grid grid-cols-[minmax(0,1.4fr)_minmax(0,1.3fr)_auto] items-center gap-3 rounded-[3px] px-3 py-2 hover:bg-panel-2 sm:grid-cols-[minmax(0,1.4fr)_minmax(0,1.3fr)_90px_auto]">
               <button type="button" className="min-w-0 cursor-pointer truncate text-left text-[14px] font-medium hover:text-accent disabled:cursor-default disabled:hover:text-fg" onClick={() => onOpen(item)} disabled={item.status !== "done"}>

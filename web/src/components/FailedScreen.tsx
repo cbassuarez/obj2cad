@@ -16,8 +16,8 @@ export function FailedScreen({
 }) {
   const e = explained;
   return (
-    <main className="paper flex min-h-dvh items-center justify-center px-4 pt-20 pb-10">
-      <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="panel flex w-full max-w-[620px] flex-col gap-5 p-6" role="alert">
+    <main className="paper flex h-dvh items-center justify-center overflow-hidden px-4 pt-[76px] pb-4">
+      <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="panel flex max-h-full w-full max-w-[620px] flex-col gap-5 overflow-y-auto p-6" role="alert">
         <div className="flex gap-3 rounded-[4px] bg-danger-soft p-4 text-danger">
           <CircleAlert className="mt-0.5 size-5 shrink-0" aria-hidden="true" />
           <div className="min-w-0">

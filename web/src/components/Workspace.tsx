@@ -146,8 +146,8 @@ export function Workspace({
   };
 
   return (
-    <main className="flex flex-col bg-viewport pb-2 lg:relative lg:block lg:h-dvh lg:min-h-[700px] lg:overflow-hidden lg:pb-0">
-      <div className="relative h-[60vh] min-h-[360px] lg:absolute lg:inset-0 lg:h-auto">
+    <main className="relative flex h-dvh flex-col overflow-hidden bg-viewport lg:block">
+      <div className="relative min-h-[200px] flex-1 lg:absolute lg:inset-0">
         <div ref={host} className="absolute inset-0" />
         {!available && (
           <div className="absolute inset-0 grid place-items-center p-6">
@@ -179,23 +179,26 @@ export function Workspace({
         </div>
       </div>
 
-      {/* panels: floating on large screens, stacked below the viewer on small ones */}
-      <motion.div
-        initial={{ opacity: 0, x: -16 }}
-        animate={{ opacity: 1, x: 0 }}
-        transition={{ delay: 0.05 }}
-        className="pointer-events-none order-2 p-4 lg:absolute lg:top-[76px] lg:left-4 lg:max-h-[calc(100%-200px)] lg:w-[268px] lg:p-0"
-      >
-        <LayersCard report={report} mode={prefs.layerMode} hidden={hidden} busy={busy !== null} onMode={onLayerMode} onToggle={toggleLayer} />
-      </motion.div>
-      <motion.div
-        initial={{ opacity: 0, x: 16 }}
-        animate={{ opacity: 1, x: 0 }}
-        transition={{ delay: 0.1 }}
-        className="pointer-events-none order-1 px-4 pt-4 lg:absolute lg:top-[76px] lg:right-4 lg:flex lg:max-h-[calc(100%-92px)] lg:w-[364px] lg:p-0"
-      >
-        <ResultCard {...panel} />
-      </motion.div>
+      {/* Panels float over the viewer on large screens; on small ones they share a bottom
+          sheet that scrolls by itself, so the page never does. */}
+      <div className="flex max-h-[58%] shrink-0 flex-col gap-3 overflow-y-auto border-t border-line bg-bg p-3 lg:contents">
+        <motion.div
+          initial={{ opacity: 0, x: 16 }}
+          animate={{ opacity: 1, x: 0 }}
+          transition={{ delay: 0.1 }}
+          className="pointer-events-none lg:absolute lg:top-[76px] lg:right-4 lg:flex lg:max-h-[calc(100%-92px)] lg:w-[364px]"
+        >
+          <ResultCard {...panel} />
+        </motion.div>
+        <motion.div
+          initial={{ opacity: 0, x: -16 }}
+          animate={{ opacity: 1, x: 0 }}
+          transition={{ delay: 0.05 }}
+          className="pointer-events-none lg:absolute lg:top-[76px] lg:left-4 lg:flex lg:max-h-[calc(100%-200px)] lg:w-[268px]"
+        >
+          <LayersCard report={report} mode={prefs.layerMode} hidden={hidden} busy={busy !== null} onMode={onLayerMode} onToggle={toggleLayer} />
+        </motion.div>
+      </div>
     </main>
   );
 }

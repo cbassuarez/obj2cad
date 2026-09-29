@@ -439,7 +439,7 @@ export function App() {
   // ---------------------------------------------------------------- render
   const inBatch = current?.batchItem != null && batch.length > 0;
   return (
-    <div className="relative min-h-dvh">
+    <div className="relative h-dvh overflow-hidden">
       <TopBar
         file={screen === "work" && current ? { name: current.file.name, size: current.file.size, exporter: current.inspection.hints.exporter, mtl: current.mtl?.name ?? null } : null}
         offlineReady={offlineReady}
