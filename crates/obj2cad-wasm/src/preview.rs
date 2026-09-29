@@ -9,7 +9,8 @@ pub struct Preview {
     pub indices: Vec<u32>,
     /// True polygon edges (index pairs), not the display triangles.
     pub edges: Vec<u32>,
-    /// Per mesh entity: `[layer, index_start, index_count, edge_start, edge_count]`.
+    /// Per layer (all its mesh entities, whatever their colors): `[layer, index_start,
+    /// index_count, edge_start, edge_count]`.
     pub groups: Vec<u32>,
     /// Line segments (pairs of xyz) and their colors (rgb per vertex), grouped by layer.
     pub lines: Vec<f32>,
@@ -68,7 +69,11 @@ impl Preview {
             |c: Option<[u8; 3]>, layer: u32| c.unwrap_or(model.layers[layer as usize].color);
 
         let mut tri = Triangulator::default();
-        for m in &model.meshes {
+        // Layer by layer, so each layer is one group (one draw) however many colors or
+        // entities it has: a textured model can have hundreds.
+        let mut by_layer: Vec<usize> = (0..model.meshes.len()).collect();
+        by_layer.sort_by_key(|&i| model.meshes[i].layer);
+        for m in by_layer.into_iter().map(|i| &model.meshes[i]) {
             let base = (out.positions.len() / 3) as u32;
             let (i0, e0) = (out.indices.len() as u32, out.edges.len() as u32);
             let rgb = color(m.color, m.layer);
@@ -85,8 +90,15 @@ impl Preview {
                 }
             }
             let (i1, e1) = (out.indices.len() as u32, out.edges.len() as u32);
-            out.groups
-                .extend_from_slice(&[m.layer, i0, i1 - i0, e0, e1 - e0]);
+            let n = out.groups.len();
+            if n >= 5 && out.groups[n - 5] == m.layer {
+                // The same layer as the group before: its ranges continue it.
+                out.groups[n - 3] += i1 - i0;
+                out.groups[n - 1] += e1 - e0;
+            } else {
+                out.groups
+                    .extend_from_slice(&[m.layer, i0, i1 - i0, e0, e1 - e0]);
+            }
         }
 
         // Lines and points, grouped by layer so the viewer can hide layers.
@@ -426,6 +438,18 @@ mod tests {
         assert_eq!(p.line_groups, vec![1, 0, 4, 2, 4, 2]);
         assert_eq!(p.point_groups, vec![1, 0, 1, 2, 1, 2]);
         assert_eq!(p.line_colors.len(), p.lines.len());
+    }
+
+    #[test]
+    fn each_layer_is_one_group_whatever_its_colors() {
+        // Layer a: a red face and, after a face on layer b, a blue one.
+        let p = preview(
+            "v 0 0 0 1 0 0\nv 1 0 0 1 0 0\nv 1 1 0 1 0 0\nv 0 0 1 0 0 1\nv 1 0 1 0 0 1\nv 1 1 1 0 0 1\n\
+             o a\nf 1 2 3\no b\nf 1 2 3\no a\nf 4 5 6\n",
+        );
+        let layers: Vec<u32> = p.groups.chunks(5).map(|g| g[0]).collect();
+        assert_eq!(layers, vec![1, 2]);
+        assert_eq!(p.groups[2], 6, "both of layer a's triangles in its group");
     }
 
     #[test]

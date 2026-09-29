@@ -11,9 +11,10 @@ import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { FailedScreen } from "@/components/FailedScreen";
 import { LoadingScreen, PreflightScreen } from "@/components/LoadingScreen";
 import { TopBar } from "@/components/TopBar";
+import { WorkspaceSkeleton } from "@/components/WorkspaceSkeleton";
 import { Button } from "@/components/ui/button";
 import type { PreviewState } from "@/components/Workspace";
-import { engine, EngineError, isEmpty, sha256Hex, type Failure, type Inspection, type Progress, type Result } from "@/lib/engine";
+import { engine, EngineError, isEmpty, RESTARTED, sha256Hex, type Failure, type Inspection, type Progress, type Result } from "@/lib/engine";
 import { CLI_URL, explain, type Explained } from "@/lib/errors";
 import { baseName, jobName, plan, saveFile, stem, zipFiles, type Job, type Source } from "@/lib/files";
 import {
@@ -60,6 +61,19 @@ interface OpenOptions {
 /** Above this, suggest the command-line version first. */
 const BIG = 1_000_000_000;
 
+/** The busy label for a step of a conversion shown in the workspace (the file is being
+ *  written while its model is shown, or a setting changed). */
+const busyLabel = (stage: Progress["stage"], format: Format): string =>
+  ({
+    engine: "Loading the DWG writer…",
+    read: "Reading the files…",
+    parse: "Reading the model…",
+    curves: "Finding curved surfaces…",
+    preview: "Updating the view…",
+    hash: "Fingerprinting the geometry…",
+    write: `Writing the ${format === "dwg" ? "DWG" : "DXF"}…`,
+  })[stage];
+
 // The 3D workspace (three.js) loads on demand, so the first screen is small and fast;
 // it is prefetched as soon as the browser is idle.
 const loadWorkspace = () => import("@/components/Workspace");
@@ -79,7 +93,7 @@ export function App() {
   const [visible, setVisible] = useState<Result | null>(null);
   const [preview, setPreview] = useState<PreviewState | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
-  const [loading, setLoading] = useState<{ name: string; progress: Progress | null }>({ name: "", progress: null });
+  const [loading, setLoading] = useState<{ name: string; progress: Progress | null; startedAt: number }>({ name: "", progress: null, startedAt: 0 });
   const [failed, setFailed] = useState<{ name: string; explained: Explained; retry?: () => void } | null>(null);
   const [preflight, setPreflight] = useState<{ name: string; size: number; go: () => void } | null>(null);
   const [choice, setChoice] = useState<{ combined: Job; separate: Job[] } | null>(null);
@@ -203,7 +217,28 @@ export function App() {
     setBusy(label);
     setDownloaded(null);
     try {
-      const r = await engine.convert(cur.job, settings, wantPreview, () => setBusy(settings.format === "dwg" ? "Preparing DWG…" : label));
+      const r = await engine.convert(
+        cur.job,
+        settings,
+        wantPreview,
+        (p) => {
+          // Opening: the loading screen names each step. Afterwards: the busy label does.
+          if (screenRef.current === "loading") setLoading((l) => ({ ...l, progress: p }));
+          else setBusy(busyLabel(p.stage, settings.format));
+        },
+        // The model is shown as soon as it can be, while its file is still being written:
+        // the result is provisional (Download waits, busy) until the file arrives.
+        (e) => {
+          if (token !== convertToken.current || isEmpty(e.report)) return;
+          const provisional: Result = { file: new Blob([]), report: e.report, decisions: e.decisions, preview: null, timings: {}, ms: 0 };
+          resultRef.current = provisional;
+          setResult(provisional);
+          shownPreview.current = { key, fileId: cur.id };
+          setPreview({ buffers: e.preview, builtUp: e.decisions.up_axis, id: ++seq.current, fileId: cur.id });
+          setBusy(busyLabel("hash", settings.format));
+          if (screenRef.current === "loading") setScreen("work", "push");
+        },
+      );
       if (token !== convertToken.current) return false;
       if (isEmpty(r.report)) {
         setFailed({ name: cur.inspection.name, explained: explain({ kind: "empty" }) });
@@ -267,13 +302,13 @@ export function App() {
       }
       const token = ++openToken.current;
       const previous = screenRef.current === "work" ? currentRef.current?.inspection.name : undefined;
-      setLoading({ name, progress: null });
+      setLoading({ name, progress: null, startedAt: performance.now() });
       if (!opts.reload) {
         setScreen("loading");
         setHidden([]); // another drawing: every layer in again
       } else setBusy("Reloading…");
       try {
-        const info = await engine.open(job, prefsRef.current.format === "dwg", (p) => setLoading({ name, progress: p }));
+        const info = await engine.open(job, prefsRef.current.format === "dwg", (p) => setLoading((l) => ({ ...l, progress: p })));
         if (token !== openToken.current) return;
         const cur: Current = { id: ++seq.current, job, handle, inspection: info, choices: opts.choices ?? AUTO, batchItem: opts.batchItem ?? null };
         setCur(cur);
@@ -290,19 +325,36 @@ export function App() {
     [convert, setScreen],
   );
 
+  /** Stop opening a file: the engine is stopped mid-step and restarted, and the app goes
+   *  back to where it was (a drawing that was open is opened again when next needed). */
+  const cancelOpen = () => {
+    ++openToken.current;
+    ++convertToken.current;
+    engine.restart(); // a file-list conversion it interrupts is retried (runBatch)
+    setBusy(null);
+    shownPreview.current = null;
+    setScreen(currentRef.current && resultRef.current ? "work" : batchRef.current.length ? "batch" : "empty", "replace");
+  };
+
   // ---------------------------------------------------------------- batch
   const runBatch = useCallback(async (items: BatchItem[]) => {
     const token = ++batchToken.current;
     for (const item of items) {
       if (token !== batchToken.current) return;
       updateBatch(item.id, { status: "converting", result: undefined, error: undefined });
-      try {
-        await engine.open(item.job, prefsRef.current.format === "dwg");
-        const r = await engine.convert(item.job, engineSettings(prefsRef.current, AUTO), false);
-        if (isEmpty(r.report)) updateBatch(item.id, { status: "failed", error: explain({ kind: "empty" }) });
-        else updateBatch(item.id, { status: "done", result: r });
-      } catch (e) {
-        updateBatch(item.id, { status: "failed", error: explain(failureOf(e)) });
+      for (let attempt = 0; ; attempt++) {
+        try {
+          await engine.open(item.job, prefsRef.current.format === "dwg");
+          const r = await engine.convert(item.job, engineSettings(prefsRef.current, AUTO), false);
+          if (isEmpty(r.report)) updateBatch(item.id, { status: "failed", error: explain({ kind: "empty" }) });
+          else updateBatch(item.id, { status: "done", result: r });
+        } catch (e) {
+          // Stopped because another file's opening was cancelled (or crashed): not this file's fault.
+          const interrupted = e instanceof EngineError && e.failure.kind === "crash" && e.failure.message === RESTARTED;
+          if (interrupted && attempt === 0 && token === batchToken.current) continue;
+          updateBatch(item.id, { status: "failed", error: explain(failureOf(e)) });
+        }
+        break;
       }
     }
   }, []);
@@ -426,7 +478,7 @@ export function App() {
   /** The report of exactly what Download saves. */
   const downloadReport = async () => {
     const d = downloadable();
-    if (!d) return;
+    if (!d || busy) return; // while busy the report may be provisional
     const { r } = d;
     const report = { ...r.report, output: { ...r.report.output, sha256: await sha256Hex(r.file) } };
     const saved = await saveFile(new Blob([JSON.stringify(report, null, 2)], { type: "application/json" }), `${d.name}.report.json`).catch(() => null);
@@ -475,8 +527,24 @@ export function App() {
   // ---------------------------------------------------------------- global keys
   useEffect(() => {
     const idle = window.requestIdleCallback ?? ((cb: () => void) => setTimeout(cb, 1500));
-    idle(() => void loadWorkspace());
+    idle(() => {
+      void loadWorkspace();
+      if (prefsRef.current.format === "dwg") engine.warm(true);
+    });
   }, []);
+
+  // The tab says what's happening, for anyone who switched away while a big file opens.
+  const title = useRef(document.title);
+  useEffect(() => {
+    const p = loading.progress;
+    const pct = p && p.total > 0 && (p.stage === "read" || p.stage === "parse") ? ` ${Math.round((p.done / p.total) * 100)}%` : "";
+    document.title =
+      screen === "loading"
+        ? `Opening${pct} · ${loading.name}`
+        : screen === "work" && busy && current
+          ? `${busy.replace(/…$/, "")} · ${current.inspection.name}`
+          : title.current;
+  }, [screen, loading, busy, current]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -525,7 +593,16 @@ export function App() {
           onCancel={() => setScreen(currentRef.current && resultRef.current ? "work" : "empty")}
         />
       )}
-      {screen === "loading" && <LoadingScreen name={loading.name} progress={loading.progress} />}
+      {screen === "loading" && (
+        <LoadingScreen
+          name={loading.name}
+          progress={loading.progress}
+          startedAt={loading.startedAt}
+          format={prefs.format === "dwg" ? "DWG" : "DXF"}
+          curves={prefs.curves}
+          onCancel={cancelOpen}
+        />
+      )}
       {screen === "failed" && failed && <FailedScreen name={failed.name} explained={failed.explained} onPick={() => void pick()} onRetry={failed.retry} />}
       {screen === "choose" && choice && (
         <ChoiceScreen separate={choice.separate} onCombine={() => void openJob(choice.combined, null)} onSeparate={() => startBatch(choice.separate)} />
@@ -546,7 +623,7 @@ export function App() {
       )}
       {screen === "work" && result && (
         <ErrorBoundary>
-          <Suspense fallback={<main className="h-dvh bg-viewport" />}>
+          <Suspense fallback={<WorkspaceSkeleton />}>
             <Workspace
               result={result}
               visible={visible}

@@ -369,7 +369,7 @@ export function ResultCard(p: ResultProps) {
               </UnitsMenu>
             </span>
           </div>
-          <Line label="Format" aside={<span className="num text-[12px] text-fg-3">{bytes(report.output.bytes)}</span>}>
+          <Line label="Format" aside={<span className="num text-[12px] text-fg-3">{p.busy !== null ? "…" : bytes(report.output.bytes)}</span>}>
             <ValueMenu label="Format" value={p.format} options={FORMATS} onPick={p.onFormat} disabled={p.busy !== null}>
               <Menu.Divider />
               <Menu.Item onClick={() => p.onCurves(!p.curves)} rightSection={p.curves ? <Check className="size-3.5" /> : null}>
