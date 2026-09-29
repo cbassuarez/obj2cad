@@ -372,8 +372,7 @@ impl Session {
             match h.units_source {
                 UnitsSource::Exporter => "file",
                 _ if s.default_units.is_some() => "default",
-                UnitsSource::Size => "size",
-                UnitsSource::None => "none",
+                UnitsSource::Assumed => "assumed",
             }
         };
         let decisions = serde_json::json!({

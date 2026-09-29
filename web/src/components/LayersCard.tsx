@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Check, ChevronDown, PencilLine, Search } from "lucide-react";
+import { Check, ChevronDown, ChevronRight, PencilLine, Search } from "lucide-react";
 import { Menu } from "@mantine/core";
 import { Button } from "@/components/ui/button";
 import { Tip } from "@/components/ui/tooltip";
@@ -13,6 +13,8 @@ const VIRTUAL = 300;
 const ROW = 32;
 /** A filter box appears above this many layers. */
 const FILTER = 12;
+/** The file heading for layers that hold geometry of several files (shared materials). */
+const SEVERAL = "Several files";
 
 const NOUN: Record<LayerMode, string> = { objects: "object", groups: "group", materials: "material", single: "" };
 
@@ -63,7 +65,6 @@ export function LayersCard({
   const onlyFaces = report.output.polylines + report.output.points + (report.curves?.length ?? 0) === 0;
   const list = useRef<HTMLUListElement>(null);
   const [scroll, setScroll] = useState({ top: 0, height: 400 });
-  const virtual = shownRows.length > VIRTUAL;
 
   const counts: Record<LayerMode, number | null> = {
     objects: inspection?.objects ?? null,
@@ -110,9 +111,13 @@ export function LayersCard({
   useEffect(() => {
     const el = list.current;
     if (selected === null || !el) return;
-    const at = shownRows.findIndex((l) => l.i === selected);
+    if (grouped) {
+      const row = rows.find((l) => l.i === selected);
+      if (row && collapsed.has(row.file ?? SEVERAL)) setCollapsed((c) => new Set([...c].filter((f) => f !== (row.file ?? SEVERAL))));
+    }
+    const at = items.findIndex((it) => it.kind === "layer" && it.row.i === selected);
     if (at < 0) return;
-    if (virtual) {
+    if (itemVirtual) {
       if (at * ROW < el.scrollTop || (at + 1) * ROW > el.scrollTop + el.clientHeight) el.scrollTop = at * ROW - el.clientHeight / 2;
     } else el.querySelector(`[data-layer="${selected}"]`)?.scrollIntoView({ block: "nearest" });
     // Only when the pick changes.
@@ -129,8 +134,22 @@ export function LayersCard({
     }
   };
 
-  const first = virtual ? Math.max(0, Math.floor(scroll.top / ROW) - 10) : 0;
-  const last = virtual ? Math.min(shownRows.length, Math.ceil((scroll.top + scroll.height) / ROW) + 10) : shownRows.length;
+  // A bundle of several files: layers listed under the file they came from.
+  const files = [...new Set(rows.map((l) => l.file ?? SEVERAL))];
+  const grouped = files.length > 1;
+  const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+  type Item = { kind: "file"; file: string; layers: number[] } | { kind: "layer"; row: (typeof rows)[number] };
+  const items: Item[] = !grouped
+    ? shownRows.map((row) => ({ kind: "layer", row }))
+    : files.flatMap((file) => {
+        const mine = shownRows.filter((l) => (l.file ?? SEVERAL) === file);
+        if (!mine.length) return [];
+        const all = rows.filter((l) => (l.file ?? SEVERAL) === file).map((l) => l.i);
+        return [{ kind: "file" as const, file, layers: all }, ...(collapsed.has(file) && !q ? [] : mine.map((row) => ({ kind: "layer" as const, row })))];
+      });
+  const itemVirtual = items.length > VIRTUAL;
+  const first = itemVirtual ? Math.max(0, Math.floor(scroll.top / ROW) - 10) : 0;
+  const last = itemVirtual ? Math.min(items.length, Math.ceil((scroll.top + scroll.height) / ROW) + 10) : items.length;
 
   return (
     <section className="panel pointer-events-auto flex max-h-full min-h-0 w-full flex-col overflow-hidden" aria-label="Layers">
@@ -199,13 +218,46 @@ export function LayersCard({
       <ul
         ref={list}
         className="m-0 min-h-0 flex-1 list-none overflow-y-auto px-2 pb-2"
-        onScroll={(e) => virtual && setScroll({ top: e.currentTarget.scrollTop, height: e.currentTarget.clientHeight })}
+        onScroll={(e) => itemVirtual && setScroll({ top: e.currentTarget.scrollTop, height: e.currentTarget.clientHeight })}
         onMouseLeave={() => onHover(null)}
         onKeyDown={onKeyDown}
         aria-label="Layers in the drawing"
       >
-        {virtual && <li aria-hidden="true" style={{ height: first * ROW }} />}
-        {shownRows.slice(first, last).map((l) => {
+        {itemVirtual && <li aria-hidden="true" style={{ height: first * ROW }} />}
+        {items.slice(first, last).map((item) => {
+          if (item.kind === "file") {
+            const on = item.layers.filter((i) => !hidden.has(i)).length;
+            const open = !collapsed.has(item.file) || !!q;
+            return (
+              <li key={`file:${item.file}`} className="flex h-8 items-center gap-2 rounded-[3px] pr-2 pl-0.5 hover:bg-panel-2" onMouseEnter={() => onHover(null)}>
+                <button
+                  type="button"
+                  className="grid size-5 shrink-0 cursor-pointer place-items-center text-fg-3 hover:text-fg"
+                  onClick={() => setCollapsed((c) => (c.has(item.file) ? new Set([...c].filter((f) => f !== item.file)) : new Set([...c, item.file])))}
+                  aria-expanded={open}
+                  aria-label={`${open ? "Collapse" : "Expand"} ${item.file}`}
+                >
+                  <ChevronRight className={cn("size-3.5 transition-transform", open && "rotate-90")} />
+                </button>
+                <input
+                  type="checkbox"
+                  className="size-3.5 shrink-0 cursor-pointer accent-[var(--accent)]"
+                  checked={on === item.layers.length}
+                  ref={(el) => {
+                    if (el) el.indeterminate = on > 0 && on < item.layers.length;
+                  }}
+                  onChange={() => set(item.layers, on < item.layers.length)}
+                  aria-label={`${item.file} in the drawing`}
+                  title={item.file === SEVERAL ? "Layers holding geometry of several files" : "Every layer of this file"}
+                />
+                <span className="min-w-0 flex-1 truncate text-[13px] font-medium" title={item.file}>
+                  {item.file}
+                </span>
+                <span className="shrink-0 text-[11.5px] text-fg-3">{plural(item.layers.length, "layer")}</span>
+              </li>
+            );
+          }
+          const l = item.row;
           const off = hidden.has(l.i);
           const renamed = l.source !== "" && l.source !== l.name;
           const loose = l.source === "" && mode !== "single" && l.name !== "0";
@@ -213,7 +265,7 @@ export function LayersCard({
             <li
               key={`${l.i}-${l.name}`}
               data-layer={l.i}
-              className={cn("flex h-8 items-center gap-2.5 rounded-[3px] px-2 hover:bg-panel-2", selected === l.i && "bg-accent-soft hover:bg-accent-soft")}
+              className={cn("flex h-8 items-center gap-2.5 rounded-[3px] px-2 hover:bg-panel-2", grouped && "pl-8", selected === l.i && "bg-accent-soft hover:bg-accent-soft")}
               onMouseEnter={() => onHover(l.i)}
             >
               {!single && (
@@ -258,7 +310,7 @@ export function LayersCard({
             </li>
           );
         })}
-        {virtual && <li aria-hidden="true" style={{ height: (shownRows.length - last) * ROW }} />}
+        {itemVirtual && <li aria-hidden="true" style={{ height: (items.length - last) * ROW }} />}
         {q && shownRows.length === 0 && <li className="px-2 py-3 text-[12.5px] text-fg-3">No layer matches “{query}”</li>}
       </ul>
 

@@ -141,6 +141,9 @@ pub struct Layer {
     pub source: String,
     /// Display color, also written to the DXF layer table.
     pub color: [u8; 3],
+    /// The file of a bundle all of this layer's geometry came from; `None` for a single
+    /// file, or when the layer holds geometry of several files.
+    pub file: Option<String>,
 }
 
 /// Distinct, calm layer colors (readable on AutoCAD's dark and light backgrounds).
@@ -405,6 +408,7 @@ impl LayerTable {
                 name: "0".into(),
                 source: String::new(),
                 color: layer_color(0),
+                file: None,
             }],
             by_source: HashMap::new(),
             taken: HashSet::from(["0".to_owned()]),
@@ -435,6 +439,7 @@ impl LayerTable {
             name,
             source: source.to_owned(),
             color: layer_color(id),
+            file: None,
         });
         self.by_source.insert(source.to_owned(), id);
         id
@@ -455,6 +460,7 @@ impl LayerTable {
             name,
             source: String::new(),
             color: layer_color(id),
+            file: None,
         });
         self.default = Some(id);
         id
@@ -582,6 +588,22 @@ pub fn convert_with<'a>(
             }
         })
         .collect();
+    // Which file each layer's geometry came from (bundles of several files).
+    if !doc.attr_file.is_empty() {
+        let mut seen: Vec<Option<Option<u32>>> = vec![None; table.layers.len()];
+        for (a, &l) in layer_of_attr.iter().enumerate() {
+            let f = doc.attr_file[a];
+            let s = &mut seen[l as usize];
+            *s = match *s {
+                None => Some(Some(f)),
+                Some(Some(g)) if g == f => Some(Some(f)),
+                _ => Some(None),
+            };
+        }
+        for (layer, s) in table.layers.iter_mut().zip(seen) {
+            layer.file = s.flatten().map(|f| doc.files[f as usize].clone());
+        }
+    }
     if table
         .layers
         .iter()

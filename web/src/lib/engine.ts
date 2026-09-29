@@ -37,7 +37,7 @@ export interface Inspection {
   hints: {
     exporter: string | null;
     units: Units;
-    units_source: "exporter" | "size" | "none";
+    units_source: "exporter" | "assumed";
     up_axis: UpAxis;
     up_axis_confident: boolean;
   };
@@ -46,7 +46,7 @@ export interface Inspection {
 /** Units and up direction as resolved, and where each came from. */
 export interface Decisions {
   units: Units;
-  units_from: "chosen" | "file" | "default" | "size" | "none";
+  units_from: "chosen" | "file" | "default" | "assumed";
   up_axis: UpAxis;
   up_from: "chosen" | "detected";
   detected_units: Units;
@@ -90,7 +90,7 @@ export interface Report {
     excluded_lines: number;
     excluded_points: number;
   };
-  layers: { name: string; source: string; color: string; entity_colors: string[]; more_colors: boolean; faces: number; polylines: number; points: number; surfaces: number }[];
+  layers: { name: string; source: string; color: string; entity_colors: string[]; more_colors: boolean; faces: number; polylines: number; points: number; surfaces: number; file?: string }[];
   diagnostics: { severity: "info" | "warning"; code: string; line: number; count: number; message: string }[];
 }
 

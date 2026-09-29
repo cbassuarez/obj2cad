@@ -90,6 +90,9 @@ export function App() {
 
   const input = useRef<HTMLInputElement>(null);
   const mtlInput = useRef<HTMLInputElement>(null);
+  const folderInput = useRef<HTMLInputElement>(null);
+  /** Choose a folder: every file in it (and its subfolders) makes one drawing. */
+  const pickFolder = () => folderInput.current?.click();
   const screenRef = useRef<Screen>("empty");
   const prefsRef = useRef(prefs);
   const currentRef = useRef<Current | null>(null);
@@ -505,13 +508,14 @@ export function App() {
         }
         offlineReady={offlineReady}
         onOpen={() => void pick()}
+        onOpenFolder={pickFolder}
         onBack={screen === "work" && inBatch ? () => window.history.back() : undefined}
         backLabel="All files"
         watch={screen === "work" && current?.handle ? watching : null}
         onWatch={setWatching}
       />
 
-      {screen === "empty" && <DropScreen onPick={() => void pick()} />}
+      {screen === "empty" && <DropScreen onPick={() => void pick()} onPickFolder={pickFolder} />}
       {screen === "preflight" && preflight && (
         <PreflightScreen
           name={preflight.name}
@@ -555,6 +559,7 @@ export function App() {
               onUp={(up: UpAxis | null) => change({ up })}
               onUnits={(units: Units | null) => change({ units })}
               onHouseUnits={(houseUnits: Units | null) => changePrefs({ houseUnits })}
+              onShowIn={(showIn: Units | null) => setPrefs({ showIn })} // display only: nothing to convert
               onKeepLoose={(keepLoose) => change({ keepLoose })}
               onLayerMode={(layerMode: LayerMode) => {
                 setHidden([]); // other layers: nothing is left out any more
@@ -585,7 +590,7 @@ export function App() {
             <div className="panel flex flex-col items-center gap-4 border-2 border-dashed !border-accent px-12 py-12 text-center">
               <CubeArt className="size-16 text-accent" />
               <div className="font-display text-[32px] font-semibold tracking-tight">Drop to open</div>
-              <div className="text-[14px] text-fg-3">.obj, .xyz, .mtl, images or .zip</div>
+              <div className="text-[14px] text-fg-3">.obj, .xyz, .mtl, images, a .zip or a folder</div>
             </div>
           </motion.div>
         </AnimatePresence>
@@ -600,6 +605,20 @@ export function App() {
           const f = e.target.files?.[0];
           e.target.value = "";
           if (f) void addSources([{ file: f, path: f.name }]);
+        }}
+      />
+      <input
+        ref={folderInput}
+        type="file"
+        // Folder picking: files arrive with their paths inside the folder (webkitRelativePath).
+        {...{ webkitdirectory: "", directory: "" }}
+        multiple
+        hidden
+        aria-label="Choose a folder"
+        onChange={(e) => {
+          const files = Array.from(e.target.files ?? []);
+          e.target.value = "";
+          if (files.length) void openFiles(files);
         }}
       />
       <input

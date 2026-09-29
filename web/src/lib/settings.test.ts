@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { AUTO, DEFAULT_PREFS, engineSettings, geometryKey, loadPrefs, previewKey, savePrefs } from "@/lib/settings";
+import { AUTO, DEFAULT_PREFS, displayUnit, engineSettings, geometryKey, loadPrefs, previewKey, savePrefs } from "@/lib/settings";
 
 const store = (value: string | null) => ({ getItem: () => value });
 
@@ -12,7 +12,9 @@ describe("preferences", () => {
 
   it("keep valid values and drop unknown ones", () => {
     const p = loadPrefs(store(JSON.stringify({ format: "dwg", layerMode: "nope", houseUnits: "meters", includeName: false, curves: "yes" })));
-    expect(p).toEqual({ format: "dwg", layerMode: "objects", houseUnits: "meters", includeName: false, curves: false });
+    expect(p).toEqual({ format: "dwg", layerMode: "objects", houseUnits: "meters", includeName: false, curves: false, showIn: null });
+    expect(loadPrefs(store(JSON.stringify({ showIn: "feet" }))).showIn).toBe("feet");
+    expect(loadPrefs(store(JSON.stringify({ showIn: "cubits" }))).showIn).toBeNull();
     expect(loadPrefs(store(JSON.stringify({ curves: true }))).curves).toBe(true);
     expect(loadPrefs(store(JSON.stringify({ houseUnits: "unitless" }))).houseUnits).toBeNull();
     expect(loadPrefs(store(JSON.stringify({ houseUnits: "parsecs" }))).houseUnits).toBeNull();
@@ -48,5 +50,15 @@ describe("engine settings", () => {
     expect(geometryKey(units)).toBe(geometryKey(base));
     expect(geometryKey(layers)).toBe(geometryKey(base));
     expect(geometryKey(curves)).toBe(geometryKey(base));
+  });
+});
+
+describe("display unit", () => {
+  it("converts for display only, and only between real units", () => {
+    expect(displayUnit("meters", "millimeters")).toEqual({ unit: "millimeters", factor: 1000 });
+    expect(displayUnit("inches", "feet").factor).toBeCloseTo(1 / 12, 12);
+    expect(displayUnit("meters", null)).toEqual({ unit: "meters", factor: 1 });
+    // A file without a unit has nothing to convert from.
+    expect(displayUnit("unitless", "millimeters")).toEqual({ unit: "unitless", factor: 1 });
   });
 });

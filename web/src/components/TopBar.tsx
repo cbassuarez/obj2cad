@@ -1,4 +1,4 @@
-import { ArrowLeft, Check, ChevronDown, FolderOpen, Lock, RefreshCw } from "lucide-react";
+import { ArrowLeft, Check, ChevronDown, FolderOpen, FolderTree, Lock, RefreshCw } from "lucide-react";
 import { Menu } from "@mantine/core";
 import { Button } from "@/components/ui/button";
 import { Tip } from "@/components/ui/tooltip";
@@ -20,6 +20,7 @@ export function TopBar({
   file,
   offlineReady,
   onOpen,
+  onOpenFolder,
   onBack,
   backLabel,
   watch,
@@ -28,6 +29,8 @@ export function TopBar({
   file: FileInfo | null;
   offlineReady: boolean;
   onOpen: () => void;
+  /** Choose a folder (one drawing of everything in it). */
+  onOpenFolder: () => void;
   /** Back to the file list (batch). */
   onBack?: () => void;
   backLabel?: string;
@@ -63,6 +66,9 @@ export function TopBar({
           <Menu.Dropdown>
             <Menu.Item leftSection={<FolderOpen className="size-4" />} onClick={onOpen}>
               Open another file…
+            </Menu.Item>
+            <Menu.Item leftSection={<FolderTree className="size-4" />} onClick={onOpenFolder}>
+              Open a folder…
             </Menu.Item>
             {watch !== null && (
               <Menu.Item leftSection={<RefreshCw className="size-4" />} rightSection={watch ? <Check className="size-3.5" /> : null} onClick={() => onWatch(!watch)}>

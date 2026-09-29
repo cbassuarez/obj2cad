@@ -7,7 +7,7 @@ import { ResultCard } from "@/components/ResultCard";
 import { ViewTools, type ResultProps } from "@/components/controls";
 import type { Inspection, PreviewBuffers, Result } from "@/lib/engine";
 import type { Format, LayerMode, Prefs, UpAxis, Units } from "@/lib/settings";
-import { unitSymbol } from "@/lib/settings";
+import { displayUnit, unitSymbol } from "@/lib/settings";
 
 function cssVar(name: string) {
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
@@ -34,6 +34,7 @@ export function Workspace({
   onUp,
   onUnits,
   onHouseUnits,
+  onShowIn,
   onKeepLoose,
   onLayerMode,
   onFormat,
@@ -58,6 +59,8 @@ export function Workspace({
   onUp: (u: UpAxis | null) => void;
   onUnits: (u: Units | null) => void;
   onHouseUnits: (u: Units | null) => void;
+  /** The unit lengths are shown in (display only). */
+  onShowIn: (u: Units | null) => void;
   onKeepLoose: (keep: boolean) => void;
   onLayerMode: (m: LayerMode) => void;
   onFormat: (f: Format) => void;
@@ -112,7 +115,8 @@ export function Workspace({
 
   // A new orientation turns the existing preview.
   useEffect(() => viewer.current?.setOrientation(decisions.up_axis), [decisions.up_axis, preview]);
-  useEffect(() => viewer.current?.setUnit(unitSymbol(decisions.units)), [decisions.units]);
+  const shownUnit = displayUnit(decisions.units, prefs.showIn);
+  useEffect(() => viewer.current?.setUnit(unitSymbol(shownUnit.unit), shownUnit.factor), [shownUnit.unit, shownUnit.factor]);
   useEffect(() => viewer.current?.setEdges(edges), [edges]);
   // Layers left out of the drawing are hidden in the viewer (after each rebuild too).
   useEffect(() => viewer.current?.setHidden(hidden), [hidden, preview]);
@@ -160,6 +164,7 @@ export function Workspace({
     downloaded,
     unitsStated: inspection?.hints.units_source === "exporter",
     houseUnits: prefs.houseUnits,
+    showIn: prefs.showIn,
     includeName: prefs.includeName,
     curves: prefs.curves,
     edges,
@@ -169,6 +174,7 @@ export function Workspace({
     onUp,
     onUnits,
     onHouseUnits,
+    onShowIn,
     onKeepLoose,
     onFormat,
     onIncludeName,
@@ -209,7 +215,7 @@ export function Workspace({
         </AnimatePresence>
 
         <div className="pointer-events-none absolute bottom-4 left-4 hidden sm:block">
-          <AxisGizmo axes={axes} unit={unitSymbol(decisions.units)} />
+          <AxisGizmo axes={axes} unit={unitSymbol(shownUnit.unit)} />
         </div>
 
         <div className="absolute right-4 bottom-4 lg:top-[76px] lg:right-[396px] lg:bottom-auto">

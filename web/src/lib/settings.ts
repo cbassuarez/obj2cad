@@ -7,13 +7,13 @@ export type UpAxis = "as_is" | "y_up_to_z_up";
 export type LayerMode = "objects" | "groups" | "materials" | "single";
 export type Format = "dxf" | "dxf-binary" | "dwg";
 
-export const UNITS: { value: Units; symbol: string; name: string }[] = [
-  { value: "millimeters", symbol: "mm", name: "Millimeters" },
-  { value: "centimeters", symbol: "cm", name: "Centimeters" },
-  { value: "meters", symbol: "m", name: "Meters" },
-  { value: "inches", symbol: "in", name: "Inches" },
-  { value: "feet", symbol: "ft", name: "Feet" },
-  { value: "unitless", symbol: "", name: "None" },
+export const UNITS: { value: Units; symbol: string; name: string; meters: number | null }[] = [
+  { value: "millimeters", symbol: "mm", name: "Millimeters", meters: 0.001 },
+  { value: "centimeters", symbol: "cm", name: "Centimeters", meters: 0.01 },
+  { value: "meters", symbol: "m", name: "Meters", meters: 1 },
+  { value: "inches", symbol: "in", name: "Inches", meters: 0.0254 },
+  { value: "feet", symbol: "ft", name: "Feet", meters: 0.3048 },
+  { value: "unitless", symbol: "", name: "None", meters: null },
 ];
 
 export const UPS: { value: UpAxis; label: string }[] = [
@@ -35,6 +35,14 @@ export const FORMATS: { value: Format; label: string; ext: string; mime: string;
 ];
 
 export const unitSymbol = (u: Units) => UNITS.find((x) => x.value === u)?.symbol ?? "";
+
+/** What lengths are shown in: `show` when set and the file has a unit, else the file's
+ *  unit. Display only: the drawing always keeps its own unit and coordinates. */
+export function displayUnit(file: Units, show: Units | null): { unit: Units; factor: number } {
+  const from = UNITS.find((x) => x.value === file)?.meters ?? null;
+  const to = show ? (UNITS.find((x) => x.value === show)?.meters ?? null) : null;
+  return from !== null && to !== null && show ? { unit: show, factor: from / to } : { unit: file, factor: 1 };
+}
 export const unitName = (u: Units) => UNITS.find((x) => x.value === u)?.name ?? u;
 export const formatInfo = (f: Format) => FORMATS.find((x) => x.value === f)!;
 
@@ -48,9 +56,11 @@ export interface Prefs {
   includeName: boolean;
   /** Also write curved surfaces recognized in the mesh. */
   curves: boolean;
+  /** The unit sizes and dimensions are shown in; `null` shows the file's own unit. */
+  showIn: Units | null;
 }
 
-export const DEFAULT_PREFS: Prefs = { format: "dxf", layerMode: "objects", houseUnits: null, includeName: true, curves: false };
+export const DEFAULT_PREFS: Prefs = { format: "dxf", layerMode: "objects", houseUnits: null, includeName: true, curves: false, showIn: null };
 const PREFS_KEY = "obj2cad.prefs.v1";
 
 const oneOf = <T extends string>(values: readonly { value: T }[], v: unknown, fallback: T): T =>
@@ -66,6 +76,7 @@ export function loadPrefs(storage: Pick<Storage, "getItem"> | null = safeStorage
       houseUnits: raw.houseUnits == null ? null : oneOf(UNITS, raw.houseUnits, "unitless") === "unitless" ? null : (raw.houseUnits as Units),
       includeName: typeof raw.includeName === "boolean" ? raw.includeName : DEFAULT_PREFS.includeName,
       curves: typeof raw.curves === "boolean" ? raw.curves : DEFAULT_PREFS.curves,
+      showIn: raw.showIn == null || raw.showIn === "unitless" ? null : oneOf(UNITS, raw.showIn, "unitless") === "unitless" ? null : (raw.showIn as Units),
     };
   } catch {
     return DEFAULT_PREFS;

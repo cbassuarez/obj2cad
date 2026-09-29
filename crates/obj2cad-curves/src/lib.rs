@@ -176,6 +176,7 @@ pub fn add_to(model: &mut CadModel) -> usize {
         name,
         source: String::new(),
         color: layer_color(layer),
+        file: None,
     });
     let count = found.len();
     for f in found {

@@ -191,7 +191,7 @@ test("Back returns to the start, and the Open button stays available", async ({ 
   await expect(downloadButton(page)).toBeEnabled();
 });
 
-test("changing units relabels the drawing without moving geometry", async ({ page }) => {
+test("changing the file's unit relabels the drawing without moving geometry", async ({ page }) => {
   await open(page, [path.join(fixtures, "edge", "names_layers.obj")]);
   await expect(downloadButton(page)).toBeEnabled();
   const hash = async () => {
@@ -203,11 +203,60 @@ test("changing units relabels the drawing without moving geometry", async ({ pag
     return h;
   };
   const before = await hash();
-  await card(page).getByRole("button", { name: /^(Millimeters|Meters|None)/ }).click();
+  await expect(card(page).getByText("File in meters · assumed")).toBeVisible();
+  await card(page).getByRole("button", { name: "Change the file's unit" }).click();
   await page.getByRole("menuitem", { name: "Feet" }).click();
   await expect(card(page).getByText(/ ft$/)).toBeVisible();
   await expect(downloadButton(page)).toBeEnabled();
   expect(await hash()).toBe(before);
+  const got = await download(page);
+  expect(got.bytes.equals(cliOutput(path.join(fixtures, "edge", "names_layers.obj"), "dxf", ["--units", "ft"])), "web and CLI outputs differ").toBe(true);
+});
+
+test("Show in changes only what the app displays, never the file", async ({ page }) => {
+  const obj = path.join(fixtures, "curves", "capsule.obj");
+  await open(page, [obj]);
+  const before = await download(page);
+  // No exporter named: meters, assumed.
+  await expect(card(page).getByText("File in meters · assumed")).toBeVisible();
+  const size = card(page).getByText(/ m$/);
+  await expect(size).toHaveText("10 × 30 × 10 m");
+  await card(page).getByRole("button", { name: /^Meters/ }).click();
+  await page.getByRole("menuitem", { name: "Millimeters" }).click();
+  await expect(card(page).getByText("10,000 × 30,000 × 10,000 mm")).toBeVisible();
+  await expect(page.locator(".dim-label").first()).toHaveText(/ mm$/);
+  await expect(card(page).getByText("File in meters · assumed")).toBeVisible();
+  const after = await download(page);
+  expect(after.bytes.equals(before.bytes), "the display unit must not change the file").toBe(true);
+  // Remembered: saved with the preferences, and kept for the next file.
+  expect(await page.evaluate(() => JSON.parse(localStorage.getItem("obj2cad.prefs.v1") ?? "{}").showIn)).toBe("millimeters");
+  await input(page).setInputFiles([path.join(fixtures, "edge", "names_layers.obj")]);
+  await expect(card(page).getByText("names_layers.obj")).toHaveCount(0);
+  await expect(downloadButton(page)).toBeEnabled();
+  await expect(card(page).getByRole("button", { name: /^Millimeters/ })).toBeVisible();
+});
+
+test("a chosen folder is one drawing, like the command-line tool", async ({ page }) => {
+  const dir = path.join(fixtures, "bundle", "site");
+  await page.goto("/");
+  await page.locator('input[aria-label="Choose a folder"]').setInputFiles(dir);
+  const got = await download(page);
+  expect(got.name).toBe("site.dxf");
+  expect(got.bytes.equals(cliOutput(dir, "dxf")), "web and CLI outputs differ").toBe(true);
+});
+
+test("a bundle lists layers under their file; a file's checkbox leaves out all of its layers", async ({ page }) => {
+  const dir = path.join(fixtures, "bundle", "same_names");
+  await page.goto("/");
+  await page.locator('input[aria-label="Choose a folder"]').setInputFiles(dir);
+  await expect(downloadButton(page)).toBeEnabled();
+  const layers = page.getByRole("region", { name: "Layers" });
+  await expect(layers.getByRole("checkbox", { name: "east.obj in the drawing" })).toBeVisible();
+  await expect(layers.getByRole("checkbox", { name: "Chair (west) in the drawing" })).toBeVisible();
+  await layers.getByRole("checkbox", { name: "west.obj in the drawing" }).click();
+  await expect(downloadButton(page)).toHaveText(/2 of 3 layers/);
+  const got = await download(page);
+  expect(got.bytes.equals(cliOutput(dir, "dxf", ["--exclude-layer", "Chair (west)"])), "web and CLI outputs differ").toBe(true);
 });
 
 test("several loose models: convert separately, then Download all", async ({ page }) => {
