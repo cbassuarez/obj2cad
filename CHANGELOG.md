@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/cbassuarez/obj2cad/compare/obj2cad-v0.3.0...obj2cad-v0.4.0) (2026-09-29)
+
+
+### Features
+
+* units shown the way designers read them, bundles grouped by file, folder picking ([#9](https://github.com/cbassuarez/obj2cad/issues/9)) ([93a6ee4](https://github.com/cbassuarez/obj2cad/commit/93a6ee4284883d778d0f442c0ddb54948da693a0))
+
 ## [0.3.0](https://github.com/cbassuarez/obj2cad/compare/obj2cad-v0.2.0...obj2cad-v0.3.0) (2026-09-29)
 
 
