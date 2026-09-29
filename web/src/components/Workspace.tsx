@@ -36,6 +36,7 @@ export function Workspace({
   onLayerMode,
   onFormat,
   onIncludeName,
+  onCurves,
   onDownload,
   onDownloadVisible,
   onDownloadReport,
@@ -55,6 +56,7 @@ export function Workspace({
   onLayerMode: (m: LayerMode) => void;
   onFormat: (f: Format) => void;
   onIncludeName: (on: boolean) => void;
+  onCurves: (on: boolean) => void;
   onDownload: (pick: boolean) => void;
   onDownloadVisible: (hiddenLayers: string[]) => void;
   onDownloadReport: () => void;
@@ -159,6 +161,8 @@ export function Workspace({
           }}
           onFit={() => viewer.current?.fit()}
           onFormat={onFormat}
+          curves={prefs.curves}
+          onCurves={onCurves}
           onDownload={onDownload}
           onAnother={onAnother}
         />

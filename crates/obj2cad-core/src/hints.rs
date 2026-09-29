@@ -1,6 +1,6 @@
 //! Settings the OBJ format does not record (units, up axis).
 //!
-//! Both are chosen automatically and shown with the reason; the user can override either.
+//! Both are chosen automatically; the user can override either.
 //! The up axis is detected from the geometry (the rotation is exact). Units are a best
 //! guess from the exporter's convention or the model's size; they only label the drawing,
 //! so a wrong guess never changes a coordinate. With no basis, the drawing stays unitless.
@@ -22,11 +22,9 @@ pub struct Hints {
     /// Exporter name if the leading comments identify one.
     pub exporter: Option<String>,
     pub units: Units,
-    pub units_reason: String,
     /// Where the unit came from: the exporter's convention, the model's size, or nothing.
     pub units_source: UnitsSource,
     pub up_axis: UpAxis,
-    pub up_axis_reason: String,
     /// True when the geometry itself decided the up axis (not just a default).
     pub up_axis_confident: bool,
     /// Bounds of all vertices in file coordinates.
@@ -102,39 +100,22 @@ pub fn hints(doc: &ObjDocument) -> Hints {
 
     // Only guess from size when it is a plausible physical size; extreme or degenerate
     // extents (surveys in odd units, test files) get no suggestion rather than a bad one.
-    let (units, units_reason, units_source) = match (known.and_then(|e| e.2), size) {
-        (Some(u), _) => (u, format!("{} usually exports in {}", known.unwrap().1, unit_name(u)), UnitsSource::Exporter),
-        (None, Some(s)) if s > 0.0 && s < 5.0 => {
-            (Units::Meters, format!("the model is about {} across", units_across(s)), UnitsSource::Size)
-        }
-        (None, Some(s)) if (5.0..50_000.0).contains(&s) => {
-            (Units::Millimeters, format!("the model is about {} across", units_across(s)), UnitsSource::Size)
-        }
-        _ => (Units::Unitless, "neither the file nor the model's size says".to_owned(), UnitsSource::None),
+    let (units, units_source) = match (known.and_then(|e| e.2), size) {
+        (Some(u), _) => (u, UnitsSource::Exporter),
+        (None, Some(s)) if s > 0.0 && s < 5.0 => (Units::Meters, UnitsSource::Size),
+        (None, Some(s)) if (5.0..50_000.0).contains(&s) => (Units::Millimeters, UnitsSource::Size),
+        _ => (Units::Unitless, UnitsSource::None),
     };
-    let exporter_up = known.and_then(|e| e.3.map(|u| (u, e.1)));
-    let (up_axis, up_axis_reason, up_axis_confident) = match (detect_up(doc, bounds), exporter_up) {
-        (Some((axis, why)), _) => (axis, why, true),
-        (None, Some((axis, name))) => {
-            let why = match axis {
-                UpAxis::YUpToZUp => format!("{name} files are usually Y-up"),
-                UpAxis::AsIs => format!("{name} files are usually Z-up"),
-            };
-            (axis, why, false)
-        }
-        (None, None) => (
-            UpAxis::AsIs,
-            "the shape doesn't show which way is up".to_owned(),
-            false,
-        ),
+    let (up_axis, up_axis_confident) = match (detect_up(doc, bounds), known.and_then(|e| e.3)) {
+        (Some(axis), _) => (axis, true),
+        (None, Some(axis)) => (axis, false),
+        (None, None) => (UpAxis::AsIs, false),
     };
     Hints {
         exporter: known.map(|e| e.1.to_owned()),
         units,
-        units_reason,
         units_source,
         up_axis,
-        up_axis_reason,
         up_axis_confident,
         bounds,
     }
@@ -174,7 +155,7 @@ pub fn resolve(h: &Hints, c: &Choices) -> (Units, UpAxis) {
 ///
 /// `None` when the evidence is weak or balanced (a cube, a sphere); callers then fall back
 /// to the exporter's convention.
-fn detect_up(doc: &ObjDocument, bounds: Option<([f64; 3], [f64; 3])>) -> Option<(UpAxis, String)> {
+fn detect_up(doc: &ObjDocument, bounds: Option<([f64; 3], [f64; 3])>) -> Option<UpAxis> {
     let (lo, hi) = bounds?;
     let ext = [hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]];
     let size = ext.iter().copied().fold(0.0, f64::max);
@@ -216,15 +197,9 @@ fn detect_up(doc: &ObjDocument, bounds: Option<([f64; 3], [f64; 3])>) -> Option<
     // (3x); small coincidental flats on mechanical parts don't count.
     if total > 0.0 && big / total > 0.05 && big > 3.0 * by.min(bz) {
         return Some(if by > bz {
-            (
-                UpAxis::YUpToZUp,
-                "it sits on a flat base that faces sideways in the file (Y-up)".to_owned(),
-            )
+            UpAxis::YUpToZUp
         } else {
-            (
-                UpAxis::AsIs,
-                "it sits on a flat base that already faces down (Z-up)".to_owned(),
-            )
+            UpAxis::AsIs
         });
     }
 
@@ -232,47 +207,12 @@ fn detect_up(doc: &ObjDocument, bounds: Option<([f64; 3], [f64; 3])>) -> Option<
     let (ey, ez) = (ext[1], ext[2]);
     let across = ext[0].max(ey).max(ez);
     if ey < 0.35 * across && ey < 0.5 * ez {
-        return Some((
-            UpAxis::YUpToZUp,
-            "it lies flat along the file's Y axis (Y-up)".to_owned(),
-        ));
+        return Some(UpAxis::YUpToZUp);
     }
     if ez < 0.35 * across && ez < 0.5 * ey {
-        return Some((UpAxis::AsIs, "it already lies flat (Z-up)".to_owned()));
+        return Some(UpAxis::AsIs);
     }
     None
-}
-
-fn units_across(v: f64) -> String {
-    let h = human(v);
-    if h == "1" {
-        "1 unit".to_owned()
-    } else {
-        format!("{h} units")
-    }
-}
-
-/// Short, readable size: at most 3 decimals, no trailing zeros.
-fn human(v: f64) -> String {
-    if v >= 1000.0 {
-        return format!("{v:.0}");
-    }
-    if v < 0.001 {
-        return format!("{v:.1e}");
-    }
-    let t = format!("{v:.3}");
-    t.trim_end_matches('0').trim_end_matches('.').to_owned()
-}
-
-fn unit_name(u: Units) -> &'static str {
-    match u {
-        Units::Unitless => "no unit",
-        Units::Millimeters => "millimeters",
-        Units::Centimeters => "centimeters",
-        Units::Meters => "meters",
-        Units::Inches => "inches",
-        Units::Feet => "feet",
-    }
 }
 
 #[cfg(test)]
@@ -298,9 +238,7 @@ v 1e308 0 0
         .unwrap();
         let h = hints(&d);
         assert_eq!(h.units, Units::Unitless);
-        assert!(h.units_reason.len() < 60, "{}", h.units_reason);
-        assert_eq!(human(160.0), "160");
-        assert_eq!(human(2.7), "2.7");
+        assert_eq!(h.units_source, UnitsSource::None);
     }
 
     /// Axis-aligned box with its min corner at `lo`, as OBJ quads with outward normals.
@@ -434,21 +372,41 @@ f 1 2 3 4
 
     #[test]
     fn resolution_order() {
-        let blender = hints(&parse(b"# Blender 4.2
+        let blender = hints(
+            &parse(
+                b"# Blender 4.2
 v 0 0 0
 v 160 0 0
-").unwrap());
-        let unknown = hints(&parse(b"v 0 0 0
+",
+            )
+            .unwrap(),
+        );
+        let unknown = hints(
+            &parse(
+                b"v 0 0 0
 v 30 12 9
-").unwrap());
-        let house = Choices { default_units: Some(Units::Meters), ..Default::default() };
+",
+            )
+            .unwrap(),
+        );
+        let house = Choices {
+            default_units: Some(Units::Meters),
+            ..Default::default()
+        };
         // The exporter's convention beats the house unit; the house unit beats a size guess.
         assert_eq!(resolve(&blender, &house).0, Units::Meters);
         assert_eq!(resolve(&unknown, &Choices::default()).0, Units::Millimeters);
         assert_eq!(resolve(&unknown, &house).0, Units::Meters);
         // An explicit choice beats everything.
-        let explicit = Choices { units: Some(Units::Inches), up_axis: Some(UpAxis::YUpToZUp), ..house };
-        assert_eq!(resolve(&unknown, &explicit), (Units::Inches, UpAxis::YUpToZUp));
+        let explicit = Choices {
+            units: Some(Units::Inches),
+            up_axis: Some(UpAxis::YUpToZUp),
+            ..house
+        };
+        assert_eq!(
+            resolve(&unknown, &explicit),
+            (Units::Inches, UpAxis::YUpToZUp)
+        );
     }
 
     #[test]

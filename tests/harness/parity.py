@@ -71,11 +71,16 @@ def read_obj(path: Path) -> dict:
         logical.append(buf)
 
     pos: list[tuple[float, float, float]] = []
-    elements = []  # (kind, [vertex indices], object, group, material)
+    texts: list[tuple[str, str, str]] = []  # the coordinates as written
+    colors: list = []  # per vertex: (r, g, b) 0..255 or None
+    elements = []  # (kind, [vertex indices], object, group, material, every corner has a vt)
     nvt = nvn = 0
     forward = []
     obj = grp = mat = None
     mtllibs = []
+    weights: dict[int, float] = {}
+    splines, curv_count = [], 0
+    cstype = deg = pending = None
 
     def ref(tok: str, n: int, slot: int) -> int:
         i = int(tok)
@@ -112,6 +117,27 @@ def read_obj(path: Path) -> dict:
             if any(math.isnan(c) or math.isinf(c) for c in xyz):
                 raise ObjError("non-finite")
             pos.append(xyz)
+            texts.append(tuple(args[:3]))
+            if len(args) == 4 and float(args[3]) != 1.0:
+                weights[len(pos) - 1] = float(args[3])
+            # `v x y z r g b`: stored as single precision, then 0..1 → 0..255.
+            colors.append(tuple(byte(f32(float(a))) for a in args[3:6]) if len(args) == 6 else None)
+        elif kw == "cstype":
+            cstype = (len(args) == 2 and args[0] == "rat", args[-1]) if args and len(args) <= 2 else None
+        elif kw == "deg":
+            deg = int(args[0]) if args else None
+        elif kw == "curv":
+            curv_count += 1
+            pending = {"range": (float(args[0]), float(args[1])), "cps": [ref(a, len(pos), 0) for a in args[2:]], "parm": None}
+        elif kw == "parm":
+            if args and args[0] == "u" and pending is not None:
+                pending["parm"] = [float(a) for a in args[1:]]
+        elif kw == "end":
+            if pending is not None:
+                sp = spline_of(pending, cstype, deg)
+                if sp is not None:
+                    splines.append({**sp, "o": obj, "g": grp, "m": mat})
+            pending = None
         elif kw == "vt":
             nvt += 1
         elif kw == "vn":
@@ -125,7 +151,7 @@ def read_obj(path: Path) -> dict:
         elif kw == "mtllib":
             mtllibs += args if args and all(a.lower().endswith(".mtl") for a in args) else ([body.split(None, 1)[1]] if len(parts) > 1 else [])
         elif kw in ("f", "fo", "l", "p"):
-            idx = []
+            idx, uv_corners = [], 0
             for a in args:
                 comps = a.split("/")
                 if len(comps) > 3 or not comps[0]:
@@ -133,6 +159,7 @@ def read_obj(path: Path) -> dict:
                 idx.append(ref(comps[0], len(pos), 0))
                 if len(comps) > 1 and comps[1]:
                     ref(comps[1], nvt, 1)
+                    uv_corners += 1
                 if len(comps) > 2 and comps[2]:
                     ref(comps[2], nvn, 2)
             kind = {"f": "f", "fo": "f", "l": "l", "p": "p"}[kw]
@@ -140,31 +167,249 @@ def read_obj(path: Path) -> dict:
                 continue  # skipped (reported by the engine)
             if kind == "l" and len(idx) < 2 or kind == "p" and not idx:
                 raise ObjError("element too short")
-            elements.append((kind, idx, obj, grp, mat))
+            elements.append((kind, idx, obj, grp, mat, uv_corners == len(idx)))
     totals = [len(pos), nvt, nvn]
     for i, slot in forward:
         if i >= totals[slot]:
             raise ObjError("forward reference out of range")
-    return {"positions": pos, "elements": elements, "mtllibs": mtllibs}
+    for sp in splines:
+        sp["weights"] = [weights.get(i, 1.0) for i in sp["cps"]] if sp["rational"] else None
+    return {"positions": pos, "texts": texts, "colors": colors, "elements": elements, "mtllibs": mtllibs,
+            "splines": splines, "curves_left_out": curv_count - len(splines)}
 
 
-def read_mtl(path: Path) -> dict[str, tuple[int, int, int]]:
-    colors, current = {}, None
+def spline_of(p: dict, cstype, deg):
+    """A free-form curve as a B-spline, or None when it can't be written exactly: only
+    B-spline and Bezier curves whose range is their whole knot domain."""
+    if cstype is None or deg is None or p["parm"] is None:
+        return None
+    rational, kind = cstype
+    n = len(p["cps"])
+    if deg < 1 or n < deg + 1:
+        return None
+    if kind == "bspline":
+        if len(p["parm"]) != n + deg + 1:
+            return None
+        knots = p["parm"]
+    elif kind == "bezier":
+        breaks = p["parm"]
+        if (n - 1) % deg or len(breaks) != (n - 1) // deg + 1:
+            return None
+        knots = [breaks[0]] * (deg + 1) + [b for b in breaks[1:-1] for _ in range(deg)] + [breaks[-1]] * (deg + 1)
+    else:
+        return None
+    if any(b < a for a, b in zip(knots, knots[1:])) or p["range"] != (knots[deg], knots[n]):
+        return None
+    return {"degree": deg, "knots": knots, "cps": p["cps"], "rational": rational}
+
+
+def spline_record(degree: int, knots, verts, weights) -> bytes:
+    b = struct.pack(">II", degree, len(knots)) + b"".join(struct.pack(">d", k) for k in knots)
+    b += record(verts)
+    return b + b"".join(struct.pack(">d", w) for w in (weights or []))
+
+
+def f32(x: float) -> float:
+    return struct.unpack("<f", struct.pack("<f", x))[0]
+
+
+def byte(c: float) -> int:
+    """0..1 → 0..255, rounding half away from zero like Rust's f64::round."""
+    return int(math.floor(min(max(c, 0.0), 1.0) * 255.0 + 0.5))
+
+
+# ---------------------------------------------------------------- independent XYZ reader
+def read_xyz(path: Path) -> dict:
+    """An ASCII point cloud, as this harness reads the column rules in xyz.rs's docs."""
+    raw = path.read_bytes()
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        raise ObjError("UTF-16")
+    text = raw.decode("utf-8-sig")
+    lines = text.split("\r") if "\n" not in text and "\r" in text else text.replace("\r\n", "\n").split("\n")
+    rows, first = [], True
+    for line in lines:
+        t = line.strip()
+        if not t or t.startswith("#") or t.startswith("//"):
+            continue
+        if first:
+            first = False
+            if t.isdigit():
+                continue  # point count
+            low = t.lower()
+            if any(c.isalpha() and c not in "eE" for c in t) and "nan" not in low and "inf" not in low:
+                continue  # column names
+        rows.append(t)
+    if not rows:
+        return {"positions": [], "texts": [], "colors": [], "elements": [], "mtllibs": [], "splines": [], "curves_left_out": 0}
+    sep = ";" if ";" in rows[0] else ("," if "," in rows[0] and len(rows[0].split()) < 3 else None)
+    split = (lambda r: [x.strip() for x in r.split(sep)]) if sep else (lambda r: r.split())
+    table = [split(r) for r in rows]
+    n = len(table[0])
+    if n not in (3, 4, 6, 7, 9) or any(len(r) != n for r in table):
+        raise ObjError("column count")
+    vals = [[float(x) for x in r] for r in table]
+    if any(not math.isfinite(v) for r in vals for v in r):
+        raise ObjError("non-finite")
+
+    def is_byte(c):
+        return all(table[i][c].isdigit() and vals[i][c] <= 255 for i in range(len(table)))
+
+    def rgb(a):
+        return all(is_byte(c) for c in range(a, a + 3)) and any(vals[i][c] > 1 for i in range(len(table)) for c in range(a, a + 3))
+
+    def normals(a):
+        unit = all(abs(sum(r[c] ** 2 for c in range(a, a + 3)) - 1) < 1e-2 for r in vals)
+        return unit and not all(is_byte(c) for c in range(a, a + 3))
+
+    rgb_at = None
+    if n == 6:
+        if rgb(3) == normals(3):
+            raise ObjError("ambiguous columns")
+        rgb_at = 3 if rgb(3) else None
+    elif n == 7:
+        if not (rgb(4) and not is_byte(3)):
+            raise ObjError("ambiguous columns")
+        rgb_at = 4
+    elif n == 9:
+        a, b = rgb(3) and normals(6), normals(3) and rgb(6)
+        if a == b:
+            raise ObjError("ambiguous columns")
+        rgb_at = 3 if a else 6
+    pos = [tuple(r[:3]) for r in vals]
+    colors = [tuple(int(v) for v in r[rgb_at:rgb_at + 3]) if rgb_at is not None else None for r in vals]
+    stem = path.stem
+    texts = [tuple(r[:3]) for r in table]
+    return {"positions": pos, "texts": texts, "colors": colors, "elements": [("p", list(range(len(pos))), stem, None, None, False)], "mtllibs": [],
+            "splines": [], "curves_left_out": 0}
+
+
+def read_mtl(path: Path) -> tuple[dict, dict]:
+    """Material colors (0..255) and texture file names (without folders)."""
+    colors, textures, current = {}, {}, None
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        line = line.strip()
-        if line.startswith("newmtl") and (len(line) == 6 or line[6].isspace()):
-            current = line[6:].strip()
-        elif line.startswith("Kd") and current is not None:
+        parts = line.strip().split(None, 1)
+        if not parts:
+            continue
+        kw, rest = parts[0], (parts[1].strip() if len(parts) > 1 else "")
+        if kw == "newmtl":
+            current = rest
+        elif kw == "Kd" and current is not None:
             vals = []
-            for t in line[2:].split():
+            for t in rest.split():
                 try:
                     vals.append(float(t))
                 except ValueError:
                     pass
             if len(vals) == 3 and all(math.isfinite(v) for v in vals):
-                # round half away from zero, like Rust's f64::round
-                colors[current] = tuple(int(math.floor(min(max(c, 0.0), 1.0) * 255.0 + 0.5)) for c in vals)
-    return colors
+                colors.setdefault(current, tuple(byte(c) for c in vals))
+        elif kw == "map_Kd" and current is not None:
+            toks, i = rest.split(), 0
+            while i < len(toks) and toks[i].startswith("-") and len(toks[i]) > 1:
+                opt = toks[i]
+                i += 1
+                if opt in ("-o", "-s", "-t"):
+                    n = 0
+                    while n < 3 and i + 1 < len(toks):
+                        try:
+                            float(toks[i])
+                        except ValueError:
+                            break
+                        i, n = i + 1, n + 1
+                else:
+                    i += 2 if opt == "-mm" else 1
+            if i < len(toks):
+                textures.setdefault(current, " ".join(toks[i:]).replace("\\", "/").split("/")[-1])
+    return colors, textures
+
+
+# ---------------------------------------------------------------- bundles
+def hidden(rel: str) -> bool:
+    return any(p.startswith(".") or p == "__MACOSX" for p in rel.replace("\\", "/").split("/"))
+
+
+def bundle_files(item: Path) -> tuple[list[Path], str]:
+    """The files the CLI reads for `item` (an .obj, an .xyz or a folder), and the name a
+    folder gives the drawing."""
+    if item.is_dir():
+        files = [p for p in item.rglob("*") if p.is_file() and not hidden(str(p.relative_to(item)))]
+        return files, item.name
+    files = [item]
+    if item.suffix.lower() == ".obj":
+        seen = {item.name.lower()}
+        for lib in read_obj(item)["mtllibs"]:
+            m = item.parent / lib
+            if m.is_file() and m.name.lower() not in seen:
+                seen.add(m.name.lower())
+                files.append(m)
+                for tex in read_mtl(m)[1].values():
+                    img = m.parent / tex
+                    if img.is_file() and img.name.lower() not in seen:
+                        seen.add(img.name.lower())
+                        files.append(img)
+    return files, ""
+
+
+def read_bundle(files: list[Path], name: str) -> dict:
+    """Every model and cloud in one document, the way bundle.rs promises to combine them."""
+    files = sorted(files, key=lambda p: (p.name.lower(), str(p)))
+    ext = lambda p: p.suffix.lower()
+    geometry = [p for p in files if ext(p) in (".obj", ".xyz")]
+    mtls = [p for p in files if ext(p) == ".mtl"]
+    images = {p.name.lower() for p in files if ext(p) in (".jpg", ".jpeg", ".png")}
+    parts = [(p, read_obj(p) if ext(p) == ".obj" else read_xyz(p)) for p in geometry]
+    n_obj = sum(ext(p) == ".obj" for p in geometry)
+    several = len(parts) > 1
+
+    merged = {"positions": [], "texts": [], "colors": [], "elements": [], "mtllibs": [], "splines": [], "curves_left_out": 0}
+    palette, textured, meaning = {}, set(), {}
+    for p, doc in parts:
+        colors, textures = {}, {}
+        if ext(p) == ".obj":
+            libs = [m for lib in doc["mtllibs"] for m in mtls if m.name.lower() == lib.replace("\\", "/").split("/")[-1].lower()]
+            used = any(e[4] is not None for e in doc["elements"])
+            if not libs and n_obj == 1 and len(mtls) == 1 and (used or not doc["mtllibs"]):
+                libs = mtls
+            for m in libs:
+                c, t = read_mtl(m)
+                for k, v in c.items():
+                    colors.setdefault(k, v)
+                for k, v in t.items():
+                    if v.lower() in images:
+                        textures.setdefault(k, v)
+        # Materials two files define differently get "name (file)".
+        rename = {}
+        for e in doc["elements"]:
+            mat = e[4]
+            if mat is None or mat in rename:
+                continue
+            key = (colors.get(mat), textures.get(mat))
+            if not several or meaning.setdefault(mat, key) == key:
+                rename[mat] = mat
+            else:
+                rename[mat] = f"{mat} ({p.stem})"
+        for mat, new in rename.items():
+            if mat in colors:
+                palette.setdefault(new, colors[mat])
+            if mat in textures:
+                textured.add(new)
+        v0 = len(merged["positions"])
+        merged["positions"] += doc["positions"]
+        merged["texts"] += doc["texts"]
+        merged["colors"] += doc["colors"]
+        for kind, idx, o, g, mat, uv in doc["elements"]:
+            if several and o is None:
+                o = p.stem
+            merged["elements"].append((kind, [i + v0 for i in idx], o, g, rename.get(mat, mat), uv))
+        for sp in doc["splines"]:
+            o = sp["o"] if sp["o"] is not None or not several else p.stem
+            merged["splines"].append({**sp, "cps": [i + v0 for i in sp["cps"]], "o": o, "m": rename.get(sp["m"], sp["m"])})
+        merged["curves_left_out"] += doc["curves_left_out"]
+    if len(geometry) == 1:
+        stem = geometry[0].stem
+    else:
+        stem = Path(name).stem if name else (geometry[0].stem if geometry else "bundle")
+    merged.update(palette=palette, textured=textured, stem=stem)
+    return merged
 
 
 # ---------------------------------------------------------------- expected layers and colors
@@ -177,11 +422,12 @@ def dxf_safe(name: str) -> str:
     return s or "unnamed"
 
 
-def expected_structure(obj: dict, stem: str, up: str, palette: dict) -> list[bytes]:
+def expected_structure(obj: dict, stem: str, up: str, palette: dict, textured: set = frozenset()) -> list[bytes]:
     """(layer, color, geometry) records the DXF should contain, in obj2cad's default
-    layer mode (objects; groups when the file has no objects)."""
+    layer mode (objects; groups when the file has no objects). Faces colored from a
+    texture get color "T" (the harness can't decode images the way the engine does)."""
     P = [transform(p, up) for p in obj["positions"]]
-    has_objects = any(e[2] is not None for e in obj["elements"])
+    has_objects = any(e[2] is not None for e in obj["elements"]) or any(sp["o"] is not None for sp in obj.get("splines", []))
     taken, by_source, default = {"0"}, {}, [None]
 
     def unique(base: str) -> str:
@@ -205,24 +451,36 @@ def expected_structure(obj: dict, stem: str, up: str, palette: dict) -> list[byt
             by_source[source] = unique(source)
         return by_source[source]
 
-    records, used = [], set()
-    for kind, idx, o, g, m in obj["elements"]:
+    vcolor = obj.get("colors") or [None] * len(P)
+    records = []
+    for kind, idx, o, g, m, uv in obj["elements"]:
         layer = layer_of(o, g)
         color = palette.get(m) if m is not None else None
-        used.update(idx)
         if kind == "p":
-            records += [structure_record(layer, color, "p", [P[i]]) for i in idx]
+            records += [structure_record(layer, vcolor[i] or color, "p", [P[i]]) for i in idx]
         else:
+            if kind == "f" and uv and m in textured:
+                color = "T"
             records.append(structure_record(layer, color, kind, [P[i] for i in idx]))
-    if not obj["elements"] and P:  # point cloud
+    for sp in obj.get("splines", []):
+        layer = layer_of(sp["o"], sp["g"])
+        color = palette.get(sp["m"]) if sp["m"] is not None else None
+        records.append(structure_record(layer, color, "s", [P[i] for i in sp["cps"]], sp))
+    if not obj["elements"] and not obj.get("splines") and P:  # point cloud
         layer = default_layer()
-        records += [structure_record(layer, None, "p", [p]) for p in P]
+        records += [structure_record(layer, vcolor[i], "p", [p]) for i, p in enumerate(P)]
     return records
 
 
-def structure_record(layer: str, color, kind: str, verts) -> bytes:
-    c = "-" if color is None else "%02x%02x%02x" % tuple(color)
-    return f"{layer}\0{c}\0{kind}\0".encode() + record(verts)
+def without_color(rec: bytes) -> bytes:
+    layer, _color, rest = rec.split(b"\0", 2)
+    return layer + b"\0" + rest
+
+
+def structure_record(layer: str, color, kind: str, verts, spline=None) -> bytes:
+    c = "-" if color is None else color if isinstance(color, str) else "%02x%02x%02x" % tuple(color)
+    body = spline_record(spline["degree"], spline["knots"], verts, spline["weights"]) if spline else record(verts)
+    return f"{layer}\0{c}\0{kind}\0".encode() + body
 
 
 # ---------------------------------------------------------------- canonical geometry hash
@@ -235,9 +493,10 @@ def record(vertices) -> bytes:
     return b"".join(struct.pack(">d", c) for v in vertices for c in v)
 
 
-def parity_hash(faces, lines, points) -> str:
+def parity_hash(faces, lines, points, splines=()) -> str:
     h = hashlib.sha256(b"obj2cad-parity-v1\0")
-    for tag, recs in ((b"f", faces), (b"l", lines), (b"p", points)):
+    kinds = [(b"f", faces), (b"l", lines), (b"p", points)] + ([(b"s", splines)] if splines else [])
+    for tag, recs in kinds:
         recs = sorted(recs)
         h.update(tag + struct.pack("<Q", len(recs)))
         for r in recs:
@@ -250,15 +509,16 @@ def hash_from_obj(obj: dict, up: str) -> str:
     faces = [record(P[i] for i in idx) for k, idx, *_ in obj["elements"] if k == "f"]
     lines = [record(P[i] for i in idx) for k, idx, *_ in obj["elements"] if k == "l"]
     points = [record([P[i]]) for k, idx, *_ in obj["elements"] if k == "p" for i in idx]
-    if not obj["elements"]:
+    splines = [spline_record(sp["degree"], sp["knots"], [P[i] for i in sp["cps"]], sp["weights"]) for sp in obj.get("splines", [])]
+    if not obj["elements"] and not splines:
         points = [record([p]) for p in P]  # point cloud
-    return parity_hash(faces, lines, points)
+    return parity_hash(faces, lines, points, splines)
 
 
 def read_dxf(path: Path):
     doc = ezdxf.readfile(path)
     auditor = doc.audit()
-    faces, lines, points, structure = [], [], [], []
+    faces, lines, points, structure, acis, splines = [], [], [], [], [], []
     for e in doc.modelspace():
         t = e.dxftype()
         color = e.dxf.true_color if e.dxf.hasattr("true_color") else None
@@ -279,6 +539,13 @@ def read_dxf(path: Path):
             verts = [tuple(e.dxf.location)]
             points.append(record(verts))
             structure.append(structure_record(layer, rgb, "p", verts))
+        elif t in ("SURFACE", "3DSOLID"):
+            acis.append((t, layer, bytes(e.sab)))
+        elif t == "SPLINE":
+            sp = {"degree": e.dxf.degree, "knots": list(e.knots), "weights": list(e.weights) if e.dxf.flags & 4 else None}
+            verts = [tuple(v) for v in e.control_points]
+            splines.append(spline_record(sp["degree"], sp["knots"], verts, sp["weights"]))
+            structure.append(structure_record(layer, rgb, "s", verts, sp))
         else:
             raise AssertionError(f"unexpected entity {t}")
     layer_colors = {l.dxf.name: l.dxf.get("true_color") for l in doc.layers}
@@ -286,7 +553,7 @@ def read_dxf(path: Path):
         "custom": dict(doc.header.custom_vars),
         "acadver": doc.header.get("$ACADVER"),
     }
-    return parity_hash(faces, lines, points), auditor, structure, layer_colors, header
+    return parity_hash(faces, lines, points, splines), auditor, structure, layer_colors, header, acis
 
 
 def read_dwg(path: Path, binary: Path):
@@ -296,7 +563,7 @@ def read_dwg(path: Path, binary: Path):
         raise AssertionError("DWG does not read back: " + proc.stderr.strip())
     dump = json.loads(proc.stdout)
     unpack = lambda v: tuple(struct.unpack(">d", bytes.fromhex(c))[0] for c in v)
-    faces, lines, points, structure = [], [], [], []
+    faces, lines, points, structure, acis, splines = [], [], [], [], [], []
     for e in dump["entities"]:
         t, layer = e["t"], e.get("layer")
         rgb = None if e.get("color") is None else tuple(bytes.fromhex(e["color"]))
@@ -312,6 +579,13 @@ def read_dwg(path: Path, binary: Path):
         elif t == "point":
             points.append(record(vs))
             structure.append(structure_record(layer, rgb, "p", vs))
+        elif t == "spline":
+            num = lambda h: struct.unpack(">d", bytes.fromhex(h))[0]
+            sp = {"degree": e["degree"], "knots": [num(k) for k in e["knots"]], "weights": [num(w) for w in e["weights"]] if e["rational"] else None}
+            splines.append(spline_record(sp["degree"], sp["knots"], vs, sp["weights"]))
+            structure.append(structure_record(layer, rgb, "s", vs, sp))
+        elif t in ("surface", "solid"):
+            acis.append(("SURFACE" if t == "surface" else "3DSOLID", layer, bytes.fromhex(e["sab"])))
         else:
             raise AssertionError(f"unexpected entity {t}")
     layer_colors = {name: None if c is None or len(c) != 6 else int(c, 16) for name, c in dump["layers"].items()}
@@ -321,11 +595,95 @@ def read_dwg(path: Path, binary: Path):
         errors = [None] * dump["problems"]
 
     header = {"custom": dump["custom"], "acadver": dump["version"]}
-    return parity_hash(faces, lines, points), Audit, structure, layer_colors, header
+    return parity_hash(faces, lines, points, splines), Audit, structure, layer_colors, header, acis
+
+
+# ---------------------------------------------------------------- curved surfaces
+def quantum(text: str) -> float:
+    """The precision a number's text states: 1.234560 → 1e-6, 1.5e-3 → 1e-4, 12 → 1."""
+    t = text.lstrip("+-")
+    mant, _, exp = t.lower().partition("e")
+    decimals = len(mant.split(".", 1)[1]) if "." in mant else 0
+    return 10.0 ** ((int(exp) if exp else 0) - decimals)
+
+
+def surface_of(sab: bytes):
+    """The single face's surface in an ACIS body, read with ezdxf's SAB parser, as
+    (kind, distance function)."""
+    from ezdxf.acis import sab as sabmod
+
+    builder = sabmod.parse_sab(sab)
+    faces = [e for e in builder.entities if e.name == "face"]
+    if len(faces) != 1:
+        raise AssertionError(f"expected one face, got {len(faces)}")
+    # face data: pattern, next, loop, shell, subshell, surface, ...
+    surf = faces[0].data[5].value
+    vals = [t.value for t in surf.data[1:] if t.tag in (0x06, 0x13, 0x14)]
+    sub = lambda a, b: tuple(x - y for x, y in zip(a, b))
+    dot = lambda a, b: sum(x * y for x, y in zip(a, b))
+    norm = lambda a: math.sqrt(dot(a, a))
+    if surf.name == "cone-surface":
+        center, axis, major, _ratio, sin, cos, _scale = vals[:7]
+        r0 = norm(major)
+
+        def d(p):
+            v = sub(p, center)
+            h = dot(v, axis)
+            rho = norm(sub(v, tuple(h * a for a in axis)))
+            return (rho - (r0 + h * sin / cos)) * cos
+
+        return ("cylinder" if sin == 0 else "cone"), d
+    if surf.name == "sphere-surface":
+        center, radius = vals[0], vals[1]
+        return "sphere", lambda p: norm(sub(p, center)) - radius
+    if surf.name == "torus-surface":
+        center, axis, major, minor = vals[:4]
+
+        def d(p):
+            v = sub(p, center)
+            z = dot(v, axis)
+            rho = norm(sub(v, tuple(z * a for a in axis)))
+            return math.hypot(rho - major, z) - minor
+
+        return "torus", d
+    raise AssertionError(f"unexpected surface {surf.name}")
+
+
+def check_curves(obj: dict, up: str, report: dict, acis: list) -> list[str]:
+    """Every vertex of every face each surface was recognized from lies on the surface
+    read back from the file, within its own stated precision (see crates/obj2cad-curves)."""
+    regions = report.get("curves", [])
+    if len(regions) != len(acis):
+        return [f"{len(regions)} regions in the report, {len(acis)} surfaces in the file"]
+    faces = [idx for kind, idx, *_ in obj["elements"] if kind == "f"]
+    P = [transform(p, up) for p in obj["positions"]]
+    used = sorted({i for f in faces for i in f})
+    if not used:
+        return []
+    lo = [min(P[i][a] for i in used) for a in range(3)]
+    hi = [max(P[i][a] for i in used) for a in range(3)]
+    size = math.dist(lo, hi)
+    floor = 1e-12 * (max(abs(c) for i in used for c in P[i]) + size)
+    cap = max(1e-6 * size, floor)
+
+    def tol(i):
+        t = 0.5 * math.sqrt(sum(quantum(x) ** 2 for x in obj["texts"][i]))
+        return max(min(t, cap), floor)
+
+    problems = []
+    for region, (_, _, sab) in zip(regions, acis):
+        kind, d = surface_of(sab)
+        if kind != region["kind"]:
+            problems.append(f"report says {region['kind']}, file has {kind}")
+        worst = max(abs(d(P[i])) / tol(i) for f in region["faces"] for i in faces[f])
+        if worst > 1.0 + 1e-9:
+            problems.append(f"{kind}: a vertex is {worst:.3g} tolerances off the surface")
+    return problems
 
 
 # ---------------------------------------------------------------- driver
-def check(binary: Path, obj_path: Path, out_dir: Path, up: str, fmt: str, expect_invalid: bool) -> tuple[bool, str]:
+def check(binary: Path, obj_path: Path, out_dir: Path, up: str, fmt: str, expect_invalid: bool, curves: bool = False) -> tuple[bool, str]:
+    """`obj_path`: an .obj or .xyz file, or a folder holding one bundle."""
     stem = f"{obj_path.parent.name}_{obj_path.stem}" if obj_path.stem == "model" else obj_path.stem
     ext = ".dwg" if fmt == "dwg" else ".dxf"
     dxf = out_dir / (stem + ext)
@@ -333,6 +691,8 @@ def check(binary: Path, obj_path: Path, out_dir: Path, up: str, fmt: str, expect
     cmd = [str(binary), "convert", str(obj_path), "-o", str(dxf), "--report", str(rep), "--format", fmt, "--quiet"]
     if up != "auto":
         cmd += ["--up", up]
+    if curves:
+        cmd += ["--curves"]
     t0 = time.perf_counter()
     proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8")
     elapsed = time.perf_counter() - t0
@@ -340,9 +700,9 @@ def check(binary: Path, obj_path: Path, out_dir: Path, up: str, fmt: str, expect
         if proc.returncode == 0:
             return False, "accepted an invalid file"
         try:
-            read_obj(obj_path)
+            read_bundle(*bundle_files(obj_path))
             return False, "independent reader accepted it (reader disagreement)"
-        except (ObjError, ValueError):
+        except (ObjError, ValueError, UnicodeDecodeError):
             pass
         return True, "rejected: " + proc.stderr.strip().splitlines()[0].split(": ", 1)[-1][:90]
     if proc.returncode != 0:
@@ -350,19 +710,19 @@ def check(binary: Path, obj_path: Path, out_dir: Path, up: str, fmt: str, expect
 
     report = json.loads(rep.read_text(encoding="utf-8"))
     applied_up = report["options"]["up_axis"]
-    obj = read_obj(obj_path)
-    mtl = next((obj_path.parent / m for m in obj["mtllibs"] if (obj_path.parent / m).is_file()), None)
-    palette = read_mtl(mtl) if mtl else {}
+    obj = read_bundle(*bundle_files(obj_path))
 
     h_rust = report["parity_hash"]
     h_obj = hash_from_obj(obj, applied_up)
-    h_dxf, auditor, structure, layer_colors, header = read_dwg(dxf, binary) if fmt == "dwg" else read_dxf(dxf)
+    h_dxf, auditor, structure, layer_colors, header, acis = read_dwg(dxf, binary) if fmt == "dwg" else read_dxf(dxf)
     problems = []
     if h_obj != h_rust:
         problems.append("OBJ readers disagree on geometry")
     if h_dxf != h_rust:
         problems.append(f"{fmt.upper()} geometry differs from source")
-    expected = sorted(expected_structure(obj, obj_path.stem, applied_up, palette))
+    expected = sorted(expected_structure(obj, obj["stem"], applied_up, obj["palette"], obj["textured"]))
+    textured = {without_color(r) for r in expected if r.split(b"\0")[1] == b"T"}
+    structure = [r.split(b"\0", 1)[0] + b"\0T\0" + r.split(b"\0", 2)[2] if without_color(r) in textured else r for r in structure]
     if sorted(structure) != expected:
         got, want = Counter(structure), Counter(expected)
         diff = next(iter((got - want) or (want - got)))
@@ -377,10 +737,16 @@ def check(binary: Path, obj_path: Path, out_dir: Path, up: str, fmt: str, expect
         problems.append("custom property parity hash missing/wrong")
     if header["acadver"] != "AC1032":
         problems.append(f"unexpected version {header['acadver']}")
+    if acis and not curves:
+        problems.append("surfaces written without --curves")
+    if report["omissions"]["freeform_curves"] != obj["curves_left_out"]:
+        problems.append(f"{report['omissions']['freeform_curves']} free-form curves reported left out, harness counts {obj['curves_left_out']}")
+    problems += check_curves(obj, applied_up, report, acis)
     if problems:
         return False, "; ".join(problems)
     up_note = "upright" if applied_up == "y_up_to_z_up" else "as-is"
-    return True, f"{report['output']['faces']} faces, {len(used_layers)} layers, {up_note}, {elapsed:.2f}s"
+    kinds = "".join(f", {r['kind']}" for r in report.get("curves", []))
+    return True, f"{report['output']['faces']} faces, {len(used_layers)} layers, {up_note}{kinds}, {elapsed:.2f}s"
 
 
 def main() -> int:
@@ -390,12 +756,23 @@ def main() -> int:
     ap.add_argument("--up", default="auto", choices=["auto", "as-is", "y-to-z"])
     ap.add_argument("--format", default="dxf", choices=["dxf", "dxf-binary", "dwg"])
     ap.add_argument("--keep", type=Path, help="keep outputs in this folder")
+    ap.add_argument("--curves", action="store_true", help="also recognize curved surfaces and verify them")
     a = ap.parse_args()
 
     binary = a.bin if a.bin.exists() else a.bin.with_suffix(".exe")
-    objs = sorted(p for d in a.dirs for p in d.rglob("*.obj"))
+    # Every .obj and .xyz on its own, except inside a `bundle` folder, where each
+    # subfolder is one bundle.
+    objs = []
+    for d in a.dirs:
+        for p in d.rglob("*"):
+            in_bundle = "bundle" in p.relative_to(d).parts[:-1] or p.parent.name == "bundle"
+            if p.is_dir() and p.parent.name == "bundle":
+                objs.append(p)
+            elif p.is_file() and p.suffix.lower() in (".obj", ".xyz") and not in_bundle:
+                objs.append(p)
+    objs.sort()
     if not objs:
-        print("no .obj files found", file=sys.stderr)
+        print("no .obj or .xyz files found", file=sys.stderr)
         return 2
     failures = 0
     with tempfile.TemporaryDirectory() as tmp:
@@ -403,13 +780,13 @@ def main() -> int:
         out.mkdir(parents=True, exist_ok=True)
         for obj in objs:
             try:
-                ok, msg = check(binary, obj, out, a.up, a.format, "invalid" in obj.parts)
+                ok, msg = check(binary, obj, out, a.up, a.format, "invalid" in obj.parts, a.curves)
             except Exception as e:  # a harness crash is a failure, not a pass
                 ok, msg = False, f"harness error: {type(e).__name__}: {e}"
             failures += not ok
             label = f"{obj.parent.name}/{obj.name}" if obj.stem == "model" else obj.name
             print(f"{'PASS' if ok else 'FAIL'}  {label:<40} {msg}", flush=True)
-    print(f"\n{len(objs) - failures}/{len(objs)} passed (up {a.up}, {a.format})")
+    print(f"\n{len(objs) - failures}/{len(objs)} passed (up {a.up}, {a.format}{', curves' if a.curves else ''})")
     return 1 if failures else 0
 
 

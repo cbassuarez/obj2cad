@@ -5,6 +5,7 @@ import { useRegisterSW } from "virtual:pwa-register/react";
 import { AnimatePresence, motion } from "motion/react";
 import { CubeArt } from "@/components/brand";
 import { BatchScreen, type BatchItem } from "@/components/BatchScreen";
+import { ChoiceScreen } from "@/components/ChoiceScreen";
 import { DropScreen } from "@/components/DropScreen";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { FailedScreen } from "@/components/FailedScreen";
@@ -14,7 +15,7 @@ import { Button } from "@/components/ui/button";
 import type { PreviewState } from "@/components/Workspace";
 import { engine, EngineError, isEmpty, sha256Hex, type Failure, type Inspection, type Progress, type Result } from "@/lib/engine";
 import { CLI_URL, explain, type Explained } from "@/lib/errors";
-import { gather, pickMtl, saveFile, stem, zipFiles } from "@/lib/files";
+import { baseName, jobName, plan, saveFile, stem, zipFiles, type Job, type Source } from "@/lib/files";
 import {
   AUTO,
   engineSettings,
@@ -30,7 +31,7 @@ import {
   type Units,
 } from "@/lib/settings";
 
-type Screen = "empty" | "preflight" | "loading" | "failed" | "work" | "batch";
+type Screen = "empty" | "preflight" | "loading" | "failed" | "work" | "batch" | "choose";
 
 /** A file handle from the File System Access API (Chromium), for reloading on change. */
 interface FileHandleLike {
@@ -40,10 +41,8 @@ interface FileHandleLike {
 
 interface Current {
   id: number;
-  file: File;
-  mtl: File | null;
-  /** Material libraries that came with it (paired by name). */
-  mtls: File[];
+  job: Job;
+  /** For a drawing made from one file picked with the file picker: reload on change. */
   handle: FileHandleLike | null;
   inspection: Inspection;
   choices: FileChoices;
@@ -67,6 +66,9 @@ const loadWorkspace = () => import("@/components/Workspace");
 const Workspace = lazy(() => loadWorkspace().then((m) => ({ default: m.Workspace })));
 
 const failureOf = (e: unknown): Failure => (e instanceof EngineError ? e.failure : { kind: "other", message: e instanceof Error ? e.message : String(e) });
+const jobSize = (job: Job) => job.sources.reduce((n, s) => n + s.file.size, 0);
+/** The file a failure is about: the one that couldn't be read, else the drawing. */
+const failedName = (job: Job, e: unknown) => (e instanceof EngineError && e.failure.kind === "parse" && e.failure.parse.file) || jobName(job);
 
 export function App() {
   const [screen, setScreenState] = useState<Screen>("empty");
@@ -77,7 +79,8 @@ export function App() {
   const [busy, setBusy] = useState<string | null>(null);
   const [loading, setLoading] = useState<{ name: string; progress: Progress | null }>({ name: "", progress: null });
   const [failed, setFailed] = useState<{ name: string; explained: Explained; retry?: () => void } | null>(null);
-  const [preflight, setPreflight] = useState<{ file: File; go: () => void } | null>(null);
+  const [preflight, setPreflight] = useState<{ name: string; size: number; go: () => void } | null>(null);
+  const [choice, setChoice] = useState<{ combined: Job; separate: Job[] } | null>(null);
   const [batch, setBatch] = useState<BatchItem[]>([]);
   const [downloaded, setDownloaded] = useState<string | null>(null);
   const [watching, setWatching] = useState(false);
@@ -90,8 +93,8 @@ export function App() {
   const currentRef = useRef<Current | null>(null);
   const resultRef = useRef<Result | null>(null);
   const batchRef = useRef<BatchItem[]>([]);
-  const batchMtls = useRef<File[]>([]);
   const shownPreview = useRef<{ key: string; fileId: number } | null>(null);
+  const choiceRef = useRef<{ combined: Job; separate: Job[] } | null>(null);
   const convertToken = useRef(0);
   const openToken = useRef(0);
   const batchToken = useRef(0);
@@ -114,6 +117,7 @@ export function App() {
       const s = (e.state?.screen as Screen | undefined) ?? "empty";
       if (s === "work" && currentRef.current && resultRef.current) setScreen("work");
       else if (s === "batch" && batchRef.current.length) setScreen("batch");
+      else if (s === "choose" && choiceRef.current) setScreen("choose");
       else setScreen("empty");
     };
     window.addEventListener("popstate", onPop);
@@ -173,7 +177,7 @@ export function App() {
   /** Convert the open file with the current preferences and its choices. */
   const convert = useCallback(async (cur: Current, forcePreview = false, label = "Converting…"): Promise<boolean> => {
     const token = ++convertToken.current;
-    const settings = engineSettings(prefsRef.current, cur.choices, cur.file);
+    const settings = engineSettings(prefsRef.current, cur.choices);
     const key = previewKey(settings);
     const shown = shownPreview.current;
     const wantPreview = forcePreview || !shown || shown.key !== key || shown.fileId !== cur.id;
@@ -183,7 +187,7 @@ export function App() {
       const r = await engine.convert(settings, wantPreview, () => setBusy(settings.format === "dwg" ? "Preparing DWG…" : label));
       if (token !== convertToken.current) return false;
       if (isEmpty(r.report)) {
-        setFailed({ name: cur.file.name, explained: explain({ kind: "empty" }) });
+        setFailed({ name: cur.inspection.name, explained: explain({ kind: "empty" }) });
         setScreen("failed", screenRef.current === "empty" ? "push" : "replace");
         return false;
       }
@@ -197,40 +201,40 @@ export function App() {
       return true;
     } catch (e) {
       if (token !== convertToken.current) return false;
-      fail(cur.file.name, e, () => void openSingle(cur.file, cur.mtls, cur.handle, { choices: cur.choices, batchItem: cur.batchItem, force: true }));
+      fail(cur.inspection.name, e, () => void openJob(cur.job, cur.handle, { choices: cur.choices, batchItem: cur.batchItem, force: true }));
       return false;
     } finally {
       if (token === convertToken.current) setBusy(null);
     }
-    // Stable: everything it reads is a ref or a state setter (openSingle is only called later).
+    // Stable: everything it reads is a ref or a state setter (openJob is only called later).
   }, []);
 
-  /** Open one file into the workspace. */
-  const openSingle = useCallback(
-    async (file: File, mtls: File[], handle: FileHandleLike | null, opts: OpenOptions = {}): Promise<void> => {
-      if (file.size > BIG && !opts.force) {
-        setPreflight({ file, go: () => void openSingle(file, mtls, handle, { ...opts, force: true }) });
+  /** Open one drawing into the workspace. */
+  const openJob = useCallback(
+    async (job: Job, handle: FileHandleLike | null, opts: OpenOptions = {}): Promise<void> => {
+      const name = jobName(job);
+      const size = jobSize(job);
+      if (size > BIG && !opts.force) {
+        setPreflight({ name, size, go: () => void openJob(job, handle, { ...opts, force: true }) });
         setScreen("preflight");
         return;
       }
       const token = ++openToken.current;
-      const previous = screenRef.current === "work" ? currentRef.current?.file.name : undefined;
-      setLoading({ name: file.name, progress: null });
+      const previous = screenRef.current === "work" ? currentRef.current?.inspection.name : undefined;
+      setLoading({ name, progress: null });
       if (!opts.reload) setScreen("loading");
       else setBusy("Reloading…");
       try {
-        const info = await engine.open(file, null, prefsRef.current.format === "dwg", (p) => setLoading({ name: file.name, progress: p }));
+        const info = await engine.open(job.sources, job.name, prefsRef.current.format === "dwg", (p) => setLoading({ name, progress: p }));
         if (token !== openToken.current) return;
-        const mtl = pickMtl(info.mtllibs, mtls, true);
-        if (mtl) await engine.setMtl(mtl);
-        const cur: Current = { id: ++seq.current, file, mtl, mtls, handle, inspection: info, choices: opts.choices ?? AUTO, batchItem: opts.batchItem ?? null };
+        const cur: Current = { id: ++seq.current, job, handle, inspection: info, choices: opts.choices ?? AUTO, batchItem: opts.batchItem ?? null };
         setCur(cur);
         if (!(await convert(cur, true)) || token !== openToken.current) return;
         setScreen("work", opts.reload || screenRef.current === "work" ? "replace" : "push");
-        if (!opts.reload && previous && previous !== file.name) notifications.show({ message: `Replaced ${previous} with ${file.name}` });
-        if (opts.reload) notifications.show({ message: `Reloaded ${file.name}` });
+        if (!opts.reload && previous && previous !== info.name) notifications.show({ message: `Replaced ${previous} with ${info.name}` });
+        if (opts.reload) notifications.show({ message: `Reloaded ${info.name}` });
       } catch (e) {
-        if (token === openToken.current) fail(file.name, e, () => void openSingle(file, mtls, handle, { ...opts, force: true }));
+        if (token === openToken.current) fail(failedName(job, e), e, () => void openJob(job, handle, { ...opts, force: true }));
       } finally {
         if (opts.reload) setBusy(null);
       }
@@ -245,10 +249,8 @@ export function App() {
       if (token !== batchToken.current) return;
       updateBatch(item.id, { status: "converting", result: undefined, error: undefined });
       try {
-        const info = await engine.open(item.file, null, prefsRef.current.format === "dwg");
-        const mtl = pickMtl(info.mtllibs, batchMtls.current, false);
-        if (mtl) await engine.setMtl(mtl);
-        const r = await engine.convert(engineSettings(prefsRef.current, AUTO, item.file), false);
+        await engine.open(item.job.sources, item.job.name, prefsRef.current.format === "dwg");
+        const r = await engine.convert(engineSettings(prefsRef.current, AUTO), false);
         if (isEmpty(r.report)) updateBatch(item.id, { status: "failed", error: explain({ kind: "empty" }) });
         else updateBatch(item.id, { status: "done", result: r });
       } catch (e) {
@@ -257,55 +259,59 @@ export function App() {
     }
   }, []);
 
-  const startBatch = (objs: File[], mtls: File[]) => {
-    batchMtls.current = mtls;
-    batchRef.current = objs.map((file) => ({ id: ++seq.current, file, status: "waiting" as const }));
+  const startBatch = (jobs: Job[]) => {
+    batchRef.current = jobs.map((job) => ({ id: ++seq.current, job, name: jobName(job), size: jobSize(job), status: "waiting" as const }));
     setBatch(batchRef.current);
     setCur(null);
     shownPreview.current = null;
-    setScreen("batch", "push");
+    setScreen("batch", screenRef.current === "choose" ? "replace" : "push");
     void runBatch(batchRef.current);
   };
 
   // ---------------------------------------------------------------- opening files
   const openFiles = useCallback(
     async (files: File[], handles: FileHandleLike[] = []) => {
-      let picked;
+      let p;
       try {
-        picked = await gather(files);
+        p = await plan(files);
       } catch (e) {
         notifications.show({ color: "red", title: "Couldn't open the .zip", message: (e as Error).message });
         return;
       }
-      if (!picked.objs.length) {
-        const cur = currentRef.current;
-        if (picked.mtls.length && screenRef.current === "work" && cur) return addMtl(picked.mtls[0]);
-        notifications.show({ title: "No .obj file", message: picked.ignored.length ? `Not used: ${picked.ignored.slice(0, 3).join(", ")}` : "Choose an .obj file." });
+      if (p.kind === "none") {
+        notifications.show({ title: "Nothing to convert", message: p.ignored.length ? `Not used: ${p.ignored.slice(0, 3).join(", ")}` : "Choose an .obj, an .xyz or a .zip." });
+        return;
+      }
+      if (p.kind === "materials") {
+        if (screenRef.current === "work" && currentRef.current) return addSources(p.mtls);
+        notifications.show({ title: "No model", message: "Choose an .obj, an .xyz or a .zip." });
         return;
       }
       batchToken.current++; // a new drop stops a running batch
-      if (picked.objs.length === 1) {
-        const obj = picked.objs[0];
-        const handle = handles.find((h) => h.name === obj.name) ?? null;
-        setWatching(false);
-        return openSingle(obj, picked.mtls, handle);
+      setWatching(false);
+      if (p.kind === "one") {
+        const only = p.job.sources.length === 1 ? p.job.sources[0] : null;
+        const handle = only ? (handles.find((h) => h.name === only.file.name) ?? null) : null;
+        return openJob(p.job, handle);
       }
-      startBatch(picked.objs, picked.mtls);
+      if (p.kind === "choose") {
+        choiceRef.current = { combined: p.combined, separate: p.separate };
+        setChoice(choiceRef.current);
+        setScreen("choose", "push");
+        return;
+      }
+      startBatch(p.jobs);
     },
-    [openSingle],
+    [openJob],
   );
 
-  const addMtl = async (mtl: File) => {
+  /** Add files (material libraries) to the open drawing and read it again. */
+  const addSources = async (extra: Source[]) => {
     const cur = currentRef.current;
     if (!cur) return;
-    try {
-      await engine.setMtl(mtl);
-    } catch (e) {
-      return fail(cur.file.name, e);
-    }
-    const next = { ...cur, mtl };
-    setCur(next);
-    await convert(next, true);
+    const names = new Set(extra.map((s) => baseName(s.path).toLowerCase()));
+    const job: Job = { ...cur.job, sources: [...cur.job.sources.filter((s) => !names.has(baseName(s.path).toLowerCase())), ...extra] };
+    await openJob(job, cur.handle, { reload: true, force: true, choices: cur.choices, batchItem: cur.batchItem });
   };
 
   /** Choose files: the browser's file picker (with handles, for reloading) or the input. */
@@ -314,7 +320,7 @@ export function App() {
     if (!w.showOpenFilePicker) return input.current?.click();
     let handles: FileHandleLike[];
     try {
-      handles = await w.showOpenFilePicker({ multiple: true, types: [{ description: "3D models", accept: { "application/octet-stream": [".obj", ".mtl", ".zip"] } }] });
+      handles = await w.showOpenFilePicker({ multiple: true, types: [{ description: "3D models", accept: { "application/octet-stream": [".obj", ".xyz", ".mtl", ".jpg", ".jpeg", ".png", ".zip"] } }] });
     } catch (e) {
       if (!(e instanceof DOMException && e.name === "AbortError")) input.current?.click();
       return;
@@ -352,7 +358,7 @@ export function App() {
   const download = (pickLocation: boolean) => {
     const cur = currentRef.current;
     const r = resultRef.current;
-    if (cur && r && !busy) void save(r.file, `${stem(cur.file.name)}.${ext()}`, pickLocation);
+    if (cur && r && !busy) void save(r.file, `${stem(cur.inspection.name)}.${ext()}`, pickLocation);
   };
 
   const downloadVisible = async (hiddenLayers: string[]) => {
@@ -360,8 +366,8 @@ export function App() {
     if (!cur) return;
     setBusy("Converting…");
     try {
-      const r = await engine.convert(engineSettings(prefsRef.current, cur.choices, cur.file, hiddenLayers), false);
-      await save(r.file, `${stem(cur.file.name)} (visible layers).${ext()}`);
+      const r = await engine.convert(engineSettings(prefsRef.current, cur.choices, hiddenLayers), false);
+      await save(r.file, `${stem(cur.inspection.name)} (visible layers).${ext()}`);
     } catch (e) {
       notifications.show({ color: "red", title: "Couldn't convert the visible layers", message: (e as Error).message });
     } finally {
@@ -374,7 +380,7 @@ export function App() {
     const r = resultRef.current;
     if (!cur || !r) return;
     const report = { ...r.report, output: { ...r.report.output, sha256: await sha256Hex(r.file) } };
-    const saved = await saveFile(new Blob([JSON.stringify(report, null, 2)], { type: "application/json" }), `${stem(cur.file.name)}.report.json`).catch(() => null);
+    const saved = await saveFile(new Blob([JSON.stringify(report, null, 2)], { type: "application/json" }), `${stem(cur.inspection.name)}.report.json`).catch(() => null);
     if (saved) setDownloaded(saved);
   };
 
@@ -384,8 +390,8 @@ export function App() {
     try {
       const names = new Set<string>();
       const files = done.map((i) => {
-        let name = `${stem(i.file.name)}.${ext()}`;
-        for (let n = 2; names.has(name.toLowerCase()); n++) name = `${stem(i.file.name)} (${n}).${ext()}`;
+        let name = `${stem(i.name)}.${ext()}`;
+        for (let n = 2; names.has(name.toLowerCase()); n++) name = `${stem(i.name)} (${n}).${ext()}`;
         names.add(name.toLowerCase());
         return { name, blob: i.result!.file };
       });
@@ -405,15 +411,17 @@ export function App() {
       if (!cur?.handle || screenRef.current !== "work") return;
       try {
         const f = await cur.handle.getFile();
-        if (f.lastModified !== cur.file.lastModified || f.size !== cur.file.size) {
-          await openSingle(f, cur.mtls, cur.handle, { reload: true, force: true, choices: cur.choices, batchItem: cur.batchItem });
+        const old = cur.job.sources[0].file;
+        if (f.lastModified !== old.lastModified || f.size !== old.size) {
+          const job: Job = { ...cur.job, sources: [{ file: f, path: cur.job.sources[0].path }, ...cur.job.sources.slice(1)] };
+          await openJob(job, cur.handle, { reload: true, force: true, choices: cur.choices, batchItem: cur.batchItem });
         }
       } catch {
         setWatching(false); // file moved or permission withdrawn
       }
     }, 2000);
     return () => clearInterval(timer);
-  }, [watching, current?.handle, openSingle]);
+  }, [watching, current?.handle, openJob]);
 
   // ---------------------------------------------------------------- global keys
   useEffect(() => {
@@ -441,7 +449,16 @@ export function App() {
   return (
     <div className="relative min-h-dvh">
       <TopBar
-        file={screen === "work" && current ? { name: current.file.name, size: current.file.size, exporter: current.inspection.hints.exporter, mtl: current.mtl?.name ?? null } : null}
+        file={
+          screen === "work" && current
+            ? {
+                name: current.inspection.name,
+                size: jobSize(current.job),
+                exporter: current.inspection.hints.exporter,
+                files: current.inspection.files.filter((f) => f.role !== "missing" && f.role !== "not_used").length,
+              }
+            : null
+        }
         offlineReady={offlineReady}
         onOpen={() => void pick()}
         onBack={screen === "work" && inBatch ? () => window.history.back() : undefined}
@@ -453,8 +470,8 @@ export function App() {
       {screen === "empty" && <DropScreen onPick={() => void pick()} />}
       {screen === "preflight" && preflight && (
         <PreflightScreen
-          name={preflight.file.name}
-          size={preflight.file.size}
+          name={preflight.name}
+          size={preflight.size}
           cliUrl={CLI_URL}
           onContinue={preflight.go}
           onCancel={() => setScreen(currentRef.current && resultRef.current ? "work" : "empty")}
@@ -462,6 +479,9 @@ export function App() {
       )}
       {screen === "loading" && <LoadingScreen name={loading.name} progress={loading.progress} />}
       {screen === "failed" && failed && <FailedScreen name={failed.name} explained={failed.explained} onPick={() => void pick()} onRetry={failed.retry} />}
+      {screen === "choose" && choice && (
+        <ChoiceScreen separate={choice.separate} onCombine={() => void openJob(choice.combined, null)} onSeparate={() => startBatch(choice.separate)} />
+      )}
       {screen === "batch" && (
         <BatchScreen
           items={batch}
@@ -471,8 +491,8 @@ export function App() {
             setPrefs({ format });
             void runBatch(batchRef.current);
           }}
-          onOpen={(item) => void openSingle(item.file, batchMtls.current, null, { batchItem: item.id })}
-          onDownload={(item) => item.result && void save(item.result.file, `${stem(item.file.name)}.${ext()}`)}
+          onOpen={(item) => void openJob(item.job, null, { batchItem: item.id })}
+          onDownload={(item) => item.result && void save(item.result.file, `${stem(item.name)}.${ext()}`)}
           onDownloadAll={() => void downloadAll()}
         />
       )}
@@ -493,6 +513,7 @@ export function App() {
               onLayerMode={(layerMode: LayerMode) => changePrefs({ layerMode })}
               onFormat={(format: Format) => changePrefs({ format })}
               onIncludeName={(includeName) => changePrefs({ includeName })}
+              onCurves={(curves) => changePrefs({ curves })}
               onDownload={download}
               onDownloadVisible={(hidden) => void downloadVisible(hidden)}
               onDownloadReport={() => void downloadReport()}
@@ -515,7 +536,7 @@ export function App() {
             <div className="panel flex flex-col items-center gap-4 border-2 border-dashed !border-accent px-12 py-12 text-center">
               <CubeArt className="size-16 text-accent" />
               <div className="font-display text-[32px] font-semibold tracking-tight">Drop to open</div>
-              <div className="text-[14px] text-fg-3">.obj, .mtl or .zip</div>
+              <div className="text-[14px] text-fg-3">.obj, .xyz, .mtl, images or .zip</div>
             </div>
           </motion.div>
         </AnimatePresence>
@@ -529,14 +550,14 @@ export function App() {
         onChange={(e) => {
           const f = e.target.files?.[0];
           e.target.value = "";
-          if (f) void addMtl(f);
+          if (f) void addSources([{ file: f, path: f.name }]);
         }}
       />
       <input
         ref={input}
         type="file"
         multiple
-        accept=".obj,.mtl,.zip"
+        accept=".obj,.xyz,.mtl,.jpg,.jpeg,.png,.zip"
         hidden
         onChange={(e) => {
           const files = Array.from(e.target.files ?? []);

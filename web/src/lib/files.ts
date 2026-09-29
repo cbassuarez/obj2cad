@@ -1,5 +1,6 @@
-// Sorting what the user dropped or picked: models, material libraries, and .zip files
-// (expanded here, inflating only the entries that are used).
+// Sorting what the user dropped or picked into drawings. A .zip or a folder is one
+// drawing; so are loose files that include a point cloud or a texture. Several loose
+// models on their own can be combined or converted separately.
 import { unzip, zip, type AsyncZippable } from "fflate";
 
 const ext = (name: string) => name.slice(name.lastIndexOf(".") + 1).toLowerCase();
@@ -7,46 +8,108 @@ const ext = (name: string) => name.slice(name.lastIndexOf(".") + 1).toLowerCase(
 export const baseName = (path: string) => path.split(/[\\/]/).pop() ?? path;
 export const stem = (name: string) => baseName(name).replace(/\.[^.]+$/, "");
 
-export interface Picked {
-  objs: File[];
-  mtls: File[];
-  /** Files that aren't models or materials. */
-  ignored: string[];
+const MODEL = new Set(["obj"]);
+const CLOUD = new Set(["xyz"]);
+const IMAGE = new Set(["jpg", "jpeg", "png"]);
+const USED = new Set(["obj", "xyz", "mtl", "jpg", "jpeg", "png"]);
+
+/** One file of a drawing, and its path (folders kept, for display and matching). */
+export interface Source {
+  file: File;
+  path: string;
 }
 
-const USED = new Set(["obj", "mtl"]);
+/** The files of one drawing. `name` names it when it holds several models or clouds. */
+export interface Job {
+  name: string;
+  sources: Source[];
+}
 
-/** Expand .zip files and sort the rest by type. */
-export async function gather(files: File[]): Promise<Picked> {
-  const flat: File[] = [];
+export type Plan =
+  | { kind: "none"; ignored: string[] }
+  /** Only material libraries: they go to the open drawing. */
+  | { kind: "materials"; mtls: Source[] }
+  | { kind: "one"; job: Job }
+  | { kind: "several"; jobs: Job[] }
+  /** Several loose models and nothing else: one drawing, or one each. */
+  | { kind: "choose"; combined: Job; separate: Job[] };
+
+const hidden = (path: string) => path.split(/[\\/]/).some((p) => p.startsWith(".") || p === "__MACOSX");
+
+/** The path a dropped or picked file came with (folders when a folder was dropped). */
+function pathOf(f: File): string {
+  const p = (f as File & { path?: string }).path || f.webkitRelativePath || f.name;
+  return p.replace(/^\.?\//, "");
+}
+
+/** Material libraries an OBJ names (read from its first 256 KB, where `mtllib` lives). */
+async function namedLibraries(f: File): Promise<string[]> {
+  const head = await f.slice(0, 256 * 1024).text();
+  const names: string[] = [];
+  for (const m of head.matchAll(/^[ \t]*mtllib[ \t]+(.+?)[ \t]*$/gm)) {
+    const rest = m[1];
+    const toks = rest.split(/\s+/);
+    names.push(...(toks.every((t) => t.toLowerCase().endsWith(".mtl")) ? toks : [rest]).map((n) => baseName(n).toLowerCase()));
+  }
+  return names;
+}
+
+/** Expand .zip files and folders, and decide how many drawings to make. */
+export async function plan(files: File[]): Promise<Plan> {
   const ignored: string[] = [];
+  const jobs: Job[] = [];
+  const loose: Source[] = [];
+  const folders = new Map<string, Source[]>();
   for (const f of files) {
+    const path = pathOf(f);
+    if (hidden(path)) continue;
     if (ext(f.name) === "zip") {
       const { used, skipped } = await unzipUsed(f);
-      flat.push(...used);
       ignored.push(...skipped);
-    } else if (USED.has(ext(f.name))) flat.push(f);
-    else ignored.push(f.name);
+      if (used.length) jobs.push({ name: f.name, sources: used });
+      continue;
+    }
+    if (!USED.has(ext(f.name))) {
+      ignored.push(f.name);
+      continue;
+    }
+    const top = path.includes("/") ? path.split("/")[0] : null;
+    if (top) folders.set(top, [...(folders.get(top) ?? []), { file: f, path }]);
+    else loose.push({ file: f, path });
   }
-  return {
-    objs: unique(flat.filter((f) => ext(f.name) === "obj")),
-    mtls: flat.filter((f) => ext(f.name) === "mtl"),
-    ignored,
-  };
+  for (const [name, sources] of folders) jobs.push({ name, sources });
+
+  const models = loose.filter((s) => MODEL.has(ext(s.path)));
+  const extras = loose.filter((s) => CLOUD.has(ext(s.path)) || IMAGE.has(ext(s.path)));
+  const mtls = loose.filter((s) => ext(s.path) === "mtl");
+  if (loose.length && (models.length || extras.length)) {
+    if (models.length > 1 && !extras.length && !jobs.length) {
+      const separate = await Promise.all(
+        models.map(async (m) => {
+          const named = await namedLibraries(m.file);
+          const libs = mtls.filter((l) => named.includes(baseName(l.path).toLowerCase()));
+          return { name: "", sources: [m, ...libs] };
+        }),
+      );
+      return { kind: "choose", combined: { name: "", sources: loose }, separate };
+    }
+    jobs.push({ name: "", sources: loose });
+  } else if (mtls.length && !jobs.length) {
+    return { kind: "materials", mtls };
+  }
+  if (!jobs.length) return { kind: "none", ignored };
+  return jobs.length === 1 ? { kind: "one", job: jobs[0] } : { kind: "several", jobs };
 }
 
-/** Distinct display names for files that share one (same name in different folders). */
-function unique(files: File[]): File[] {
-  const seen = new Map<string, number>();
-  return files.map((f) => {
-    const key = f.name.toLowerCase();
-    const n = (seen.get(key) ?? 0) + 1;
-    seen.set(key, n);
-    return n === 1 ? f : new File([f], `${stem(f.name)} (${n}).${ext(f.name)}`, { lastModified: f.lastModified, type: f.type });
-  });
+/** A job's display name before the engine has read it: the zip/folder, or the first model. */
+export function jobName(job: Job): string {
+  if (job.name) return job.name;
+  const geometry = job.sources.filter((s) => MODEL.has(ext(s.path)) || CLOUD.has(ext(s.path)));
+  const first = [...geometry].sort((a, b) => baseName(a.path).toLowerCase().localeCompare(baseName(b.path).toLowerCase()))[0];
+  return first ? baseName(first.path) : "drawing";
 }
 
-async function unzipUsed(archive: File): Promise<{ used: File[]; skipped: string[] }> {
+async function unzipUsed(archive: File): Promise<{ used: Source[]; skipped: string[] }> {
   const data = new Uint8Array(await archive.arrayBuffer());
   const skipped: string[] = [];
   const entries = await new Promise<Record<string, Uint8Array>>((resolve, reject) =>
@@ -54,9 +117,8 @@ async function unzipUsed(archive: File): Promise<{ used: File[]; skipped: string
       data,
       {
         filter: (f) => {
-          const hidden = f.name.startsWith("__MACOSX/") || baseName(f.name).startsWith(".") || f.name.endsWith("/");
-          const keep = !hidden && USED.has(ext(f.name));
-          if (!keep && !hidden) skipped.push(baseName(f.name));
+          const keep = !hidden(f.name) && !f.name.endsWith("/") && USED.has(ext(f.name));
+          if (!keep && !hidden(f.name) && !f.name.endsWith("/")) skipped.push(baseName(f.name));
           return keep;
         },
       },
@@ -64,15 +126,11 @@ async function unzipUsed(archive: File): Promise<{ used: File[]; skipped: string
     ),
   );
   // Entries keep the archive's date, so repeated conversions are identical.
-  const used = Object.entries(entries).map(([path, bytes]) => new File([bytes as Uint8Array<ArrayBuffer>], baseName(path), { lastModified: archive.lastModified }));
+  const used = Object.entries(entries).map(([path, bytes]) => ({
+    file: new File([bytes as Uint8Array<ArrayBuffer>], baseName(path), { lastModified: archive.lastModified }),
+    path,
+  }));
   return { used, skipped };
-}
-
-/** The material library an OBJ names (by file name, ignoring folders and case); with a
- *  single model and a single library, that one. */
-export function pickMtl(mtllibs: string[], mtls: File[], onlyModel: boolean): File | null {
-  const wanted = new Set(mtllibs.map((l) => baseName(l).toLowerCase()));
-  return mtls.find((m) => wanted.has(m.name.toLowerCase())) ?? (onlyModel && mtls.length === 1 ? mtls[0] : null);
 }
 
 /** A .zip of finished files. Text (DXF) is compressed; DWG is already compressed. */

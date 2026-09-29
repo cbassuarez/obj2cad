@@ -26,7 +26,7 @@ export function DropScreen({ onPick }: { onPick: () => void }) {
       >
         <div className="flex flex-col items-center gap-3 text-center">
           <h1 className="font-display text-[clamp(36px,6vw,56px)] leading-none font-semibold tracking-[-0.035em]">OBJ to DWG / DXF</h1>
-          <p className="max-w-[560px] text-[16px] text-fg-2">Drop an .obj file, with its .mtl if it has one. Several files or a .zip work too.</p>
+          <p className="max-w-[560px] text-[16px] text-fg-2">Drop an .obj, or a .zip with its materials, textures and point clouds.</p>
         </div>
 
         <div className="relative w-full">

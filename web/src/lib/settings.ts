@@ -46,9 +46,11 @@ export interface Prefs {
   houseUnits: Units | null;
   /** Record the source file name in the drawing's properties. */
   includeName: boolean;
+  /** Also write curved surfaces recognized in the mesh. */
+  curves: boolean;
 }
 
-export const DEFAULT_PREFS: Prefs = { format: "dxf", layerMode: "objects", houseUnits: null, includeName: true };
+export const DEFAULT_PREFS: Prefs = { format: "dxf", layerMode: "objects", houseUnits: null, includeName: true, curves: false };
 const PREFS_KEY = "obj2cad.prefs.v1";
 
 const oneOf = <T extends string>(values: readonly { value: T }[], v: unknown, fallback: T): T =>
@@ -63,6 +65,7 @@ export function loadPrefs(storage: Pick<Storage, "getItem"> | null = safeStorage
       layerMode: oneOf(LAYER_MODES, raw.layerMode, DEFAULT_PREFS.layerMode),
       houseUnits: raw.houseUnits == null ? null : oneOf(UNITS, raw.houseUnits, "unitless") === "unitless" ? null : (raw.houseUnits as Units),
       includeName: typeof raw.includeName === "boolean" ? raw.includeName : DEFAULT_PREFS.includeName,
+      curves: typeof raw.curves === "boolean" ? raw.curves : DEFAULT_PREFS.curves,
     };
   } catch {
     return DEFAULT_PREFS;
@@ -103,11 +106,12 @@ export interface EngineSettings {
   keep_loose_points: boolean;
   exclude_layers: string[];
   format: Format;
-  created_unix: number | null;
   include_name: boolean;
+  curves: boolean;
 }
 
-export function engineSettings(prefs: Prefs, choices: FileChoices, file: { lastModified: number } | null, exclude: string[] = []): EngineSettings {
+/** The drawing's date comes from its files (the newest one used), set by the engine. */
+export function engineSettings(prefs: Prefs, choices: FileChoices, exclude: string[] = []): EngineSettings {
   return {
     units: choices.units,
     default_units: prefs.houseUnits,
@@ -116,14 +120,14 @@ export function engineSettings(prefs: Prefs, choices: FileChoices, file: { lastM
     keep_loose_points: choices.keepLoose,
     exclude_layers: exclude,
     format: prefs.format,
-    // Whole seconds, like the command-line tool, so both write identical files.
-    created_unix: file && file.lastModified > 0 ? Math.floor(file.lastModified / 1000) : null,
     include_name: prefs.includeName,
+    curves: prefs.curves,
   };
 }
 
-/** Settings that move geometry: a change needs a new parity hash. */
+/** Settings that move geometry: a change needs a new parity hash. (Curved surfaces are
+ *  written next to the mesh; the parity hash covers the mesh.) */
 export const geometryKey = (s: EngineSettings) => JSON.stringify([s.up_axis, s.keep_loose_points, s.exclude_layers]);
 
 /** Settings that change what the preview shows. Orientation is applied by rotating it. */
-export const previewKey = (s: EngineSettings) => JSON.stringify([s.layer_mode, s.keep_loose_points, s.exclude_layers]);
+export const previewKey = (s: EngineSettings) => JSON.stringify([s.layer_mode, s.keep_loose_points, s.exclude_layers, s.curves]);

@@ -57,6 +57,8 @@ export function Dock({
   onOrtho,
   onFit,
   onFormat,
+  curves,
+  onCurves,
   onDownload,
   onAnother,
 }: {
@@ -78,6 +80,9 @@ export function Dock({
   onOrtho: (on: boolean) => void;
   onFit: () => void;
   onFormat: (f: Format) => void;
+  /** Also write recognized curved surfaces. */
+  curves: boolean;
+  onCurves: (on: boolean) => void;
   onDownload: (pick: boolean) => void;
   onAnother: () => void;
 }) {
@@ -164,6 +169,10 @@ export function Dock({
                   {f.beta && <span className="ml-1.5 rounded-[2px] bg-warn-soft px-1 py-px text-[10.5px] font-medium text-warn">beta</span>}
                 </Menu.Item>
               ))}
+              <Menu.Divider />
+              <Menu.Item onClick={() => onCurves(!curves)} rightSection={curves ? <Check className="size-3.5" /> : null}>
+                Curved surfaces
+              </Menu.Item>
               {canPickSaveLocation() && (
                 <>
                   <Menu.Divider />

@@ -6,10 +6,14 @@ ezdxf (MIT), whose output is tested against AutoCAD and BricsCAD. We then:
 * remove ezdxf-specific bookkeeping (EZDXF appid, EZDXF_META dictionary),
 * make it deterministic (fixed timestamps, GUIDs filled in by the writer),
 * add the MESH class AutoCAD declares for AcDbSubDMesh entities,
-* insert @@MARKERS@@ the Rust writer fills in.
+* insert @@MARKERS@@ the Rust writer fills in (ACDSDATA: ACIS data, only when needed).
+
+Also writes the ACDSDATA section's schema preamble (the part before the per-body ACIS
+records), taken from ezdxf's default, which Autodesk's viewer accepts.
 
 Run:  python tools/dxf-template/gen_template.py
-Output: crates/obj2cad-dxf/templates/r2018.dxf (committed; regenerate only on purpose).
+Output: crates/obj2cad-dxf/templates/r2018.dxf and acdsdata.dxf (committed; regenerate
+only on purpose).
 """
 
 from __future__ import annotations
@@ -135,6 +139,7 @@ def main() -> None:
                 "  0\nCLASS\n  1\nMESH\n  2\nAcDbSubDMesh\n  3\nObjectDBX Classes\n"
                 " 90\n4095\n 91\n0\n280\n0\n281\n1"
             )
+            out.append("@@CLASSES@@")  # SURFACE, when the drawing has surfaces
             i += 1
             continue
         if (c, v) == ("2", "LAYER") and pairs[i - 1] == ("0", "TABLE"):
@@ -148,6 +153,9 @@ def main() -> None:
             continue
         if (c, v) == ("0", "ENDTAB") and "@@LAYERCOUNT@@" in out and "@@LAYERS@@" not in out:
             out.append("@@LAYERS@@")
+        if (c, v) == ("0", "EOF"):
+            # ACIS data of surfaces and solids (DXF R2013+), written only when there are any.
+            out.append("@@ACDSDATA@@")
         if (c, v) == ("2", "ENTITIES"):
             out.append(f"{c:>3}\n{v}")
             out.append("@@ENTITIES@@")
@@ -161,7 +169,7 @@ def main() -> None:
         list(HEADER_MARKERS.values())
         + list(DATE_MARKERS.values())
         + list(VPORT_MARKERS.values())
-        + ["@@CUSTOMPROPERTIES@@", "@@LAYERS@@", "@@LAYERCOUNT@@", "@@ENTITIES@@"]
+        + ["@@CUSTOMPROPERTIES@@", "@@LAYERS@@", "@@LAYERCOUNT@@", "@@ENTITIES@@", "@@ACDSDATA@@", "@@CLASSES@@"]
     )
     for marker in markers:
         assert text.count(marker) == 1, marker
@@ -170,5 +178,19 @@ def main() -> None:
     print(f"wrote {OUT} ({len(text)} bytes); removed ezdxf handles {sorted(ezdxf_handles)}")
 
 
+def acdsdata() -> None:
+    from ezdxf.sections.acdsdata import DEFAULT_SETUP
+
+    lines = DEFAULT_SETUP.strip().split("\n")
+    pairs = [(lines[i].strip(), lines[i + 1]) for i in range(0, len(lines) - 1, 2)]
+    assert pairs[:2] == [("0", "SECTION"), ("2", "ACDSDATA")]
+    if pairs[-1] == ("0", "ENDSEC"):
+        pairs = pairs[:-1]  # the writer adds records, then ENDSEC
+    out = OUT.with_name("acdsdata.dxf")
+    out.write_text("\n".join(f"{c:>3}\n{v}" for c, v in pairs) + "\n", newline="\n")
+    print(f"wrote {out}")
+
+
 if __name__ == "__main__":
     main()
+    acdsdata()

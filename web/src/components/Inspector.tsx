@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Check, ChevronRight, Copy, ExternalLink, FileText, Palette, TriangleAlert } from "lucide-react";
+import { Check, ChevronRight, CircleDot, Copy, ExternalLink, FileText, Palette, TriangleAlert } from "lucide-react";
 import { AnimatePresence, motion } from "motion/react";
 import { Button } from "@/components/ui/button";
 import type { Report } from "@/lib/engine";
@@ -206,7 +206,7 @@ export function Inspector({
   onDownloadReport: () => void;
 }) {
   const s = summarize(report);
-  const layers = report.layers.filter((l) => l.faces + l.polylines + l.points > 0).length;
+  const layers = report.layers.filter((l) => l.faces + l.polylines + l.points + l.surfaces > 0).length;
 
   return (
     <aside className="panel pointer-events-auto flex max-h-full min-h-0 w-full flex-col overflow-hidden" aria-label="Result">
@@ -219,8 +219,28 @@ export function Inspector({
           <Stat value={bytes(report.output.bytes)} label={`${formatInfo(format).label.replace(" (binary)", "")} file`} />
         </div>
 
-        {(s.leftOut.length > 0 || s.loosePoints || s.needsMtl || s.notIncluded.length > 0) && (
+        {(s.leftOut.length > 0 ||
+          s.loosePoints ||
+          s.needsMtl ||
+          s.notIncluded.length > 0 ||
+          s.missing.length > 0 ||
+          s.unreadable.length > 0 ||
+          s.notUsed.length > 0 ||
+          s.textureColors ||
+          s.curves.length > 0) && (
           <ul className="m-0 flex list-none flex-col gap-1.5 px-5 py-4">
+            {s.missing.length > 0 && (
+              <Row tone="warn">
+                <TriangleAlert className="size-4 shrink-0 text-warn" />
+                <span className="min-w-0 flex-1">Missing: {s.missing.join(", ")}</span>
+              </Row>
+            )}
+            {s.unreadable.length > 0 && (
+              <Row tone="warn">
+                <TriangleAlert className="size-4 shrink-0 text-warn" />
+                <span className="min-w-0 flex-1">Unreadable: {s.unreadable.join(", ")}</span>
+              </Row>
+            )}
             {s.leftOut.length > 0 && (
               <Row tone="warn">
                 <TriangleAlert className="size-4 shrink-0 text-warn" />
@@ -246,7 +266,20 @@ export function Inspector({
                 </Button>
               </Row>
             )}
+            {s.curves.length > 0 && (
+              <Row>
+                <CircleDot className="size-4 shrink-0 text-accent" />
+                <span className="min-w-0 flex-1">Curved surfaces: {s.curves.join(", ")}</span>
+              </Row>
+            )}
+            {s.textureColors && (
+              <Row>
+                <Palette className="size-4 shrink-0 text-accent" />
+                <span className="min-w-0 flex-1">Texture colors, approximate</span>
+              </Row>
+            )}
             {s.notIncluded.length > 0 && <Row tone="muted">Not included: {s.notIncluded.join(", ")}</Row>}
+            {s.notUsed.length > 0 && <Row tone="muted">Not used: {s.notUsed.join(", ")}</Row>}
           </ul>
         )}
 

@@ -13,4 +13,7 @@ path = "src/main.rs"
 obj2cad-core.workspace = true
 obj2cad-dxf.workspace = true
 obj2cad-dwg.workspace = true
+obj2cad-acis.workspace = true
+obj2cad-curves.workspace = true
 serde_json.workspace = true
+zip = { version = "7", default-features = false, features = ["deflate-flate2"] }

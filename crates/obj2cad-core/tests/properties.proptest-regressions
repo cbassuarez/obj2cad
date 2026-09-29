@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 9c5c1c834a608426f0ed4761515cad3d8f5a51b54661c536a271c055da6d890e # shrinks to m = Model { vertices: [[(0.0, "0.0"), (0.0, "0.0"), (-5.44670339035692e299, "-5.44670339035692e299")], [(-0.0, "-0.000000"), (-9.271016010329358e-188, "-9.271016010329358e-188"), (-3.757708633411237e299, "-3.757708633411237e299")], [(-0.0, "-0.000000"), (1.3379991889626598e299, "1.3379991889626598e299"), (-0.0, "-0.000000")]], faces: [] }, line = Index(1576091411171610963), hidden = "\u{feff}"

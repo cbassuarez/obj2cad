@@ -17,6 +17,8 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 obj2cad-core.workspace = true
 obj2cad-dxf.workspace = true
+obj2cad-curves.workspace = true
+obj2cad-acis.workspace = true
 obj2cad-dwg = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true

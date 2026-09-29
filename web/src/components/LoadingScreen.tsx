@@ -44,7 +44,6 @@ export function PreflightScreen({ name, size, onContinue, onCancel, cliUrl }: { 
         <div id="preflight-title" className="text-[16px] font-semibold">
           {name} is {bytes(size)}
         </div>
-        <p className="m-0 text-[14px] text-fg-2">Files this large convert more reliably with the command-line version.</p>
         <div className="flex flex-wrap gap-3">
           <Button variant="primary" asChild>
             <a href={cliUrl} target="_blank" rel="noreferrer">

@@ -5,6 +5,7 @@
 //! "Strict" means anything whose meaning is ambiguous (bad numbers, out-of-range
 //! indices, non-finite values) is a hard error, never a guess.
 
+pub mod bundle;
 pub mod convert;
 pub mod diag;
 pub mod hash;
@@ -14,8 +15,12 @@ pub mod obj;
 pub mod output;
 pub mod report;
 pub mod synth;
+pub mod texture;
+pub mod xyz;
 
-pub use convert::{convert, CadModel, LayerMode, Omissions, Options, Units, UpAxis};
+pub use convert::{
+    convert, convert_with, CadModel, LayerMode, Materials, Omissions, Options, Units, UpAxis,
+};
 pub use diag::{Code, Diagnostic, Severity};
 pub use obj::{parse, parse_with_progress, ErrorKind, ObjDocument, ParseError, ParseIssue};
 pub use output::Meta;

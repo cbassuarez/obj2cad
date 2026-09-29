@@ -23,9 +23,9 @@ export function LayersCard({
   onToggle: (layer: number) => void;
   onDownloadVisible: () => void;
 }) {
-  const rows = report.layers.map((l, i) => ({ ...l, i })).filter((l) => l.faces + l.polylines + l.points > 0);
-  const total = (l: (typeof rows)[number]) => l.faces + l.polylines + l.points;
-  const onlyFaces = report.output.polylines + report.output.points === 0;
+  const rows = report.layers.map((l, i) => ({ ...l, i })).filter((l) => l.faces + l.polylines + l.points + l.surfaces > 0);
+  const total = (l: (typeof rows)[number]) => l.faces + l.polylines + l.points + l.surfaces;
+  const onlyFaces = report.output.polylines + report.output.points + (report.curves?.length ?? 0) === 0;
   const shown = rows.filter((l) => !hidden.has(l.i)).length;
 
   return (
