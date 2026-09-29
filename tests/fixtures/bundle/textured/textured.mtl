@@ -1,0 +1,12 @@
+newmtl stripes
+Kd 1 1 1
+map_Kd stripes.png
+newmtl edge
+Kd 1 1 1
+map_Kd -clamp on stripes.png
+newmtl scaled
+Kd 1 1 1
+map_Kd -s 0.25 0.25 1 -o 0 0.75 stripes.png
+newmtl leaf
+Kd 1 1 1
+map_Kd leaf.png

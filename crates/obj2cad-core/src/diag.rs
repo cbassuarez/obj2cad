@@ -41,8 +41,11 @@ pub enum Code {
     NonUtf8Text,
     /// Element referenced more than one group; only the first names its layer.
     MultipleGroups,
-    /// Per-vertex colors are not written (DXF entities carry one color).
+    /// Per-vertex colors that faces or lines can't show (a texture wins; or not every
+    /// corner has a color).
     VertexColorsDropped,
+    /// Faces and lines take the average of their vertices' colors (one color per entity).
+    VertexColorsAveraged,
     /// Materials referenced but no MTL was supplied.
     MaterialColorsUnavailable,
     /// An object/group name had to be changed to be a valid, unique layer name.

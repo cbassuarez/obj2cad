@@ -10,7 +10,11 @@ For every OBJ in the given folders this script:
 4. checks **geometry**: the obj2cad-parity-v1 hash (see crates/obj2cad-core/src/hash.rs)
    computed from the OBJ and from the DXF must both equal the hash in the Rust report;
 5. checks **structure**: every face, line and point must be on the expected layer with the
-   expected color, computed here from the OBJ and MTL with independently written rules.
+   expected color, computed here from the OBJ and MTL with independently written rules;
+6. checks **approximate colors** against references computed here: a face colored from
+   its vertices' colors against their average in linear light, and a face colored from a
+   PNG texture (decoded by this script) against a dense average of the texture over the
+   face. JPEG textures are only checked for having some color.
 
 Files under a folder named ``invalid`` must be rejected by the CLI *and* by this reader.
 
@@ -32,6 +36,7 @@ import sys
 import tempfile
 import time
 import unicodedata
+import zlib
 from collections import Counter
 from pathlib import Path
 
@@ -73,7 +78,8 @@ def read_obj(path: Path) -> dict:
     pos: list[tuple[float, float, float]] = []
     texts: list[tuple[str, str, str]] = []  # the coordinates as written
     colors: list = []  # per vertex: (r, g, b) 0..255 or None
-    elements = []  # (kind, [vertex indices], object, group, material, every corner has a vt)
+    elements = []  # (kind, [vertex indices], object, group, material, [vt per corner] or None)
+    texcoords: list[tuple[float, float]] = []
     nvt = nvn = 0
     forward = []
     obj = grp = mat = None
@@ -140,6 +146,9 @@ def read_obj(path: Path) -> dict:
             pending = None
         elif kw == "vt":
             nvt += 1
+            # Stored as single precision, like the engine.
+            uv = [f32(float(a)) for a in args[:2]]
+            texcoords.append(tuple(uv + [0.0] * (2 - len(uv))))
         elif kw == "vn":
             nvn += 1
         elif kw == "o":
@@ -151,15 +160,14 @@ def read_obj(path: Path) -> dict:
         elif kw == "mtllib":
             mtllibs += args if args and all(a.lower().endswith(".mtl") for a in args) else ([body.split(None, 1)[1]] if len(parts) > 1 else [])
         elif kw in ("f", "fo", "l", "p"):
-            idx, uv_corners = [], 0
+            idx, uvs = [], []
             for a in args:
                 comps = a.split("/")
                 if len(comps) > 3 or not comps[0]:
                     raise ObjError("malformed reference")
                 idx.append(ref(comps[0], len(pos), 0))
                 if len(comps) > 1 and comps[1]:
-                    ref(comps[1], nvt, 1)
-                    uv_corners += 1
+                    uvs.append(ref(comps[1], nvt, 1))
                 if len(comps) > 2 and comps[2]:
                     ref(comps[2], nvn, 2)
             kind = {"f": "f", "fo": "f", "l": "l", "p": "p"}[kw]
@@ -167,7 +175,7 @@ def read_obj(path: Path) -> dict:
                 continue  # skipped (reported by the engine)
             if kind == "l" and len(idx) < 2 or kind == "p" and not idx:
                 raise ObjError("element too short")
-            elements.append((kind, idx, obj, grp, mat, uv_corners == len(idx)))
+            elements.append((kind, idx, obj, grp, mat, uvs if len(uvs) == len(idx) else None))
     totals = [len(pos), nvt, nvn]
     for i, slot in forward:
         if i >= totals[slot]:
@@ -175,7 +183,7 @@ def read_obj(path: Path) -> dict:
     for sp in splines:
         sp["weights"] = [weights.get(i, 1.0) for i in sp["cps"]] if sp["rational"] else None
     return {"positions": pos, "texts": texts, "colors": colors, "elements": elements, "mtllibs": mtllibs,
-            "splines": splines, "curves_left_out": curv_count - len(splines)}
+            "texcoords": texcoords, "splines": splines, "curves_left_out": curv_count - len(splines)}
 
 
 def spline_of(p: dict, cstype, deg):
@@ -218,6 +226,133 @@ def byte(c: float) -> int:
     return int(math.floor(min(max(c, 0.0), 1.0) * 255.0 + 0.5))
 
 
+# ---------------------------------------------------------------- reference colors
+def to_linear(c: int) -> float:
+    x = c / 255.0
+    return x / 12.92 if x <= 0.04045 else ((x + 0.055) / 1.055) ** 2.4
+
+
+def to_srgb(lin: float) -> float:
+    """Linear light → sRGB, 0..255 (unrounded)."""
+    lin = min(max(lin, 0.0), 1.0)
+    x = lin * 12.92 if lin <= 0.0031308 else 1.055 * lin ** (1 / 2.4) - 0.055
+    return x * 255.0
+
+
+def mix(colors) -> tuple:
+    """The average of 8-bit sRGB colors, taken in linear light."""
+    n = len(colors)
+    return tuple(to_srgb(sum(to_linear(c[k]) for c in colors) / n) for k in range(3))
+
+
+def read_png(path: Path):
+    """(width, height, rgb rows, alpha rows) for a non-interlaced PNG, or None for anything
+    else. Written from the PNG specification, independently of the engine's decoder."""
+    data = path.read_bytes()
+    if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return None
+    pos, idat, palette, trns = 8, b"", None, None
+    while pos < len(data):
+        n, kind = struct.unpack(">I4s", data[pos:pos + 8])
+        body = data[pos + 8:pos + 8 + n]
+        pos += 12 + n
+        if kind == b"IHDR":
+            w, h, depth, ctype, _, _, interlace = struct.unpack(">IIBBBBB", body)
+        elif kind == b"PLTE":
+            palette = [tuple(body[i:i + 3]) for i in range(0, len(body), 3)]
+        elif kind == b"tRNS":
+            trns = body
+        elif kind == b"IDAT":
+            idat += body
+    if interlace or (ctype == 3 and depth != 8) or (ctype != 3 and depth not in (8, 16)):
+        return None
+    channels = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}[ctype]
+    bpp = channels * depth // 8
+    stride = w * bpp
+    raw = zlib.decompress(idat)
+    rows, prev = [], bytearray(stride)
+    for y in range(h):
+        f = raw[y * (stride + 1)]
+        line = bytearray(raw[y * (stride + 1) + 1:(y + 1) * (stride + 1)])
+        for i in range(stride):
+            a = line[i - bpp] if i >= bpp else 0
+            b = prev[i]
+            c = prev[i - bpp] if i >= bpp else 0
+            if f == 1:
+                line[i] = (line[i] + a) & 255
+            elif f == 2:
+                line[i] = (line[i] + b) & 255
+            elif f == 3:
+                line[i] = (line[i] + (a + b) // 2) & 255
+            elif f == 4:
+                pa, pb, pc = abs(b - c), abs(a - c), abs(a + b - 2 * c)
+                line[i] = (line[i] + (a if pa <= pb and pa <= pc else b if pb <= pc else c)) & 255
+        rows.append(bytes(line))
+        prev = line
+    rgb, alpha = [], []
+    for line in rows:
+        px = [line[i:i + bpp:depth // 8] for i in range(0, stride, bpp)]  # high bytes
+        if ctype == 3:
+            rgb.append([palette[p[0]] for p in px])
+            alpha.append([trns[p[0]] if trns and p[0] < len(trns) else 255 for p in px])
+        elif ctype in (0, 4):
+            rgb.append([(p[0],) * 3 for p in px])
+            alpha.append([p[1] if ctype == 4 else 255 for p in px])
+        else:
+            rgb.append([tuple(p[:3]) for p in px])
+            alpha.append([p[3] if ctype == 6 else 255 for p in px])
+    return w, h, rgb, alpha
+
+
+def texture_reference(image, uvs, scale, offset, clamp) -> tuple | None:
+    """A face's texture color: the texture averaged over the face in linear light, from a
+    grid of at least 48 × 48 samples per triangle and 36 per texel (bilinear, transparent
+    parts left out)."""
+    w, h, rgb, alpha = image
+    uv = [(u * scale[0] + offset[0], v * scale[1] + offset[1]) for u, v in uvs]
+
+    def texel(x, y):
+        x = min(max(x, 0), w - 1) if clamp else x % w
+        y = min(max(y, 0), h - 1) if clamp else y % h
+        a = alpha[y][x] / 255.0
+        return [to_linear(c) * a for c in rgb[y][x]], a
+
+    def sample(u, v):
+        if clamp:
+            u, v = min(max(u, 0.0), 1.0), min(max(v, 0.0), 1.0)
+        else:
+            u, v = u - math.floor(u), v - math.floor(v)
+        x, y = u * w - 0.5, (1.0 - v) * h - 0.5
+        x0, y0 = math.floor(x), math.floor(y)
+        fx, fy = x - x0, y - y0
+        c, a = [0.0] * 3, 0.0
+        for dx, dy, wt in ((0, 0, (1 - fx) * (1 - fy)), (1, 0, fx * (1 - fy)), (0, 1, (1 - fx) * fy), (1, 1, fx * fy)):
+            ci, ai = texel(x0 + dx, y0 + dy)
+            c = [c[k] + ci[k] * wt for k in range(3)]
+            a += ai * wt
+        return c, a
+
+    total, weight = [0.0] * 3, 0.0
+    for k in range(1, len(uv) - 1):
+        (au, av), (bu, bv), (cu, cv) = uv[0], uv[k], uv[k + 1]
+        area = abs((bu - au) * (cv - av) - (bv - av) * (cu - au)) / 2
+        n = max(48, math.ceil(6 * math.sqrt(area * w * h)))
+        for i in range(n):
+            for j in range(n - i):
+                for s, t in (((i + 1 / 3) / n, (j + 1 / 3) / n), ((i + 2 / 3) / n, (j + 2 / 3) / n)):
+                    if s + t > 1:
+                        continue
+                    c, a = sample(au + (bu - au) * s + (cu - au) * t, av + (bv - av) * s + (cv - av) * t)
+                    total = [total[q] + c[q] * area for q in range(3)]
+                    weight += a * area
+    if weight == 0:
+        c, a = sample(sum(p[0] for p in uv) / len(uv), sum(p[1] for p in uv) / len(uv))
+        if a == 0:
+            return None
+        total, weight = c, a
+    return tuple(to_srgb(t / weight) for t in total)
+
+
 # ---------------------------------------------------------------- independent XYZ reader
 def read_xyz(path: Path) -> dict:
     """An ASCII point cloud, as this harness reads the column rules in xyz.rs's docs."""
@@ -240,7 +375,7 @@ def read_xyz(path: Path) -> dict:
                 continue  # column names
         rows.append(t)
     if not rows:
-        return {"positions": [], "texts": [], "colors": [], "elements": [], "mtllibs": [], "splines": [], "curves_left_out": 0}
+        return {"positions": [], "texts": [], "colors": [], "elements": [], "mtllibs": [], "texcoords": [], "splines": [], "curves_left_out": 0}
     sep = ";" if ";" in rows[0] else ("," if "," in rows[0] and len(rows[0].split()) < 3 else None)
     split = (lambda r: [x.strip() for x in r.split(sep)]) if sep else (lambda r: r.split())
     table = [split(r) for r in rows]
@@ -279,13 +414,14 @@ def read_xyz(path: Path) -> dict:
     colors = [tuple(int(v) for v in r[rgb_at:rgb_at + 3]) if rgb_at is not None else None for r in vals]
     stem = path.stem
     texts = [tuple(r[:3]) for r in table]
-    return {"positions": pos, "texts": texts, "colors": colors, "elements": [("p", list(range(len(pos))), stem, None, None, False)], "mtllibs": [],
-            "splines": [], "curves_left_out": 0}
+    return {"positions": pos, "texts": texts, "colors": colors, "elements": [("p", list(range(len(pos))), stem, None, None, None)], "mtllibs": [],
+            "texcoords": [], "splines": [], "curves_left_out": 0}
 
 
-def read_mtl(path: Path) -> tuple[dict, dict]:
-    """Material colors (0..255) and texture file names (without folders)."""
-    colors, textures, current = {}, {}, None
+def read_mtl(path: Path) -> tuple[dict, dict, dict]:
+    """Material colors (0..255), texture file names (without folders), and each texture's
+    options: (scale, offset, clamp)."""
+    colors, textures, options, current = {}, {}, {}, None
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         parts = line.strip().split(None, 1)
         if not parts:
@@ -304,6 +440,7 @@ def read_mtl(path: Path) -> tuple[dict, dict]:
                 colors.setdefault(current, tuple(byte(c) for c in vals))
         elif kw == "map_Kd" and current is not None:
             toks, i = rest.split(), 0
+            opts = {"-s": [1.0, 1.0], "-o": [0.0, 0.0], "-clamp": False}
             while i < len(toks) and toks[i].startswith("-") and len(toks[i]) > 1:
                 opt = toks[i]
                 i += 1
@@ -311,15 +448,21 @@ def read_mtl(path: Path) -> tuple[dict, dict]:
                     n = 0
                     while n < 3 and i + 1 < len(toks):
                         try:
-                            float(toks[i])
+                            x = float(toks[i])
                         except ValueError:
                             break
+                        if opt in opts and n < 2 and math.isfinite(x):
+                            opts[opt][n] = x
                         i, n = i + 1, n + 1
+                elif opt == "-clamp":
+                    opts["-clamp"] = i < len(toks) and toks[i].lower() == "on"
+                    i += 1
                 else:
                     i += 2 if opt == "-mm" else 1
-            if i < len(toks):
-                textures.setdefault(current, " ".join(toks[i:]).replace("\\", "/").split("/")[-1])
-    return colors, textures
+            if i < len(toks) and current not in textures:
+                textures[current] = " ".join(toks[i:]).replace("\\", "/").split("/")[-1]
+                options[current] = (tuple(opts["-s"]), tuple(opts["-o"]), opts["-clamp"])
+    return colors, textures, options
 
 
 # ---------------------------------------------------------------- bundles
@@ -355,13 +498,13 @@ def read_bundle(files: list[Path], name: str) -> dict:
     ext = lambda p: p.suffix.lower()
     geometry = [p for p in files if ext(p) in (".obj", ".xyz")]
     mtls = [p for p in files if ext(p) == ".mtl"]
-    images = {p.name.lower() for p in files if ext(p) in (".jpg", ".jpeg", ".png")}
+    images = {p.name.lower(): p for p in files if ext(p) in (".jpg", ".jpeg", ".png")}
     parts = [(p, read_obj(p) if ext(p) == ".obj" else read_xyz(p)) for p in geometry]
     n_obj = sum(ext(p) == ".obj" for p in geometry)
     several = len(parts) > 1
 
-    merged = {"positions": [], "texts": [], "colors": [], "elements": [], "mtllibs": [], "splines": [], "curves_left_out": 0}
-    palette, textured, meaning = {}, set(), {}
+    merged = {"positions": [], "texts": [], "colors": [], "elements": [], "mtllibs": [], "texcoords": [], "splines": [], "curves_left_out": 0}
+    palette, textured, maps, meaning = {}, set(), {}, {}
     taken = {"o": set(), "g": set()}  # object/group names an earlier file already used
     for p, doc in parts:
         own = {"o": {}, "g": {}}
@@ -379,19 +522,20 @@ def read_bundle(files: list[Path], name: str) -> dict:
                 own[kind][raw] = name
             return own[kind][raw]
 
-        colors, textures = {}, {}
+        colors, textures, options = {}, {}, {}
         if ext(p) == ".obj":
             libs = [m for lib in doc["mtllibs"] for m in mtls if m.name.lower() == lib.replace("\\", "/").split("/")[-1].lower()]
             used = any(e[4] is not None for e in doc["elements"])
             if not libs and n_obj == 1 and len(mtls) == 1 and (used or not doc["mtllibs"]):
                 libs = mtls
             for m in libs:
-                c, t = read_mtl(m)
+                c, t, o = read_mtl(m)
                 for k, v in c.items():
                     colors.setdefault(k, v)
                 for k, v in t.items():
-                    if v.lower() in images:
-                        textures.setdefault(k, v)
+                    if v.lower() in images and k not in textures:
+                        textures[k] = v
+                        options[k] = o[k]
         # Materials two files define differently get "name (file)".
         rename = {}
         for e in doc["elements"]:
@@ -408,13 +552,16 @@ def read_bundle(files: list[Path], name: str) -> dict:
                 palette.setdefault(new, colors[mat])
             if mat in textures:
                 textured.add(new)
-        v0 = len(merged["positions"])
+                maps.setdefault(new, (images[textures[mat].lower()], *options[mat]))
+        v0, t0 = len(merged["positions"]), len(merged["texcoords"])
         merged["positions"] += doc["positions"]
+        merged["texcoords"] += doc["texcoords"]
         merged["texts"] += doc["texts"]
         merged["colors"] += doc["colors"]
         for kind, idx, o, g, mat, uv in doc["elements"]:
             if several and o is None:
                 o = p.stem
+            uv = None if uv is None else [i + t0 for i in uv]
             merged["elements"].append((kind, [i + v0 for i in idx], claim("o", o), claim("g", g), rename.get(mat, mat), uv))
         for sp in doc["splines"]:
             o = sp["o"] if sp["o"] is not None or not several else p.stem
@@ -424,7 +571,7 @@ def read_bundle(files: list[Path], name: str) -> dict:
         stem = geometry[0].stem
     else:
         stem = Path(name).stem if name else (geometry[0].stem if geometry else "bundle")
-    merged.update(palette=palette, textured=textured, stem=stem)
+    merged.update(palette=palette, textured=textured, maps=maps, stem=stem)
     return merged
 
 
@@ -441,7 +588,8 @@ def dxf_safe(name: str) -> str:
 def expected_structure(obj: dict, stem: str, up: str, palette: dict, textured: set = frozenset()) -> list[bytes]:
     """(layer, color, geometry) records the DXF should contain, in obj2cad's default
     layer mode (objects; groups when the file has no objects). Faces colored from a
-    texture get color "T" (the harness can't decode images the way the engine does)."""
+    texture or from vertex colors get an approximate color "~rrggbb" (checked within a
+    tolerance), or "T" when the texture isn't a PNG this harness decodes."""
     P = [transform(p, up) for p in obj["positions"]]
     has_objects = any(e[2] is not None for e in obj["elements"]) or any(sp["o"] is not None for sp in obj.get("splines", []))
     taken, by_source, default = {"0"}, {}, [None]
@@ -468,16 +616,23 @@ def expected_structure(obj: dict, stem: str, up: str, palette: dict, textured: s
         return by_source[source]
 
     vcolor = obj.get("colors") or [None] * len(P)
+    maps, images = obj.get("maps", {}), {}
     records = []
     for kind, idx, o, g, m, uv in obj["elements"]:
         layer = layer_of(o, g)
         color = palette.get(m) if m is not None else None
         if kind == "p":
             records += [structure_record(layer, vcolor[i] or color, "p", [P[i]]) for i in idx]
-        else:
-            if kind == "f" and uv and m in textured:
-                color = "T"
-            records.append(structure_record(layer, color, kind, [P[i] for i in idx]))
+            continue
+        if kind == "f" and uv and m in textured:
+            path, scale, offset, clamp = maps[m]
+            if path not in images:
+                images[path] = read_png(path)
+            ref = images[path] and texture_reference(images[path], [obj["texcoords"][t] for t in uv], scale, offset, clamp)
+            color = "~%02x%02x%02x" % tuple(round(c) for c in ref) if ref else "T"
+        elif all(vcolor[i] is not None for i in idx):
+            color = "~%02x%02x%02x" % tuple(round(c) for c in mix([vcolor[i] for i in idx]))
+        records.append(structure_record(layer, color, kind, [P[i] for i in idx]))
     for sp in obj.get("splines", []):
         layer = layer_of(sp["o"], sp["g"])
         color = palette.get(sp["m"]) if sp["m"] is not None else None
@@ -486,6 +641,44 @@ def expected_structure(obj: dict, stem: str, up: str, palette: dict, textured: s
         layer = default_layer()
         records += [structure_record(layer, vcolor[i], "p", [p]) for i, p in enumerate(P)]
     return records
+
+
+# Approximate colors may differ from their reference by rounding, by the engine merging
+# colors within 4 levels of each other, and (textures) by its coarser sampling.
+COLOR_TOLERANCE = 6
+
+
+def match_approximate(structure: list[bytes], expected: list[bytes]) -> tuple[list[bytes], int]:
+    """Give each written record whose expected color is approximate ("~rrggbb" or "T") that
+    expected color when its own is within tolerance, so the exact comparison can follow.
+    Returns the records and the largest color difference seen (-1: none approximate)."""
+    approx: dict[bytes, list[bytes]] = {}
+    for r in expected:
+        c = r.split(b"\0")[1]
+        if c == b"T" or c.startswith(b"~"):
+            approx.setdefault(without_color(r), []).append(c)
+    worst, out = -1, []
+    for r in structure:
+        key, got = without_color(r), r.split(b"\0")[1]
+        want = approx.get(key)
+        if not want or got == b"-":
+            out.append(r)
+            continue
+        rgb = bytes.fromhex(got.decode())
+
+        def distance(c: bytes) -> int:
+            return 0 if c == b"T" else max(abs(a - b) for a, b in zip(rgb, bytes.fromhex(c[1:].decode())))
+
+        best = min(want, key=distance)
+        d = distance(best)
+        worst = max(worst, d if best != b"T" else 0)
+        if d > COLOR_TOLERANCE:
+            out.append(r)
+            continue
+        want.remove(best)
+        layer, _, rest = r.split(b"\0", 2)
+        out.append(layer + b"\0" + best + b"\0" + rest)
+    return out, worst
 
 
 def without_color(rec: bytes) -> bytes:
@@ -737,8 +930,9 @@ def check(binary: Path, obj_path: Path, out_dir: Path, up: str, fmt: str, expect
     if h_dxf != h_rust:
         problems.append(f"{fmt.upper()} geometry differs from source")
     expected = sorted(expected_structure(obj, obj["stem"], applied_up, obj["palette"], obj["textured"]))
-    textured = {without_color(r) for r in expected if r.split(b"\0")[1] == b"T"}
-    structure = [r.split(b"\0", 1)[0] + b"\0T\0" + r.split(b"\0", 2)[2] if without_color(r) in textured else r for r in structure]
+    structure, color_error = match_approximate(structure, expected)
+    if color_error > COLOR_TOLERANCE:
+        problems.append(f"a face's color is {color_error} levels from its reference (tolerance {COLOR_TOLERANCE})")
     if sorted(structure) != expected:
         got, want = Counter(structure), Counter(expected)
         diff = next(iter((got - want) or (want - got)))
@@ -762,7 +956,8 @@ def check(binary: Path, obj_path: Path, out_dir: Path, up: str, fmt: str, expect
         return False, "; ".join(problems)
     up_note = "upright" if applied_up == "y_up_to_z_up" else "as-is"
     kinds = "".join(f", {r['kind']}" for r in report.get("curves", []))
-    return True, f"{report['output']['faces']} faces, {len(used_layers)} layers, {up_note}{kinds}, {elapsed:.2f}s"
+    colors = f", colors within {color_error}" if color_error >= 0 else ""
+    return True, f"{report['output']['faces']} faces, {len(used_layers)} layers, {up_note}{kinds}{colors}, {elapsed:.2f}s"
 
 
 def main() -> int:

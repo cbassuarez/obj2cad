@@ -6,6 +6,7 @@
 //! indices, non-finite values) is a hard error, never a guess.
 
 pub mod bundle;
+pub mod color;
 pub mod convert;
 pub mod diag;
 pub mod hash;

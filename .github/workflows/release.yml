@@ -52,7 +52,9 @@ jobs:
         include:
           - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, exe: obj2cad }
           - { os: macos-latest, target: aarch64-apple-darwin, exe: obj2cad }
-          - { os: macos-13, target: x86_64-apple-darwin, exe: obj2cad }
+          # Intel Macs: cross-built on Apple Silicon (GitHub retired its Intel runners) and
+          # verified under Rosetta.
+          - { os: macos-latest, target: x86_64-apple-darwin, exe: obj2cad }
           - { os: windows-latest, target: x86_64-pc-windows-msvc, exe: obj2cad.exe }
     runs-on: ${{ matrix.os }}
     env:
@@ -60,23 +62,31 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: rustup show active-toolchain || rustup toolchain install
+      - run: rustup target add ${{ matrix.target }}
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - run: python tools/vendor/fetch_acadrust.py
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release -p obj2cad-cli
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo build --release -p obj2cad-cli --target ${{ matrix.target }}
+      - name: Rosetta (to verify the Intel build)
+        if: matrix.target == 'x86_64-apple-darwin'
+        run: /usr/bin/pgrep -q oahd || sudo softwareupdate --install-rosetta --agree-to-license
       - name: Verify (parity harness)
+        env:
+          BIN: target/${{ matrix.target }}/release/obj2cad
         run: |
           pip install -r tests/harness/requirements.txt
-          python tests/harness/parity.py --up auto tests/fixtures
-          python tests/harness/parity.py --up auto --format dwg tests/fixtures
+          python tests/harness/parity.py --bin "$BIN" --up auto tests/fixtures
+          python tests/harness/parity.py --bin "$BIN" --up auto --format dwg tests/fixtures
       - name: Package
         shell: bash
         run: |
           name=obj2cad-cli-$VERSION-${{ matrix.target }}
           mkdir "$name"
-          cp target/release/${{ matrix.exe }} README.md LICENSE "$name/"
+          cp target/${{ matrix.target }}/release/${{ matrix.exe }} README.md LICENSE "$name/"
           if [ "${{ runner.os }}" = "Windows" ]; then 7z a "$name.zip" "$name" > /dev/null; else tar czf "$name.tar.gz" "$name"; fi
           rm -rf "$name"
       - uses: actions/attest-build-provenance@v4

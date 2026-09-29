@@ -84,7 +84,7 @@ function Notes({ summary: s, onKeepLoose, onAddMtl }: { summary: Summary; onKeep
     s.missing.length > 0 ||
     s.unreadable.length > 0 ||
     s.notUsed.length > 0 ||
-    s.textureColors ||
+    s.faceColors.length > 0 ||
     s.curves.length > 0;
   if (!any) return null;
   return (
@@ -132,10 +132,10 @@ function Notes({ summary: s, onKeepLoose, onAddMtl }: { summary: Summary; onKeep
           <span className="min-w-0 flex-1">Curved surfaces: {s.curves.join(", ")}</span>
         </Row>
       )}
-      {s.textureColors && (
+      {s.faceColors.length > 0 && (
         <Row>
           <Palette className="size-4 shrink-0 text-accent" />
-          <span className="min-w-0 flex-1">Texture colors, approximate</span>
+          <span className="min-w-0 flex-1">Colors from {s.faceColors.join(" and ")}, averaged per face</span>
         </Row>
       )}
       {s.notIncluded.length > 0 && <Row tone="muted">Not included: {s.notIncluded.join(", ")}</Row>}

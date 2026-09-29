@@ -1,14 +1,17 @@
 //! Texture images, decoded in pure Rust so the command-line tool and the browser get
 //! the same pixels (and so the same drawing) from the same file.
 
+use crate::color;
 use crate::mtl::TextureRef;
 
-/// An 8-bit RGB image, rows top to bottom.
+/// An 8-bit sRGB image, rows top to bottom.
 #[derive(Debug, Clone)]
 pub struct Image {
     pub width: u32,
     pub height: u32,
     pub rgb: Vec<u8>,
+    /// Opacity per pixel; empty when the image is opaque.
+    pub alpha: Vec<u8>,
 }
 
 /// Images larger than this are rejected (a 16k × 16k texture is 768 MB of pixels).
@@ -58,6 +61,7 @@ fn decode_jpeg(bytes: &[u8]) -> Result<Image, String> {
         width: info.width.into(),
         height: info.height.into(),
         rgb,
+        alpha: Vec::new(),
     })
 }
 
@@ -75,48 +79,79 @@ fn decode_png(bytes: &[u8]) -> Result<Image, String> {
     ];
     let frame = reader.next_frame(&mut buf).map_err(|e| e.to_string())?;
     let px = &buf[..frame.buffer_size()];
-    let rgb = match frame.color_type {
-        png::ColorType::Rgb => px.to_vec(),
-        png::ColorType::Rgba => px
-            .chunks_exact(4)
-            .flat_map(|c| [c[0], c[1], c[2]])
-            .collect(),
-        png::ColorType::Grayscale => px.iter().flat_map(|&l| [l, l, l]).collect(),
-        png::ColorType::GrayscaleAlpha => px.chunks_exact(2).flat_map(|c| [c[0]; 3]).collect(),
+    let (rgb, alpha): (Vec<u8>, Vec<u8>) = match frame.color_type {
+        png::ColorType::Rgb => (px.to_vec(), Vec::new()),
+        png::ColorType::Rgba => (
+            px.chunks_exact(4)
+                .flat_map(|c| [c[0], c[1], c[2]])
+                .collect(),
+            px.chunks_exact(4).map(|c| c[3]).collect(),
+        ),
+        png::ColorType::Grayscale => (px.iter().flat_map(|&l| [l, l, l]).collect(), Vec::new()),
+        png::ColorType::GrayscaleAlpha => (
+            px.chunks_exact(2).flat_map(|c| [c[0]; 3]).collect(),
+            px.chunks_exact(2).map(|c| c[1]).collect(),
+        ),
         png::ColorType::Indexed => return Err("unexpected indexed PNG after expansion".into()),
+    };
+    // Fully opaque images need no alpha.
+    let alpha = if alpha.iter().all(|&a| a == 255) {
+        Vec::new()
+    } else {
+        alpha
     };
     Ok(Image {
         width: w,
         height: h,
         rgb,
+        alpha,
     })
 }
 
 impl Image {
-    /// Bilinear sample at texture coordinates (u, v), repeating outside 0..1. OBJ's v
-    /// runs bottom to top; image rows run top to bottom.
-    pub fn sample(&self, u: f64, v: f64) -> [f64; 3] {
-        let (w, h) = (self.width as f64, self.height as f64);
-        let x = (u - u.floor()) * w - 0.5;
-        let y = (1.0 - (v - v.floor())) * h - 0.5;
+    /// Bilinear sample at texture coordinates (u, v) in linear light, premultiplied by
+    /// opacity: returns (color × opacity, opacity). Outside 0..1 the image repeats, or
+    /// its edge extends when `clamp` is set (`-clamp on`). OBJ's v runs bottom to top;
+    /// image rows run top to bottom.
+    pub fn sample(&self, u: f64, v: f64, clamp: bool) -> ([f64; 3], f64) {
+        let (w, h) = (f64::from(self.width), f64::from(self.height));
+        let (u, v) = if clamp {
+            (u.clamp(0.0, 1.0), v.clamp(0.0, 1.0))
+        } else {
+            (u - u.floor(), v - v.floor())
+        };
+        let x = u * w - 0.5;
+        let y = (1.0 - v) * h - 0.5;
         let (x0, y0) = (x.floor(), y.floor());
         let (fx, fy) = (x - x0, y - y0);
-        let wrap = |i: f64, n: u32| (i.rem_euclid(f64::from(n))) as usize;
-        let px = |xi: f64, yi: f64| {
-            let at = (wrap(yi, self.height) * self.width as usize + wrap(xi, self.width)) * 3;
-            [0, 1, 2].map(|c| f64::from(self.rgb[at + c]))
+        let index = |i: f64, n: u32| {
+            if clamp {
+                i.clamp(0.0, f64::from(n - 1)) as usize
+            } else {
+                i.rem_euclid(f64::from(n)) as usize
+            }
         };
-        let (a, b, c, d) = (
-            px(x0, y0),
-            px(x0 + 1.0, y0),
-            px(x0, y0 + 1.0),
-            px(x0 + 1.0, y0 + 1.0),
-        );
-        [0, 1, 2].map(|k| {
-            let top = a[k] + (b[k] - a[k]) * fx;
-            let bottom = c[k] + (d[k] - c[k]) * fx;
-            top + (bottom - top) * fy
-        })
+        let texel = |xi: f64, yi: f64| {
+            let at = index(yi, self.height) * self.width as usize + index(xi, self.width);
+            let a = self.alpha.get(at).map_or(1.0, |&a| f64::from(a) / 255.0);
+            let c = [0, 1, 2].map(|k| color::TO_LINEAR[self.rgb[at * 3 + k] as usize] * a);
+            (c, a)
+        };
+        let corners = [
+            (texel(x0, y0), (1.0 - fx) * (1.0 - fy)),
+            (texel(x0 + 1.0, y0), fx * (1.0 - fy)),
+            (texel(x0, y0 + 1.0), (1.0 - fx) * fy),
+            (texel(x0 + 1.0, y0 + 1.0), fx * fy),
+        ];
+        let mut c = [0.0; 3];
+        let mut a = 0.0;
+        for ((ci, ai), wi) in corners {
+            for k in 0..3 {
+                c[k] += ci[k] * wi;
+            }
+            a += ai * wi;
+        }
+        (c, a)
     }
 }
 
@@ -126,130 +161,145 @@ pub struct Texture<'a> {
     pub map: &'a TextureRef,
 }
 
-impl Texture<'_> {
-    /// The color of a face from its corners' texture coordinates: the mean of samples at
-    /// the centroid and halfway from the centroid to each corner.
-    pub fn face_color(&self, uvs: &[[f32; 2]]) -> [f64; 3] {
-        let n = uvs.len() as f64;
-        let c = uvs.iter().fold([0.0; 2], |acc, uv| {
-            [acc[0] + f64::from(uv[0]) / n, acc[1] + f64::from(uv[1]) / n]
-        });
-        let tex = |u: f64, v: f64| {
-            let m = self.map;
-            self.image
-                .sample(u * m.scale[0] + m.offset[0], v * m.scale[1] + m.offset[1])
-        };
-        let mut sum = tex(c[0], c[1]);
-        for uv in uvs {
-            let s = tex(
-                (c[0] + f64::from(uv[0])) / 2.0,
-                (c[1] + f64::from(uv[1])) / 2.0,
-            );
-            for k in 0..3 {
-                sum[k] += s[k];
-            }
-        }
-        sum.map(|x| x / (n + 1.0))
-    }
-}
+/// Samples per texel along each side (4 per texel), and per triangle side at most (so at
+/// most 4096 samples per triangle).
+const STEPS_PER_TEXEL: f64 = 2.0;
+const MAX_STEPS: f64 = 64.0;
 
-/// Reduce colors to at most `k` representatives (median cut on the weighted colors).
-/// Returns the palette and, for each input color, the index of its representative.
-pub fn quantize(colors: &[[u8; 3]], k: usize) -> (Vec<[u8; 3]>, Vec<u16>) {
-    use std::collections::BTreeMap;
-    let mut counts: BTreeMap<[u8; 3], u64> = BTreeMap::new();
-    for &c in colors {
-        *counts.entry(c).or_default() += 1;
-    }
-    let distinct: Vec<([u8; 3], u64)> = counts.into_iter().collect();
-    let mut boxes: Vec<Vec<([u8; 3], u64)>> = vec![distinct];
-    while boxes.len() < k.max(1) {
-        // Split the box with the widest channel range (ties: most weight, then first).
-        let range = |b: &Vec<([u8; 3], u64)>| {
-            (0..3)
-                .map(|ch| {
-                    let (lo, hi) = b.iter().fold((255u8, 0u8), |(lo, hi), (c, _)| {
-                        (lo.min(c[ch]), hi.max(c[ch]))
-                    });
-                    (hi.saturating_sub(lo), ch)
-                })
-                .max_by_key(|&(r, ch)| (r, std::cmp::Reverse(ch)))
-                .unwrap_or((0, 0))
-        };
-        let Some((i, (r, ch))) = boxes
+impl Texture<'_> {
+    /// The color a face shows from far enough away to see it as one color: the texture
+    /// averaged over the face's area in linear light, about four samples per texel, with
+    /// transparent parts left out. `uvs` are the face's corners' texture coordinates.
+    pub fn face_color(&self, uvs: &[[f32; 2]]) -> [u8; 3] {
+        let m = self.map;
+        let uv: Vec<[f64; 2]> = uvs
             .iter()
-            .enumerate()
-            .filter(|(_, b)| b.len() > 1)
-            .map(|(i, b)| (i, range(b)))
-            .max_by_key(|&(i, (r, _))| (r, std::cmp::Reverse(i)))
-        else {
-            break;
+            .map(|t| {
+                [
+                    f64::from(t[0]) * m.scale[0] + m.offset[0],
+                    f64::from(t[1]) * m.scale[1] + m.offset[1],
+                ]
+            })
+            .collect();
+        let texels = f64::from(self.image.width) * f64::from(self.image.height);
+        let (mut seen, mut all) = (color::Mix::default(), color::Mix::default());
+        let mut add = |p: [f64; 2], w: f64| {
+            let (c, a) = self.image.sample(p[0], p[1], m.clamp);
+            seen.add_linear(if a > 0.0 { c.map(|x| x / a) } else { c }, w * a);
+            all.add_linear(if a > 0.0 { c.map(|x| x / a) } else { c }, w);
         };
-        if r == 0 {
-            break;
-        }
-        let mut b = boxes.swap_remove(i);
-        b.sort_by_key(|(c, _)| (c[ch], *c));
-        let total: u64 = b.iter().map(|x| x.1).sum();
-        let (mut acc, mut cut) = (0u64, 1usize);
-        for (j, x) in b.iter().enumerate() {
-            acc += x.1;
-            if acc * 2 >= total {
-                cut = (j + 1).clamp(1, b.len() - 1);
-                break;
+        let mut total_area = 0.0;
+        // A fan of triangles from the first corner, each split into steps² equal triangles
+        // sampled at their centers.
+        for k in 1..uv.len().saturating_sub(1) {
+            let (a, b, c) = (uv[0], uv[k], uv[k + 1]);
+            let e1 = [b[0] - a[0], b[1] - a[1]];
+            let e2 = [c[0] - a[0], c[1] - a[1]];
+            let area = (e1[0] * e2[1] - e1[1] * e2[0]).abs() / 2.0;
+            total_area += area;
+            let steps = ((area * texels).sqrt() * STEPS_PER_TEXEL)
+                .ceil()
+                .clamp(1.0, MAX_STEPS);
+            let n = steps as u32;
+            let w = area / (steps * steps);
+            let at = |s: f64, t: f64| [a[0] + e1[0] * s + e2[0] * t, a[1] + e1[1] * s + e2[1] * t];
+            for i in 0..n {
+                for j in 0..n - i {
+                    let (fi, fj) = (f64::from(i), f64::from(j));
+                    add(at((fi + 1.0 / 3.0) / steps, (fj + 1.0 / 3.0) / steps), w);
+                    if i + j + 1 < n {
+                        add(at((fi + 2.0 / 3.0) / steps, (fj + 2.0 / 3.0) / steps), w);
+                    }
+                }
             }
         }
-        let right = b.split_off(cut);
-        boxes.push(b);
-        boxes.push(right);
-    }
-    boxes.sort_by_key(|b| b[0].0);
-    let palette: Vec<[u8; 3]> = boxes
-        .iter()
-        .map(|b| {
-            let w: u64 = b.iter().map(|x| x.1).sum();
-            [0, 1, 2].map(|ch| {
-                ((b.iter().map(|x| u64::from(x.0[ch]) * x.1).sum::<u64>() as f64 / w as f64)
-                    .round()) as u8
-            })
-        })
-        .collect();
-    let mut index: BTreeMap<[u8; 3], u16> = BTreeMap::new();
-    for (i, b) in boxes.iter().enumerate() {
-        for (c, _) in b {
-            index.insert(*c, i as u16);
+        if total_area == 0.0 {
+            // No area in texture space (every corner on one point or line): the center.
+            let n = uv.len() as f64;
+            let c = uv
+                .iter()
+                .fold([0.0; 2], |s, p| [s[0] + p[0] / n, s[1] + p[1] / n]);
+            add(c, 1.0);
         }
+        seen.srgb().or_else(|| all.srgb()).unwrap_or([0, 0, 0])
     }
-    (palette, colors.iter().map(|c| index[c]).collect())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn samples_with_v_up_and_repeat() {
-        // 2 × 2: top row red, green; bottom row blue, white.
-        let img = Image {
-            width: 2,
-            height: 2,
-            rgb: vec![255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255],
-        };
-        assert_eq!(img.sample(0.25, 0.75), [255.0, 0.0, 0.0]);
-        assert_eq!(img.sample(0.25, 0.25), [0.0, 0.0, 255.0]);
-        assert_eq!(img.sample(1.25, -0.75), [0.0, 0.0, 255.0]);
+    fn image(width: u32, height: u32, rgb: Vec<u8>, alpha: Vec<u8>) -> Image {
+        Image {
+            width,
+            height,
+            rgb,
+            alpha,
+        }
+    }
+
+    fn srgb(c: ([f64; 3], f64)) -> [u8; 3] {
+        c.0.map(color::to_srgb)
     }
 
     #[test]
-    fn quantizes_deterministically() {
-        let colors: Vec<[u8; 3]> = (0..200u32)
-            .map(|i| [(i % 256) as u8, (i * 7 % 256) as u8, 40])
+    fn samples_with_v_up_repeat_and_clamp() {
+        // 2 × 2: top row red, green; bottom row blue, white.
+        let img = image(
+            2,
+            2,
+            vec![255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255],
+            vec![],
+        );
+        assert_eq!(srgb(img.sample(0.25, 0.75, false)), [255, 0, 0]);
+        assert_eq!(srgb(img.sample(0.25, 0.25, false)), [0, 0, 255]);
+        assert_eq!(srgb(img.sample(1.25, -0.75, false)), [0, 0, 255]);
+        // Clamped, the edge extends instead of wrapping around.
+        assert_eq!(srgb(img.sample(-0.5, 0.75, true)), [255, 0, 0]);
+        assert_eq!(srgb(img.sample(1.9, 0.75, true)), [0, 255, 0]);
+    }
+
+    fn face(img: &Image, uvs: &[[f32; 2]], clamp: bool) -> [u8; 3] {
+        let map = TextureRef {
+            file: String::new(),
+            offset: [0.0; 2],
+            scale: [1.0; 2],
+            clamp,
+        };
+        Texture {
+            image: img,
+            map: &map,
+        }
+        .face_color(uvs)
+    }
+
+    #[test]
+    fn a_face_shows_its_area_mixed_in_linear_light() {
+        // 64 × 64 stripes, black and white: from afar they reflect half the light.
+        let rgb = (0..64 * 64)
+            .flat_map(|i| [if i % 2 == 0 { 0 } else { 255 }; 3])
             .collect();
-        let (p, idx) = quantize(&colors, 8);
-        assert_eq!(p.len(), 8);
-        assert_eq!(quantize(&colors, 8), (p.clone(), idx.clone()));
-        let (p, idx) = quantize(&[[1, 2, 3], [1, 2, 3]], 8);
-        assert_eq!((p, idx), (vec![[1, 2, 3]], vec![0, 0]));
+        let img = image(64, 64, rgb, vec![]);
+        let quad = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+        let c = face(&img, &quad, false);
+        assert!(c.iter().all(|&x| x.abs_diff(188) <= 2), "{c:?}");
+        // A face well inside one texel shows (nearly) that texel.
+        let tiny = [
+            [0.5 / 64.0, 0.5 / 64.0],
+            [0.51 / 64.0, 0.5 / 64.0],
+            [0.5 / 64.0, 0.51 / 64.0],
+        ];
+        assert!(face(&img, &tiny, false)[0] < 16);
+    }
+
+    #[test]
+    fn transparent_parts_are_left_out() {
+        // Left half opaque red, right half transparent (and green underneath).
+        let rgb = vec![255, 0, 0, 0, 255, 0];
+        let img = image(2, 1, rgb, vec![255, 0]);
+        let quad = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+        let c = face(&img, &quad, true);
+        assert_eq!((c[0] > 250, c[1] < 5), (true, true), "{c:?}");
     }
 
     #[test]
@@ -266,6 +316,6 @@ mod tests {
                 .unwrap();
         }
         let img = decode(&out).unwrap();
-        assert_eq!(img.rgb, vec![10, 20, 30]);
+        assert_eq!((img.rgb, img.alpha), (vec![10, 20, 30], vec![]));
     }
 }

@@ -21,8 +21,8 @@ export interface Summary {
   /** Files that came along but weren't needed, or couldn't be read. */
   notUsed: string[];
   unreadable: string[];
-  /** Some faces are colored from textures (approximate colors). */
-  textureColors: boolean;
+  /** Where approximate face colors came from ("textures", "vertex colors"); one color per face. */
+  faceColors: string[];
   /** Curved surfaces written next to the mesh, by kind ("2 cylinders", "1 sphere"). */
   curves: string[];
   /** Count and noun for the main stat. */
@@ -70,7 +70,9 @@ export function summarize(r: Report): Summary {
     missing: named("missing"),
     notUsed: named("not_used"),
     unreadable: named("unreadable"),
-    textureColors: (r.texture_colored_faces ?? 0) > 0,
+    faceColors: [(r.texture_colored_faces ?? 0) > 0 && "textures", (r.vertex_colored_faces ?? 0) > 0 && "vertex colors"].filter(
+      (x): x is string => Boolean(x),
+    ),
     curves: (["cylinder", "cone", "sphere", "torus"] as const)
       .map((k) => [k, (r.curves ?? []).filter((c) => c.kind === k).length] as const)
       .filter(([, n]) => n > 0)
