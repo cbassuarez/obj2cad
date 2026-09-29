@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.2](https://github.com/cbassuarez/obj2cad/compare/obj2cad-v0.5.1...obj2cad-v0.5.2) (2026-09-29)
+
+
+### Performance Improvements
+
+* point clouds and zips load fast; a large scan loads after its models ([#15](https://github.com/cbassuarez/obj2cad/issues/15)) ([fd9d9a7](https://github.com/cbassuarez/obj2cad/commit/fd9d9a7a70b5a75dc7ab8221edd0e1258c3ce416))
+
 ## [0.5.1](https://github.com/cbassuarez/obj2cad/compare/obj2cad-v0.5.0...obj2cad-v0.5.1) (2026-09-29)
 
 
