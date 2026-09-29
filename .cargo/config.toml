@@ -1,4 +1,5 @@
-# WebAssembly SIMD is supported by every browser we target (Chrome/Edge 91+, Firefox 89+,
-# Safari 16.4+) and speeds up byte scanning and hashing in the core.
+# No SIMD on purpose: measured no gain for obj2cad (parse, write and preview within noise
+# of the SIMD build), and without it the engine runs in every browser with WebAssembly.
+# getrandom (through acadrust's hash maps) takes randomness from the browser's Web Crypto.
 [target.wasm32-unknown-unknown]
-rustflags = ["-C", "target-feature=+simd128"]
+rustflags = ["--cfg", 'getrandom_backend="wasm_js"']

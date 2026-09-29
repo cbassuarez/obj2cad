@@ -1,70 +1,133 @@
-export type Units = "mm" | "cm" | "m" | "in" | "ft" | "unitless";
-export type Up = "as-is" | "y-to-z";
-export type Theme = "dark" | "light";
+// Everything the user can choose, in the engine's own vocabulary (the serde names in
+// crates/obj2cad-core/src/convert.rs and crates/obj2cad-wasm/src/lib.rs), and the
+// preferences the app remembers between files and visits.
 
-export interface Settings {
-  units: Units;
-  up: Up;
+export type Units = "millimeters" | "centimeters" | "meters" | "inches" | "feet" | "unitless";
+export type UpAxis = "as_is" | "y_up_to_z_up";
+export type LayerMode = "objects" | "groups" | "materials" | "single";
+export type Format = "dxf" | "dxf-binary" | "dwg";
+
+export const UNITS: { value: Units; symbol: string; name: string }[] = [
+  { value: "millimeters", symbol: "mm", name: "Millimeters" },
+  { value: "centimeters", symbol: "cm", name: "Centimeters" },
+  { value: "meters", symbol: "m", name: "Meters" },
+  { value: "inches", symbol: "in", name: "Inches" },
+  { value: "feet", symbol: "ft", name: "Feet" },
+  { value: "unitless", symbol: "", name: "None" },
+];
+
+export const UPS: { value: UpAxis; label: string }[] = [
+  { value: "as_is", label: "As exported" },
+  { value: "y_up_to_z_up", label: "Stand upright" },
+];
+
+export const LAYER_MODES: { value: LayerMode; label: string }[] = [
+  { value: "objects", label: "Objects" },
+  { value: "groups", label: "Groups" },
+  { value: "materials", label: "Materials" },
+  { value: "single", label: "One layer" },
+];
+
+export const FORMATS: { value: Format; label: string; ext: string; mime: string; beta?: boolean }[] = [
+  { value: "dxf", label: "DXF", ext: "dxf", mime: "application/dxf" },
+  { value: "dxf-binary", label: "DXF (binary)", ext: "dxf", mime: "application/dxf" },
+  { value: "dwg", label: "DWG", ext: "dwg", mime: "application/acad", beta: true },
+];
+
+export const unitSymbol = (u: Units) => UNITS.find((x) => x.value === u)?.symbol ?? "";
+export const unitName = (u: Units) => UNITS.find((x) => x.value === u)?.name ?? u;
+export const formatInfo = (f: Format) => FORMATS.find((x) => x.value === f)!;
+
+/** Remembered across files and visits (this browser only). */
+export interface Prefs {
+  format: Format;
+  layerMode: LayerMode;
+  /** Unit for files that don't state one. */
+  houseUnits: Units | null;
+  /** Record the source file name in the drawing's properties. */
+  includeName: boolean;
+  /** Also write curved surfaces recognized in the mesh. */
+  curves: boolean;
 }
 
-export const UNITS: { value: Units; label: string; name: string }[] = [
-  { value: "mm", label: "mm", name: "millimeters" },
-  { value: "cm", label: "cm", name: "centimeters" },
-  { value: "m", label: "m", name: "meters" },
-  { value: "in", label: "in", name: "inches" },
-  { value: "ft", label: "ft", name: "feet" },
-  { value: "unitless", label: "none", name: "no unit" },
-];
+export const DEFAULT_PREFS: Prefs = { format: "dxf", layerMode: "objects", houseUnits: null, includeName: true, curves: false };
+const PREFS_KEY = "obj2cad.prefs.v1";
 
-export const UPS: { value: Up; label: string; short: string; detail: string }[] = [
-  { value: "as-is", label: "As exported", short: "As exported", detail: "Coordinates exactly as in the file" },
-  { value: "y-to-z", label: "Y-up → Z-up", short: "Y-up → Z-up", detail: "Stands Y-up models upright for CAD. Still exact." },
-];
+const oneOf = <T extends string>(values: readonly { value: T }[], v: unknown, fallback: T): T =>
+  values.some((x) => x.value === v) ? (v as T) : fallback;
 
-/** The core reports hints with its own enum names. */
-export const HINT_UNITS: Record<string, Units> = {
-  millimeters: "mm",
-  centimeters: "cm",
-  meters: "m",
-  inches: "in",
-  feet: "ft",
-  unitless: "unitless",
-};
-export const HINT_UP: Record<string, Up> = { as_is: "as-is", y_up_to_z_up: "y-to-z" };
-
-const SETTINGS_KEY = "obj2cad.settings.v1";
-const THEME_KEY = "obj2cad.theme";
-
-// Storage can be unavailable (private windows, blocked site data): everything falls back
-// to in-memory defaults and the app keeps working.
-export function loadSettings(): Settings | null {
+/** Stored preferences, validated; defaults when storage is unavailable or damaged. */
+export function loadPrefs(storage: Pick<Storage, "getItem"> | null = safeStorage()): Prefs {
   try {
-    const s = JSON.parse(localStorage.getItem(SETTINGS_KEY) ?? "null");
-    return s && UNITS.some((u) => u.value === s.units) && UPS.some((u) => u.value === s.up) ? s : null;
+    const raw = JSON.parse(storage?.getItem(PREFS_KEY) ?? "{}") as Partial<Record<keyof Prefs, unknown>>;
+    return {
+      format: oneOf(FORMATS, raw.format, DEFAULT_PREFS.format),
+      layerMode: oneOf(LAYER_MODES, raw.layerMode, DEFAULT_PREFS.layerMode),
+      houseUnits: raw.houseUnits == null ? null : oneOf(UNITS, raw.houseUnits, "unitless") === "unitless" ? null : (raw.houseUnits as Units),
+      includeName: typeof raw.includeName === "boolean" ? raw.includeName : DEFAULT_PREFS.includeName,
+      curves: typeof raw.curves === "boolean" ? raw.curves : DEFAULT_PREFS.curves,
+    };
+  } catch {
+    return DEFAULT_PREFS;
+  }
+}
+
+export function savePrefs(p: Prefs, storage: Pick<Storage, "setItem"> | null = safeStorage()): void {
+  try {
+    storage?.setItem(PREFS_KEY, JSON.stringify(p));
+  } catch {
+    /* private window or storage full: preferences last for this visit only */
+  }
+}
+
+function safeStorage(): Storage | null {
+  try {
+    return typeof localStorage === "undefined" ? null : localStorage;
   } catch {
     return null;
   }
 }
 
-export function saveSettings(s: Settings): void {
-  try {
-    localStorage.setItem(SETTINGS_KEY, JSON.stringify(s));
-  } catch {
-    /* session-only */
-  }
+/** Choices for one file. `null` means "decided from the file". */
+export interface FileChoices {
+  units: Units | null;
+  up: UpAxis | null;
+  keepLoose: boolean;
 }
 
-export function loadTheme(): Theme {
-  return document.documentElement.classList.contains("light") ? "light" : "dark";
+export const AUTO: FileChoices = { units: null, up: null, keepLoose: false };
+
+/** What the engine takes (`Settings` in crates/obj2cad-wasm/src/lib.rs). */
+export interface EngineSettings {
+  units: Units | null;
+  default_units: Units | null;
+  up_axis: UpAxis | null;
+  layer_mode: LayerMode;
+  keep_loose_points: boolean;
+  exclude_layers: string[];
+  format: Format;
+  include_name: boolean;
+  curves: boolean;
 }
 
-export function applyTheme(t: Theme): void {
-  document.documentElement.classList.remove("light", "dark");
-  document.documentElement.classList.add(t);
-  document.querySelector('meta[name="theme-color"]')?.setAttribute("content", t === "dark" ? "#0e0f11" : "#f4f2ee");
-  try {
-    localStorage.setItem(THEME_KEY, t);
-  } catch {
-    /* session-only */
-  }
+/** The drawing's date comes from its files (the newest one used), set by the engine. */
+export function engineSettings(prefs: Prefs, choices: FileChoices, exclude: string[] = []): EngineSettings {
+  return {
+    units: choices.units,
+    default_units: prefs.houseUnits,
+    up_axis: choices.up,
+    layer_mode: prefs.layerMode,
+    keep_loose_points: choices.keepLoose,
+    exclude_layers: exclude,
+    format: prefs.format,
+    include_name: prefs.includeName,
+    curves: prefs.curves,
+  };
 }
+
+/** Settings that move geometry: a change needs a new parity hash. (Curved surfaces are
+ *  written next to the mesh; the parity hash covers the mesh.) */
+export const geometryKey = (s: EngineSettings) => JSON.stringify([s.up_axis, s.keep_loose_points, s.exclude_layers]);
+
+/** Settings that change what the preview shows. Orientation is applied by rotating it. */
+export const previewKey = (s: EngineSettings) => JSON.stringify([s.layer_mode, s.keep_loose_points, s.exclude_layers, s.curves]);

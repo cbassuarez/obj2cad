@@ -24,6 +24,11 @@ jobs:
       - uses: actions/checkout@v7
       - name: Toolchain (from rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Patched DWG writer (tools/vendor/fetch_acadrust.py)
+        run: python tools/vendor/fetch_acadrust.py
       - uses: Swatinem/rust-cache@v2
       - name: Format
         run: cargo fmt --all --check
@@ -33,21 +38,35 @@ jobs:
         run: cargo test --workspace
       - name: Build CLI
         run: cargo build --release -p obj2cad-cli
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.12"
       - name: Harness dependencies
         run: pip install -r tests/harness/requirements.txt
       - name: Parity harness (as-is)
-        run: python tests/harness/parity.py --up as-is --keep acceptance tests/fixtures
-      - name: Upload AutoCAD acceptance files (see docs/ACCEPTANCE.md)
+        run: python tests/harness/parity.py --up as-is tests/fixtures
+      - name: Parity harness (Y-up → Z-up)
+        run: python tests/harness/parity.py --up y-to-z tests/fixtures
+      - name: Parity harness (automatic, as the web app does)
+        run: python tests/harness/parity.py --up auto --keep acceptance/dxf tests/fixtures
+      - name: Parity harness (binary DXF)
+        run: python tests/harness/parity.py --up auto --format dxf-binary --keep acceptance/dxf-binary tests/fixtures
+      - name: Parity harness (DWG)
+        run: python tests/harness/parity.py --up auto --format dwg --keep acceptance/dwg tests/fixtures
+      - name: Curved surfaces (every vertex re-checked against the surface read back)
+        run: |
+          python tests/harness/parity.py --curves --up auto --keep acceptance/curves tests/fixtures
+          python tests/harness/parity.py --curves --up auto --format dwg --keep acceptance/curves-dwg tests/fixtures
+      - name: AutoCAD acceptance files (see docs/ACCEPTANCE.md)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          ./target/release/obj2cad synth 818 big_terrain.obj
+          ./target/release/obj2cad convert big_terrain.obj -o acceptance/dxf/big_terrain.dxf --quiet
+          ./target/release/obj2cad convert big_terrain.obj -o acceptance/dwg/big_terrain.dwg --quiet
+          ./target/release/obj2cad acis-samples acceptance/acis
+      - name: Upload AutoCAD acceptance files
         if: matrix.os == 'ubuntu-latest'
         uses: actions/upload-artifact@v7
         with:
           name: acceptance-${{ github.sha }}
           path: acceptance/
-      - name: Parity harness (Y-up → Z-up)
-        run: python tests/harness/parity.py --up y-to-z tests/fixtures
 
   bench:
     name: Performance budget (docs/PERFORMANCE.md, M4)
@@ -55,6 +74,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: rustup show active-toolchain || rustup toolchain install
+      - run: python3 tools/vendor/fetch_acadrust.py
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release -p obj2cad-cli
       - name: Benchmark
@@ -79,8 +99,26 @@ jobs:
           node-version: 24
           cache: npm
           cache-dependency-path: web/package-lock.json
+      - name: Install
+        working-directory: web
+        run: npm ci
+      - name: Unit tests
+        working-directory: web
+        run: npm test
       - name: Build (wasm + typecheck + bundle)
         working-directory: web
-        run: |
-          npm ci
-          npm run build
+        run: npm run build
+      # Browser tests: every download must equal the CLI's output for the same file.
+      - name: Build CLI (reference for the browser tests)
+        run: cargo build --release -p obj2cad-cli
+      - name: Browser
+        working-directory: web
+        run: npx playwright install --with-deps chromium
+      - name: Browser tests
+        working-directory: web
+        run: npm run e2e
+      - if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-${{ github.sha }}
+          path: web/test-results/

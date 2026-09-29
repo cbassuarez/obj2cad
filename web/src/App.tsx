@@ -1,52 +1,145 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { Dropzone } from "@mantine/dropzone";
 import { notifications } from "@mantine/notifications";
 import { useRegisterSW } from "virtual:pwa-register/react";
 import { AnimatePresence, motion } from "motion/react";
 import { CubeArt } from "@/components/brand";
+import { BatchScreen, type BatchItem } from "@/components/BatchScreen";
+import { ChoiceScreen } from "@/components/ChoiceScreen";
 import { DropScreen } from "@/components/DropScreen";
-import { FailedScreen } from "@/components/FailedScreen";
-import { SetupDialog } from "@/components/SetupDialog";
-import { TopBar, type FileInfo } from "@/components/TopBar";
-import { Button } from "@/components/ui/button";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
-import type { Suggestion } from "@/components/Dock";
-import * as engine from "@/lib/engine";
-import type { ConvertResult, Inspection, Report } from "@/lib/engine";
-import { HINT_UNITS, HINT_UP, UNITS, UPS, loadSettings, saveSettings, type Settings, type Theme } from "@/lib/settings";
+import { FailedScreen } from "@/components/FailedScreen";
+import { LoadingScreen, PreflightScreen } from "@/components/LoadingScreen";
+import { TopBar } from "@/components/TopBar";
+import { Button } from "@/components/ui/button";
+import type { PreviewState } from "@/components/Workspace";
+import { engine, EngineError, isEmpty, sha256Hex, type Failure, type Inspection, type Progress, type Result } from "@/lib/engine";
+import { CLI_URL, explain, type Explained } from "@/lib/errors";
+import { baseName, jobName, plan, saveFile, stem, zipFiles, type Job, type Source } from "@/lib/files";
+import {
+  AUTO,
+  engineSettings,
+  formatInfo,
+  loadPrefs,
+  previewKey,
+  savePrefs,
+  type FileChoices,
+  type Format,
+  type LayerMode,
+  type Prefs,
+  type UpAxis,
+  type Units,
+} from "@/lib/settings";
 
-type Phase = "empty" | "loading" | "failed" | "work";
+type Screen = "empty" | "preflight" | "loading" | "failed" | "work" | "batch" | "choose";
+
+/** A file handle from the File System Access API (Chromium), for reloading on change. */
+interface FileHandleLike {
+  name: string;
+  getFile(): Promise<File>;
+}
+
+interface Current {
+  id: number;
+  job: Job;
+  /** For a drawing made from one file picked with the file picker: reload on change. */
+  handle: FileHandleLike | null;
+  inspection: Inspection;
+  choices: FileChoices;
+  /** Opened from the file list. */
+  batchItem: number | null;
+}
+
+interface OpenOptions {
+  force?: boolean;
+  reload?: boolean;
+  choices?: FileChoices;
+  batchItem?: number | null;
+}
+
+/** Above this, suggest the command-line version first. */
+const BIG = 1_000_000_000;
 
 // The 3D workspace (three.js) loads on demand, so the first screen is small and fast;
 // it is prefetched as soon as the browser is idle.
 const loadWorkspace = () => import("@/components/Workspace");
 const Workspace = lazy(() => loadWorkspace().then((m) => ({ default: m.Workspace })));
 
-function download(data: BlobPart, name: string, type: string) {
-  const url = URL.createObjectURL(new Blob([data], { type }));
-  const a = Object.assign(document.createElement("a"), { href: url, download: name });
-  a.click();
-  setTimeout(() => URL.revokeObjectURL(url), 10_000);
-}
+const failureOf = (e: unknown): Failure => (e instanceof EngineError ? e.failure : { kind: "other", message: e instanceof Error ? e.message : String(e) });
+const jobSize = (job: Job) => job.sources.reduce((n, s) => n + s.file.size, 0);
+/** The file a failure is about: the one that couldn't be read, else the drawing. */
+const failedName = (job: Job, e: unknown) => (e instanceof EngineError && e.failure.kind === "parse" && e.failure.parse.file) || jobName(job);
 
-export function App({ theme, onToggleTheme }: { theme: Theme; onToggleTheme: () => void }) {
-  const [phase, setPhase] = useState<Phase>("empty");
-  const [file, setFile] = useState<FileInfo | null>(null);
-  const [inspection, setInspection] = useState<Inspection | null>(null);
-  const [settings, setSettings] = useState<Settings>(() => loadSettings() ?? { units: "mm", up: "as-is" });
-  const [asking, setAsking] = useState(false);
-  const [result, setResult] = useState<ConvertResult | null>(null);
-  const [report, setReport] = useState<Report | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<{ name: string; message: string } | null>(null);
+export function App() {
+  const [screen, setScreenState] = useState<Screen>("empty");
+  const [prefs, setPrefsState] = useState<Prefs>(loadPrefs);
+  const [current, setCurrent] = useState<Current | null>(null);
+  const [result, setResult] = useState<Result | null>(null);
+  const [preview, setPreview] = useState<PreviewState | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [loading, setLoading] = useState<{ name: string; progress: Progress | null }>({ name: "", progress: null });
+  const [failed, setFailed] = useState<{ name: string; explained: Explained; retry?: () => void } | null>(null);
+  const [preflight, setPreflight] = useState<{ name: string; size: number; go: () => void } | null>(null);
+  const [choice, setChoice] = useState<{ combined: Job; separate: Job[] } | null>(null);
+  const [batch, setBatch] = useState<BatchItem[]>([]);
+  const [downloaded, setDownloaded] = useState<string | null>(null);
+  const [watching, setWatching] = useState(false);
+  const [zipping, setZipping] = useState(false);
+
   const input = useRef<HTMLInputElement>(null);
   const mtlInput = useRef<HTMLInputElement>(null);
-  const runToken = useRef(0);
-  const fileName = useRef("");
-  const phaseRef = useRef<Phase>("empty");
-  const settingsRef = useRef<Settings>(settings);
-  phaseRef.current = phase;
-  settingsRef.current = settings;
+  const screenRef = useRef<Screen>("empty");
+  const prefsRef = useRef(prefs);
+  const currentRef = useRef<Current | null>(null);
+  const resultRef = useRef<Result | null>(null);
+  const batchRef = useRef<BatchItem[]>([]);
+  const shownPreview = useRef<{ key: string; fileId: number } | null>(null);
+  const choiceRef = useRef<{ combined: Job; separate: Job[] } | null>(null);
+  const convertToken = useRef(0);
+  const openToken = useRef(0);
+  const batchToken = useRef(0);
+  const seq = useRef(0);
+  prefsRef.current = prefs;
+  resultRef.current = result;
+
+  // ---------------------------------------------------------------- navigation
+  // Each page is a history entry, so the browser's Back button goes back a step.
+  const setScreen = useCallback((s: Screen, history: "push" | "replace" | "none" = "none") => {
+    screenRef.current = s;
+    setScreenState(s);
+    if (history === "push" && window.history.state?.screen !== s) window.history.pushState({ screen: s }, "");
+    else if (history !== "none") window.history.replaceState({ screen: s }, "");
+  }, []);
+
+  useEffect(() => {
+    if (!window.history.state?.screen) window.history.replaceState({ screen: "empty" }, "");
+    const onPop = (e: PopStateEvent) => {
+      const s = (e.state?.screen as Screen | undefined) ?? "empty";
+      if (s === "work" && currentRef.current && resultRef.current) setScreen("work");
+      else if (s === "batch" && batchRef.current.length) setScreen("batch");
+      else if (s === "choose" && choiceRef.current) setScreen("choose");
+      else setScreen("empty");
+    };
+    window.addEventListener("popstate", onPop);
+    return () => window.removeEventListener("popstate", onPop);
+  }, [setScreen]);
+
+  const setPrefs = (update: Partial<Prefs>) => {
+    const next = { ...prefsRef.current, ...update };
+    prefsRef.current = next;
+    setPrefsState(next);
+    savePrefs(next);
+  };
+
+  const setCur = (cur: Current | null) => {
+    currentRef.current = cur;
+    setCurrent(cur);
+  };
+
+  const updateBatch = (id: number, patch: Partial<BatchItem>) => {
+    batchRef.current = batchRef.current.map((i) => (i.id === id ? { ...i, ...patch } : i));
+    setBatch(batchRef.current);
+  };
 
   // ---------------------------------------------------------------- updates (PWA)
   const {
@@ -61,10 +154,9 @@ export function App({ theme, onToggleTheme }: { theme: Theme; onToggleTheme: () 
       id: "update",
       autoClose: false,
       withCloseButton: true,
-      title: "A new version of obj2cad is ready",
+      title: "A new version is ready",
       message: (
-        <div className="mt-2 flex items-center gap-3">
-          <span className="text-fg-2">Reload when you're done with this file.</span>
+        <div className="mt-2">
           <Button size="sm" variant="primary" onClick={() => updateServiceWorker(true)}>
             Reload
           </Button>
@@ -73,181 +165,363 @@ export function App({ theme, onToggleTheme }: { theme: Theme; onToggleTheme: () 
     });
   }, [needRefresh, updateServiceWorker]);
 
+  // ---------------------------------------------------------------- failures
+  const fail = (name: string, e: unknown, retry?: () => void) => {
+    const failure = failureOf(e);
+    const retryable = failure.kind === "crash" || failure.kind === "read" || failure.kind === "other";
+    setFailed({ name, explained: explain(failure), retry: retryable ? retry : undefined });
+    setScreen("failed", screenRef.current === "empty" ? "push" : "replace");
+  };
+
   // ---------------------------------------------------------------- conversion
-  const run = useCallback(async (s: Settings) => {
-    const token = ++runToken.current;
-    setBusy(true);
+  /** Convert the open file with the current preferences and its choices. */
+  const convert = useCallback(async (cur: Current, forcePreview = false, label = "Converting…"): Promise<boolean> => {
+    const token = ++convertToken.current;
+    const settings = engineSettings(prefsRef.current, cur.choices);
+    const key = previewKey(settings);
+    const shown = shownPreview.current;
+    const wantPreview = forcePreview || !shown || shown.key !== key || shown.fileId !== cur.id;
+    setBusy(label);
+    setDownloaded(null);
     try {
-      const r = await engine.convert(s.units, s.up);
-      if (token !== runToken.current) return; // superseded by a newer run
-      const rep: Report = JSON.parse(r.report);
-      if (rep.output.faces + rep.output.polylines + rep.output.points === 0) {
-        setError({ name: fileName.current, message: "No faces, lines or points found, so there is nothing to convert." });
-        setPhase("failed");
+      const r = await engine.convert(settings, wantPreview, () => setBusy(settings.format === "dwg" ? "Preparing DWG…" : label));
+      if (token !== convertToken.current) return false;
+      if (isEmpty(r.report)) {
+        setFailed({ name: cur.inspection.name, explained: explain({ kind: "empty" }) });
+        setScreen("failed", screenRef.current === "empty" ? "push" : "replace");
+        return false;
+      }
+      resultRef.current = r;
+      setResult(r);
+      if (r.preview) {
+        shownPreview.current = { key, fileId: cur.id };
+        setPreview({ buffers: r.preview, builtUp: r.decisions.up_axis, id: ++seq.current, fileId: cur.id });
+      }
+      if (cur.batchItem !== null) updateBatch(cur.batchItem, { status: "done", result: r });
+      return true;
+    } catch (e) {
+      if (token !== convertToken.current) return false;
+      fail(cur.inspection.name, e, () => void openJob(cur.job, cur.handle, { choices: cur.choices, batchItem: cur.batchItem, force: true }));
+      return false;
+    } finally {
+      if (token === convertToken.current) setBusy(null);
+    }
+    // Stable: everything it reads is a ref or a state setter (openJob is only called later).
+  }, []);
+
+  /** Open one drawing into the workspace. */
+  const openJob = useCallback(
+    async (job: Job, handle: FileHandleLike | null, opts: OpenOptions = {}): Promise<void> => {
+      const name = jobName(job);
+      const size = jobSize(job);
+      if (size > BIG && !opts.force) {
+        setPreflight({ name, size, go: () => void openJob(job, handle, { ...opts, force: true }) });
+        setScreen("preflight");
         return;
       }
-      setResult(r);
-      setReport(rep);
-      setPhase("work");
-    } catch (err) {
-      if (token !== runToken.current) return;
-      setError({ name: fileName.current, message: (err as Error).message });
-      setPhase("failed");
-    } finally {
-      if (token === runToken.current) setBusy(false);
+      const token = ++openToken.current;
+      const previous = screenRef.current === "work" ? currentRef.current?.inspection.name : undefined;
+      setLoading({ name, progress: null });
+      if (!opts.reload) setScreen("loading");
+      else setBusy("Reloading…");
+      try {
+        const info = await engine.open(job.sources, job.name, prefsRef.current.format === "dwg", (p) => setLoading({ name, progress: p }));
+        if (token !== openToken.current) return;
+        const cur: Current = { id: ++seq.current, job, handle, inspection: info, choices: opts.choices ?? AUTO, batchItem: opts.batchItem ?? null };
+        setCur(cur);
+        if (!(await convert(cur, true)) || token !== openToken.current) return;
+        setScreen("work", opts.reload || screenRef.current === "work" ? "replace" : "push");
+        if (!opts.reload && previous && previous !== info.name) notifications.show({ message: `Replaced ${previous} with ${info.name}` });
+        if (opts.reload) notifications.show({ message: `Reloaded ${info.name}` });
+      } catch (e) {
+        if (token === openToken.current) fail(failedName(job, e), e, () => void openJob(job, handle, { ...opts, force: true }));
+      } finally {
+        if (opts.reload) setBusy(null);
+      }
+    },
+    [convert, setScreen],
+  );
+
+  // ---------------------------------------------------------------- batch
+  const runBatch = useCallback(async (items: BatchItem[]) => {
+    const token = ++batchToken.current;
+    for (const item of items) {
+      if (token !== batchToken.current) return;
+      updateBatch(item.id, { status: "converting", result: undefined, error: undefined });
+      try {
+        await engine.open(item.job.sources, item.job.name, prefsRef.current.format === "dwg");
+        const r = await engine.convert(engineSettings(prefsRef.current, AUTO), false);
+        if (isEmpty(r.report)) updateBatch(item.id, { status: "failed", error: explain({ kind: "empty" }) });
+        else updateBatch(item.id, { status: "done", result: r });
+      } catch (e) {
+        updateBatch(item.id, { status: "failed", error: explain(failureOf(e)) });
+      }
     }
   }, []);
 
-  const openFiles = useCallback(async (files: File[]) => {
-    const obj = files.find((f) => f.name.toLowerCase().endsWith(".obj"));
-    const onlyMtl = files.find((f) => f.name.toLowerCase().endsWith(".mtl"));
-    if (!obj && onlyMtl && phaseRef.current === "work") {
-      // Materials for the open model: apply them and re-convert.
-      await engine.setMtl(onlyMtl);
-      setFile((prev) => (prev ? { ...prev, mtl: onlyMtl.name } : prev));
-      void run(settingsRef.current);
-      return;
-    }
-    if (!obj) {
-      notifications.show({ title: "Choose an .obj file", message: "You can add its .mtl alongside it.", color: "accent" });
-      return;
-    }
-    const mtls = files.filter((f) => f.name.toLowerCase().endsWith(".mtl"));
-    runToken.current++;
-    fileName.current = obj.name;
-    setFile({ name: obj.name, size: obj.size, exporter: null, mtl: null });
-    setPhase("loading");
-    setBusy(true);
-    let info: Inspection;
-    try {
-      info = await engine.load(obj);
-    } catch (err) {
-      setError({ name: obj.name, message: (err as Error).message });
-      setPhase("failed");
-      setBusy(false);
-      return;
-    }
-    // Prefer the MTL the OBJ names; otherwise the only one given.
-    const named = mtls.find((m) => info.mtllibs.some((l) => l.split(/[\\/]/).pop()?.toLowerCase() === m.name.toLowerCase()));
-    const mtl = named ?? (mtls.length === 1 ? mtls[0] : undefined);
-    if (mtl) await engine.setMtl(mtl);
-    setInspection(info);
-    setFile({ name: obj.name, size: obj.size, exporter: info.hints.exporter, mtl: mtl?.name ?? null });
-    const saved = loadSettings();
-    if (saved) {
-      setSettings(saved);
-      await run(saved);
-    } else {
-      setBusy(false);
-      setAsking(true);
-    }
-  }, [run]);
-
-  const change = (next: Settings) => {
-    setSettings(next);
-    if (loadSettings()) saveSettings(next); // keep remembering the latest choice
-    void run(next);
+  const startBatch = (jobs: Job[]) => {
+    batchRef.current = jobs.map((job) => ({ id: ++seq.current, job, name: jobName(job), size: jobSize(job), status: "waiting" as const }));
+    setBatch(batchRef.current);
+    setCur(null);
+    shownPreview.current = null;
+    setScreen("batch", screenRef.current === "choose" ? "replace" : "push");
+    void runBatch(batchRef.current);
   };
 
+  // ---------------------------------------------------------------- opening files
+  const openFiles = useCallback(
+    async (files: File[], handles: FileHandleLike[] = []) => {
+      let p;
+      try {
+        p = await plan(files);
+      } catch (e) {
+        notifications.show({ color: "red", title: "Couldn't open the .zip", message: (e as Error).message });
+        return;
+      }
+      if (p.kind === "none") {
+        notifications.show({ title: "Nothing to convert", message: p.ignored.length ? `Not used: ${p.ignored.slice(0, 3).join(", ")}` : "Choose an .obj, an .xyz or a .zip." });
+        return;
+      }
+      if (p.kind === "materials") {
+        if (screenRef.current === "work" && currentRef.current) return addSources(p.mtls);
+        notifications.show({ title: "No model", message: "Choose an .obj, an .xyz or a .zip." });
+        return;
+      }
+      batchToken.current++; // a new drop stops a running batch
+      setWatching(false);
+      if (p.kind === "one") {
+        const only = p.job.sources.length === 1 ? p.job.sources[0] : null;
+        const handle = only ? (handles.find((h) => h.name === only.file.name) ?? null) : null;
+        return openJob(p.job, handle);
+      }
+      if (p.kind === "choose") {
+        choiceRef.current = { combined: p.combined, separate: p.separate };
+        setChoice(choiceRef.current);
+        setScreen("choose", "push");
+        return;
+      }
+      startBatch(p.jobs);
+    },
+    [openJob],
+  );
+
+  /** Add files (material libraries) to the open drawing and read it again. */
+  const addSources = async (extra: Source[]) => {
+    const cur = currentRef.current;
+    if (!cur) return;
+    const names = new Set(extra.map((s) => baseName(s.path).toLowerCase()));
+    const job: Job = { ...cur.job, sources: [...cur.job.sources.filter((s) => !names.has(baseName(s.path).toLowerCase())), ...extra] };
+    await openJob(job, cur.handle, { reload: true, force: true, choices: cur.choices, batchItem: cur.batchItem });
+  };
+
+  /** Choose files: the browser's file picker (with handles, for reloading) or the input. */
+  const pick = useCallback(async () => {
+    const w = window as Window & { showOpenFilePicker?: (o: object) => Promise<FileHandleLike[]> };
+    if (!w.showOpenFilePicker) return input.current?.click();
+    let handles: FileHandleLike[];
+    try {
+      handles = await w.showOpenFilePicker({ multiple: true, types: [{ description: "3D models", accept: { "application/octet-stream": [".obj", ".xyz", ".mtl", ".jpg", ".jpeg", ".png", ".zip"] } }] });
+    } catch (e) {
+      if (!(e instanceof DOMException && e.name === "AbortError")) input.current?.click();
+      return;
+    }
+    await openFiles(await Promise.all(handles.map((h) => h.getFile())), handles);
+  }, [openFiles]);
+
+  // ---------------------------------------------------------------- settings
+  const change = (choices: Partial<FileChoices>) => {
+    const cur = currentRef.current;
+    if (!cur) return;
+    const next = { ...cur, choices: { ...cur.choices, ...choices } };
+    setCur(next);
+    void convert(next);
+  };
+
+  const changePrefs = (update: Partial<Prefs>) => {
+    setPrefs(update);
+    const cur = currentRef.current;
+    if (cur && screenRef.current === "work") void convert(cur);
+  };
+
+  // ---------------------------------------------------------------- downloads
+  const ext = () => formatInfo(prefsRef.current.format).ext;
+
+  const save = async (blob: Blob, name: string, pickLocation = false) => {
+    try {
+      const saved = await saveFile(blob, name, pickLocation);
+      if (saved) setDownloaded(saved);
+    } catch (e) {
+      notifications.show({ color: "red", title: "Couldn't save the file", message: (e as Error).message });
+    }
+  };
+
+  const download = (pickLocation: boolean) => {
+    const cur = currentRef.current;
+    const r = resultRef.current;
+    if (cur && r && !busy) void save(r.file, `${stem(cur.inspection.name)}.${ext()}`, pickLocation);
+  };
+
+  const downloadVisible = async (hiddenLayers: string[]) => {
+    const cur = currentRef.current;
+    if (!cur) return;
+    setBusy("Converting…");
+    try {
+      const r = await engine.convert(engineSettings(prefsRef.current, cur.choices, hiddenLayers), false);
+      await save(r.file, `${stem(cur.inspection.name)} (visible layers).${ext()}`);
+    } catch (e) {
+      notifications.show({ color: "red", title: "Couldn't convert the visible layers", message: (e as Error).message });
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const downloadReport = async () => {
+    const cur = currentRef.current;
+    const r = resultRef.current;
+    if (!cur || !r) return;
+    const report = { ...r.report, output: { ...r.report.output, sha256: await sha256Hex(r.file) } };
+    const saved = await saveFile(new Blob([JSON.stringify(report, null, 2)], { type: "application/json" }), `${stem(cur.inspection.name)}.report.json`).catch(() => null);
+    if (saved) setDownloaded(saved);
+  };
+
+  const downloadAll = async () => {
+    const done = batchRef.current.filter((i) => i.status === "done" && i.result);
+    setZipping(true);
+    try {
+      const names = new Set<string>();
+      const files = done.map((i) => {
+        let name = `${stem(i.name)}.${ext()}`;
+        for (let n = 2; names.has(name.toLowerCase()); n++) name = `${stem(i.name)} (${n}).${ext()}`;
+        names.add(name.toLowerCase());
+        return { name, blob: i.result!.file };
+      });
+      await save(await zipFiles(files), `obj2cad ${done.length} files.zip`);
+    } catch (e) {
+      notifications.show({ color: "red", title: "Couldn't make the .zip", message: (e as Error).message });
+    } finally {
+      setZipping(false);
+    }
+  };
+
+  // ---------------------------------------------------------------- watching
+  useEffect(() => {
+    if (!watching || !current?.handle) return;
+    const timer = setInterval(async () => {
+      const cur = currentRef.current;
+      if (!cur?.handle || screenRef.current !== "work") return;
+      try {
+        const f = await cur.handle.getFile();
+        const old = cur.job.sources[0].file;
+        if (f.lastModified !== old.lastModified || f.size !== old.size) {
+          const job: Job = { ...cur.job, sources: [{ file: f, path: cur.job.sources[0].path }, ...cur.job.sources.slice(1)] };
+          await openJob(job, cur.handle, { reload: true, force: true, choices: cur.choices, batchItem: cur.batchItem });
+        }
+      } catch {
+        setWatching(false); // file moved or permission withdrawn
+      }
+    }, 2000);
+    return () => clearInterval(timer);
+  }, [watching, current?.handle, openJob]);
+
+  // ---------------------------------------------------------------- global keys
   useEffect(() => {
     const idle = window.requestIdleCallback ?? ((cb: () => void) => setTimeout(cb, 1500));
     idle(() => void loadWorkspace());
   }, []);
 
-  // Ctrl/Cmd+O opens a file, like a desktop app.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "o") {
+      if (!(e.ctrlKey || e.metaKey)) return;
+      if (e.key.toLowerCase() === "o") {
         e.preventDefault();
-        input.current?.click();
+        void pick();
+      } else if (e.key.toLowerCase() === "s" && screenRef.current === "work") {
+        e.preventDefault();
+        download(e.shiftKey);
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, []);
+  });
 
-  // ---------------------------------------------------------------- derived
-  const suggestion = useMemo<Suggestion | null>(() => {
-    if (!inspection || phase !== "work") return null;
-    const h = inspection.hints;
-    const su = HINT_UNITS[h.units];
-    if (su && su !== settings.units && h.units !== "unitless") {
-      const name = UNITS.find((u) => u.value === su)!.name;
-      return { text: `Suggested: ${name} (${h.units_reason})`, apply: () => change({ ...settings, units: su }) };
-    }
-    const sup = HINT_UP[h.up_axis];
-    // Orientation is only worth suggesting when we know the exporter's convention.
-    if (h.exporter && sup && sup !== settings.up) {
-      const label = UPS.find((u) => u.value === sup)!.label;
-      return { text: `Suggested: ${label} (${h.up_axis_reason})`, apply: () => change({ ...settings, up: sup }) };
-    }
-    return null;
-  }, [inspection, settings, phase]); // `change` is recreated each render; these are its inputs
-
-  const stem = (file?.name ?? "model.obj").replace(/\.obj$/i, "");
-  const exportDxf = () => result && download(result.dxf as BlobPart, `${stem}.dxf`, "application/dxf");
-  const exportReport = () => result && download(result.report, `${stem}.report.json`, "application/json");
-
+  // ---------------------------------------------------------------- render
+  const inBatch = current?.batchItem != null && batch.length > 0;
   return (
-    <div className="relative h-full">
+    <div className="relative min-h-dvh">
       <TopBar
-        file={phase === "work" || phase === "loading" ? file : null}
-        theme={theme}
+        file={
+          screen === "work" && current
+            ? {
+                name: current.inspection.name,
+                size: jobSize(current.job),
+                exporter: current.inspection.hints.exporter,
+                files: current.inspection.files.filter((f) => f.role !== "missing" && f.role !== "not_used").length,
+              }
+            : null
+        }
         offlineReady={offlineReady}
-        onToggleTheme={onToggleTheme}
-        onOpen={() => input.current?.click()}
-        onDownloadReport={phase === "work" ? exportReport : undefined}
+        onOpen={() => void pick()}
+        onBack={screen === "work" && inBatch ? () => window.history.back() : undefined}
+        backLabel="All files"
+        watch={screen === "work" && current?.handle ? watching : null}
+        onWatch={setWatching}
       />
 
-      {phase === "empty" && <DropScreen onPick={() => input.current?.click()} />}
-      {phase === "failed" && error && <FailedScreen name={error.name} message={error.message} onPick={() => input.current?.click()} />}
-      {phase === "work" && result && report && (
+      {screen === "empty" && <DropScreen onPick={() => void pick()} />}
+      {screen === "preflight" && preflight && (
+        <PreflightScreen
+          name={preflight.name}
+          size={preflight.size}
+          cliUrl={CLI_URL}
+          onContinue={preflight.go}
+          onCancel={() => setScreen(currentRef.current && resultRef.current ? "work" : "empty")}
+        />
+      )}
+      {screen === "loading" && <LoadingScreen name={loading.name} progress={loading.progress} />}
+      {screen === "failed" && failed && <FailedScreen name={failed.name} explained={failed.explained} onPick={() => void pick()} onRetry={failed.retry} />}
+      {screen === "choose" && choice && (
+        <ChoiceScreen separate={choice.separate} onCombine={() => void openJob(choice.combined, null)} onSeparate={() => startBatch(choice.separate)} />
+      )}
+      {screen === "batch" && (
+        <BatchScreen
+          items={batch}
+          format={prefs.format}
+          zipping={zipping}
+          onFormat={(format: Format) => {
+            setPrefs({ format });
+            void runBatch(batchRef.current);
+          }}
+          onOpen={(item) => void openJob(item.job, null, { batchItem: item.id })}
+          onDownload={(item) => item.result && void save(item.result.file, `${stem(item.name)}.${ext()}`)}
+          onDownloadAll={() => void downloadAll()}
+        />
+      )}
+      {screen === "work" && result && (
         <ErrorBoundary>
-        <Suspense fallback={<main className="h-full bg-viewport" />}>
-        <Workspace
-          result={result}
-          report={report}
-          settings={settings}
-          theme={theme}
-          busy={busy}
-          exporter={file?.exporter ?? null}
-          onAddMtl={() => mtlInput.current?.click()}
-          suggestion={suggestion}
-          onUnits={(units) => change({ ...settings, units })}
-          onUp={(up) => change({ ...settings, up })}
-          onExport={exportDxf}
-          onDownloadReport={exportReport}
-        />
-        </Suspense>
+          <Suspense fallback={<main className="h-dvh bg-viewport" />}>
+            <Workspace
+              result={result}
+              preview={preview}
+              inspection={current?.inspection ?? null}
+              prefs={prefs}
+              busy={busy}
+              downloaded={downloaded}
+              onUp={(up: UpAxis | null) => change({ up })}
+              onUnits={(units: Units | null) => change({ units })}
+              onHouseUnits={(houseUnits: Units | null) => changePrefs({ houseUnits })}
+              onKeepLoose={(keepLoose) => change({ keepLoose })}
+              onLayerMode={(layerMode: LayerMode) => changePrefs({ layerMode })}
+              onFormat={(format: Format) => changePrefs({ format })}
+              onIncludeName={(includeName) => changePrefs({ includeName })}
+              onCurves={(curves) => changePrefs({ curves })}
+              onDownload={download}
+              onDownloadVisible={(hidden) => void downloadVisible(hidden)}
+              onDownloadReport={() => void downloadReport()}
+              onAddMtl={() => mtlInput.current?.click()}
+              onAnother={() => void pick()}
+            />
+          </Suspense>
         </ErrorBoundary>
-      )}
-      {phase === "loading" && (
-        <main className="paper flex h-full items-center justify-center" role="status">
-          <div className="panel flex flex-col items-center gap-4 px-10 py-8">
-            <motion.div animate={{ rotate: [0, 0, 120, 120] }} transition={{ duration: 1.8, repeat: Infinity, times: [0, 0.3, 0.7, 1] }}>
-              <CubeArt className="size-12 text-accent" />
-            </motion.div>
-            <div className="text-[14px] text-fg-2">
-              Reading <span className="num text-fg">{file?.name ?? "file"}</span>…
-            </div>
-          </div>
-        </main>
-      )}
-
-      {asking && inspection && (
-        <SetupDialog
-          inspection={inspection}
-          onCancel={() => {
-            setAsking(false);
-            setPhase("empty");
-          }}
-          onDone={(s, remember) => {
-            setAsking(false);
-            if (remember) saveSettings(s);
-            setSettings(s);
-            void run(s);
-          }}
-        />
       )}
 
       <Dropzone.FullScreen
@@ -258,15 +532,11 @@ export function App({ theme, onToggleTheme }: { theme: Theme; onToggleTheme: () 
         classNames={{ fullScreen: "!bg-[var(--backdrop)] backdrop-blur-sm", root: "!h-full !border-0 !bg-transparent !p-0", inner: "!h-full" }}
       >
         <AnimatePresence>
-          <motion.div
-            initial={{ scale: 0.97, opacity: 0 }}
-            animate={{ scale: 1, opacity: 1 }}
-            className="flex h-full items-center justify-center p-8"
-          >
+          <motion.div initial={{ scale: 0.97, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} className="flex h-full items-center justify-center p-8">
             <div className="panel flex flex-col items-center gap-4 border-2 border-dashed !border-accent px-12 py-12 text-center">
               <CubeArt className="size-16 text-accent" />
-              <div className="font-display text-[32px] font-semibold tracking-tight">Drop to convert</div>
-              <div className="text-[14px] text-fg-3">.obj, plus its .mtl for colors</div>
+              <div className="font-display text-[32px] font-semibold tracking-tight">Drop to open</div>
+              <div className="text-[14px] text-fg-3">.obj, .xyz, .mtl, images or .zip</div>
             </div>
           </motion.div>
         </AnimatePresence>
@@ -277,20 +547,17 @@ export function App({ theme, onToggleTheme }: { theme: Theme; onToggleTheme: () 
         type="file"
         accept=".mtl"
         hidden
-        onChange={async (e) => {
+        onChange={(e) => {
           const f = e.target.files?.[0];
           e.target.value = "";
-          if (!f) return;
-          await engine.setMtl(f);
-          setFile((prev) => (prev ? { ...prev, mtl: f.name } : prev));
-          void run(settings);
+          if (f) void addSources([{ file: f, path: f.name }]);
         }}
       />
       <input
         ref={input}
         type="file"
         multiple
-        accept=".obj,.mtl"
+        accept=".obj,.xyz,.mtl,.jpg,.jpeg,.png,.zip"
         hidden
         onChange={(e) => {
           const files = Array.from(e.target.files ?? []);

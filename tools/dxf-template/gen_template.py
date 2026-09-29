@@ -6,10 +6,14 @@ ezdxf (MIT), whose output is tested against AutoCAD and BricsCAD. We then:
 * remove ezdxf-specific bookkeeping (EZDXF appid, EZDXF_META dictionary),
 * make it deterministic (fixed timestamps, GUIDs filled in by the writer),
 * add the MESH class AutoCAD declares for AcDbSubDMesh entities,
-* insert @@MARKERS@@ the Rust writer fills in.
+* insert @@MARKERS@@ the Rust writer fills in (ACDSDATA: ACIS data, only when needed).
+
+Also writes the ACDSDATA section's schema preamble (the part before the per-body ACIS
+records), taken from ezdxf's default, which Autodesk's viewer accepts.
 
 Run:  python tools/dxf-template/gen_template.py
-Output: crates/obj2cad-dxf/templates/r2018.dxf (committed; regenerate only on purpose).
+Output: crates/obj2cad-dxf/templates/r2018.dxf and acdsdata.dxf (committed; regenerate
+only on purpose).
 """
 
 from __future__ import annotations
@@ -32,7 +36,17 @@ HEADER_MARKERS = {
     "$VERSIONGUID": "@@VERSIONGUID@@",
     "$LASTSAVEDBY": "@@LASTSAVEDBY@@",
 }
-FIXED_DATES = ("$TDCREATE", "$TDUCREATE", "$TDUPDATE", "$TDUUPDATE")
+# Dates come from the source file (deterministic per input), filled in by the writer.
+DATE_MARKERS = {
+    "$TDCREATE": "@@TDCREATE@@",
+    "$TDUCREATE": "@@TDUCREATE@@",
+    "$TDUPDATE": "@@TDUPDATE@@",
+    "$TDUUPDATE": "@@TDUUPDATE@@",
+}
+# The opening view (VPORT *Active) is fitted to the model by the writer: one marker per
+# point/value, placed where its first pair was; the pairs' other coordinates are dropped.
+VPORT_MARKERS = {"12": "@@VPORT_CENTER@@", "16": "@@VPORT_DIRECTION@@", "17": "@@VPORT_TARGET@@", "40": "@@VPORT_HEIGHT@@"}
+VPORT_DROP = {"22", "26", "36", "27", "37"}
 
 
 def pairs_of(text: str) -> list[tuple[str, str]]:
@@ -101,9 +115,20 @@ def main() -> None:
             while i < len(pairs) and pairs[i][0] not in ("9", "0"):
                 i += 1
             continue
-        if in_header and c == "9" and v in FIXED_DATES:
-            out += [f"  9\n{v}", " 40\n2461318.5"]  # 2026-10-01, fixed for determinism
+        if in_header and c == "9" and v in DATE_MARKERS:
+            out.append(DATE_MARKERS[v])
             i += 2
+            continue
+        if (c, v) == ("2", "*Active") and ("0", "VPORT") in pairs[i - 6 : i]:
+            out.append(f"{c:>3}\n{v}")
+            i += 1
+            while pairs[i][0] != "0":
+                code = pairs[i][0]
+                if code in VPORT_MARKERS:
+                    out.append(VPORT_MARKERS[code])
+                elif code not in VPORT_DROP:
+                    out.append(f"{code:>3}\n{pairs[i][1]}")
+                i += 1
             continue
         if in_header and (c, v) == ("0", "ENDSEC"):
             out.append("@@CUSTOMPROPERTIES@@")
@@ -114,6 +139,7 @@ def main() -> None:
                 "  0\nCLASS\n  1\nMESH\n  2\nAcDbSubDMesh\n  3\nObjectDBX Classes\n"
                 " 90\n4095\n 91\n0\n280\n0\n281\n1"
             )
+            out.append("@@CLASSES@@")  # SURFACE, when the drawing has surfaces
             i += 1
             continue
         if (c, v) == ("2", "LAYER") and pairs[i - 1] == ("0", "TABLE"):
@@ -127,6 +153,9 @@ def main() -> None:
             continue
         if (c, v) == ("0", "ENDTAB") and "@@LAYERCOUNT@@" in out and "@@LAYERS@@" not in out:
             out.append("@@LAYERS@@")
+        if (c, v) == ("0", "EOF"):
+            # ACIS data of surfaces and solids (DXF R2013+), written only when there are any.
+            out.append("@@ACDSDATA@@")
         if (c, v) == ("2", "ENTITIES"):
             out.append(f"{c:>3}\n{v}")
             out.append("@@ENTITIES@@")
@@ -136,12 +165,32 @@ def main() -> None:
         i += 1
 
     text = "\n".join(out) + "\n"
-    for marker in list(HEADER_MARKERS.values()) + ["@@CUSTOMPROPERTIES@@", "@@LAYERS@@", "@@LAYERCOUNT@@", "@@ENTITIES@@"]:
+    markers = (
+        list(HEADER_MARKERS.values())
+        + list(DATE_MARKERS.values())
+        + list(VPORT_MARKERS.values())
+        + ["@@CUSTOMPROPERTIES@@", "@@LAYERS@@", "@@LAYERCOUNT@@", "@@ENTITIES@@", "@@ACDSDATA@@", "@@CLASSES@@"]
+    )
+    for marker in markers:
         assert text.count(marker) == 1, marker
     OUT.parent.mkdir(parents=True, exist_ok=True)
     OUT.write_text(text, newline="\n")
     print(f"wrote {OUT} ({len(text)} bytes); removed ezdxf handles {sorted(ezdxf_handles)}")
 
 
+def acdsdata() -> None:
+    from ezdxf.sections.acdsdata import DEFAULT_SETUP
+
+    lines = DEFAULT_SETUP.strip().split("\n")
+    pairs = [(lines[i].strip(), lines[i + 1]) for i in range(0, len(lines) - 1, 2)]
+    assert pairs[:2] == [("0", "SECTION"), ("2", "ACDSDATA")]
+    if pairs[-1] == ("0", "ENDSEC"):
+        pairs = pairs[:-1]  # the writer adds records, then ENDSEC
+    out = OUT.with_name("acdsdata.dxf")
+    out.write_text("\n".join(f"{c:>3}\n{v}" for c, v in pairs) + "\n", newline="\n")
+    print(f"wrote {out}")
+
+
 if __name__ == "__main__":
     main()
+    acdsdata()

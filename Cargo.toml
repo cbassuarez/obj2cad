@@ -1,9 +1,10 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
+exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/cbassuarez/obj2cad"
@@ -12,11 +13,24 @@ rust-version = "1.85"
 [workspace.dependencies]
 obj2cad-core = { path = "crates/obj2cad-core" }
 obj2cad-dxf = { path = "crates/obj2cad-dxf" }
+obj2cad-dwg = { path = "crates/obj2cad-dwg" }
+obj2cad-acis = { path = "crates/obj2cad-acis" }
+obj2cad-curves = { path = "crates/obj2cad-curves" }
 ryu = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 
+# Dependencies without debug info: much smaller and faster dev/test builds (acadrust
+# alone is ~250 MB with it). Our own crates keep full debug info.
+[profile.dev.package."*"]
+debug = false
+
 [profile.release]
 lto = true
 codegen-units = 1
+
+# acadrust with obj2cad's negative-zero fix. `vendor/` is generated (and git-ignored):
+# run `python tools/vendor/fetch_acadrust.py` once after cloning.
+[patch.crates-io]
+acadrust = { path = "vendor/acadrust" }

@@ -11,7 +11,7 @@ export function AxisGizmo({ axes, unit }: { axes: AxisDirs | null; unit: string 
     : [];
   return (
     <div className="panel pointer-events-auto flex items-center gap-3 py-2 pr-4 pl-2">
-      <svg viewBox="-36 -36 72 72" className="size-[60px]" role="img" aria-label="Axes: Z is up, as in CAD">
+      <svg viewBox="-36 -36 72 72" className="size-[60px]" role="img" aria-label="Axes, Z up">
         <circle r="34" fill="none" stroke="var(--line)" />
         {items.map(({ k, d }) => {
           const x = d[0] * R;
@@ -29,9 +29,9 @@ export function AxisGizmo({ axes, unit }: { axes: AxisDirs | null; unit: string 
         })}
       </svg>
       <div className="num text-[11.5px] leading-relaxed text-fg-3">
-        CAD space · Z up
+        Z up
         <br />
-        {unit === "unitless" ? "no unit" : unit}
+        {unit || "no unit"}
       </div>
     </div>
   );

@@ -1,0 +1,10 @@
+[package]
+name = "obj2cad-acis"
+description = "Minimal ACIS B-rep writer (SAT and SAB) for obj2cad's curved surfaces"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]

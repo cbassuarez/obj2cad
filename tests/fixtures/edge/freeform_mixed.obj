@@ -1,0 +1,12 @@
+# a triangle and a free-form surface
+v 0 0 0
+v 1 0 0
+v 0 1 0
+v 1 1 0
+f 1 2 3
+cstype bspline
+deg 1 1
+surf 0 1 0 1 1 2 3 4
+parm u 0 0 1 1
+parm v 0 0 1 1
+end

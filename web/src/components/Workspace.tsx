@@ -2,52 +2,80 @@ import { useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
 import { Viewer, type AxisDirs } from "@/viewer/Viewer";
 import { AxisGizmo } from "@/components/AxisGizmo";
-import { Dock, type Suggestion } from "@/components/Dock";
+import { Dock } from "@/components/Dock";
 import { Inspector } from "@/components/Inspector";
 import { LayersCard } from "@/components/LayersCard";
-import type { ConvertResult, Report } from "@/lib/engine";
-import type { Settings, Theme, Units, Up } from "@/lib/settings";
+import type { Inspection, PreviewBuffers, Result } from "@/lib/engine";
+import type { Format, LayerMode, Prefs, UpAxis, Units } from "@/lib/settings";
+import { unitSymbol } from "@/lib/settings";
 
 function cssVar(name: string) {
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 }
 
+/** Preview buffers and the orientation they were built in. `id` changes per build;
+ *  `fileId` per opened file (a new file re-frames the view). */
+export interface PreviewState {
+  buffers: PreviewBuffers;
+  builtUp: UpAxis;
+  id: number;
+  fileId: number;
+}
+
 export function Workspace({
   result,
-  report,
-  settings,
-  theme,
+  preview,
+  inspection,
+  prefs,
   busy,
-  exporter,
-  suggestion,
-  onAddMtl,
-  onUnits,
+  downloaded,
   onUp,
-  onExport,
+  onUnits,
+  onHouseUnits,
+  onKeepLoose,
+  onLayerMode,
+  onFormat,
+  onIncludeName,
+  onCurves,
+  onDownload,
+  onDownloadVisible,
   onDownloadReport,
+  onAddMtl,
+  onAnother,
 }: {
-  result: ConvertResult;
-  report: Report;
-  settings: Settings;
-  theme: Theme;
-  busy: boolean;
-  exporter: string | null;
-  suggestion: Suggestion | null;
-  onAddMtl: () => void;
-  onUnits: (u: Units) => void;
-  onUp: (u: Up) => void;
-  onExport: () => void;
+  result: Result;
+  preview: PreviewState | null;
+  inspection: Inspection | null;
+  prefs: Prefs;
+  busy: string | null;
+  downloaded: string | null;
+  onUp: (u: UpAxis | null) => void;
+  onUnits: (u: Units | null) => void;
+  onHouseUnits: (u: Units | null) => void;
+  onKeepLoose: (keep: boolean) => void;
+  onLayerMode: (m: LayerMode) => void;
+  onFormat: (f: Format) => void;
+  onIncludeName: (on: boolean) => void;
+  onCurves: (on: boolean) => void;
+  onDownload: (pick: boolean) => void;
+  onDownloadVisible: (hiddenLayers: string[]) => void;
   onDownloadReport: () => void;
+  onAddMtl: () => void;
+  onAnother: () => void;
 }) {
   const host = useRef<HTMLDivElement>(null);
   const viewer = useRef<Viewer | null>(null);
+  const shownFile = useRef<number | null>(null);
   const [axes, setAxes] = useState<AxisDirs | null>(null);
   const [edges, setEdges] = useState(false);
+  const [ortho, setOrtho] = useState(false);
   const [hidden, setHidden] = useState<Set<number>>(new Set());
+  const { report, decisions } = result;
 
   useEffect(() => {
     const v = new Viewer(host.current!);
     v.onAxes = setAxes;
+    v.setTheme({ grid: cssVar("--grid"), gridMajor: cssVar("--grid-major"), dim: cssVar("--dim"), edge: cssVar("--text") });
     viewer.current = v;
     return () => {
       v.dispose();
@@ -55,27 +83,20 @@ export function Workspace({
     };
   }, []);
 
+  // New buffers: rebuild (and re-frame only for a new file).
   useEffect(() => {
-    viewer.current?.setTheme({
-      grid: cssVar("--grid"),
-      gridMajor: cssVar("--grid-major"),
-      dim: cssVar("--dim"),
-      edge: cssVar("--accent"),
-      line: cssVar("--info"),
-    });
-  }, [theme]);
-
-  useEffect(() => {
-    viewer.current?.setUnit(settings.units === "unitless" ? "" : settings.units);
-  }, [settings.units]);
-
-  useEffect(() => {
-    viewer.current?.show(result);
-    viewer.current?.setEdges(edges);
+    const v = viewer.current;
+    if (!v || !preview) return;
+    v.show(preview.buffers, preview.builtUp, shownFile.current !== preview.fileId);
+    shownFile.current = preview.fileId;
+    v.setEdges(edges);
     setHidden(new Set());
-    // `edges` is applied on its own below; a new result should not re-run on toggles.
-  }, [result]);
+    // `edges` is applied on its own below; new buffers must not re-run on toggles.
+  }, [preview]);
 
+  // A new orientation turns the existing preview.
+  useEffect(() => viewer.current?.setOrientation(decisions.up_axis), [decisions.up_axis, preview]);
+  useEffect(() => viewer.current?.setUnit(unitSymbol(decisions.units)), [decisions.units]);
   useEffect(() => viewer.current?.setEdges(edges), [edges]);
 
   const toggleLayer = (layer: number) => {
@@ -86,17 +107,15 @@ export function Workspace({
     viewer.current?.setLayerVisible(layer, !next.has(layer));
   };
 
+  const available = preview?.buffers.available ?? true;
+
   return (
-    <main className="h-full overflow-y-auto bg-viewport lg:relative lg:overflow-hidden">
-      {/* viewport */}
-      <div className="relative h-[62vh] min-h-[380px] lg:absolute lg:inset-0 lg:h-auto">
+    <main className="bg-viewport pb-2 lg:relative lg:h-dvh lg:min-h-[700px] lg:overflow-hidden lg:pb-0">
+      <div className="relative h-[60vh] min-h-[360px] lg:absolute lg:inset-0 lg:h-auto">
         <div ref={host} className="absolute inset-0" />
-        {!result.previewAvailable && (
+        {!available && (
           <div className="absolute inset-0 grid place-items-center p-6">
-            <div className="panel max-w-sm p-5 text-center text-[13.5px] text-fg-2">
-              <div className="mb-1 font-semibold text-fg">No preview for this model</div>
-              Its coordinates are too large to draw on screen. The DXF is unaffected and still exact.
-            </div>
+            <div className="panel px-5 py-4 text-[13.5px] font-semibold">No preview for this model</div>
           </div>
         )}
 
@@ -110,31 +129,44 @@ export function Workspace({
               role="status"
             >
               <span className="size-3.5 animate-spin rounded-full border-2 border-line border-t-accent" />
-              Converting…
+              {busy}
             </motion.div>
           )}
         </AnimatePresence>
 
         <div className="pointer-events-none absolute bottom-4 left-4 hidden sm:block">
-          <AxisGizmo axes={axes} unit={settings.units} />
+          <AxisGizmo axes={axes} unit={unitSymbol(decisions.units)} />
         </div>
-
       </div>
 
       <div className="flex justify-center px-4 pt-4 lg:pointer-events-none lg:absolute lg:right-[396px] lg:bottom-4 lg:left-[300px] lg:p-0">
-          <Dock
-            settings={settings}
-            onUnits={onUnits}
-            onUp={onUp}
-            edges={edges}
-            onEdges={setEdges}
-            onFit={() => viewer.current?.fit()}
-            onExport={onExport}
-            exportBytes={busy ? null : result.dxf.byteLength}
-            busy={busy}
-            suggestion={suggestion}
-          />
-        </div>
+        <Dock
+          report={report}
+          decisions={decisions}
+          format={prefs.format}
+          busy={busy}
+          unitsStated={inspection?.hints.units_source === "exporter"}
+          houseUnits={prefs.houseUnits}
+          edges={edges}
+          ortho={ortho}
+          downloaded={downloaded}
+          onUp={onUp}
+          onUnits={onUnits}
+          onHouseUnits={onHouseUnits}
+          onEdges={setEdges}
+          onView={(v) => viewer.current?.setView(v)}
+          onOrtho={(on) => {
+            setOrtho(on);
+            viewer.current?.setOrtho(on);
+          }}
+          onFit={() => viewer.current?.fit()}
+          onFormat={onFormat}
+          curves={prefs.curves}
+          onCurves={onCurves}
+          onDownload={onDownload}
+          onAnother={onAnother}
+        />
+      </div>
       {/* panels: floating on large screens, stacked below the viewer on small ones */}
       <motion.div
         initial={{ opacity: 0, x: -16 }}
@@ -142,7 +174,15 @@ export function Workspace({
         transition={{ delay: 0.05 }}
         className="pointer-events-none p-4 lg:absolute lg:top-[76px] lg:left-4 lg:max-h-[calc(100%-200px)] lg:w-[268px] lg:p-0"
       >
-        <LayersCard report={report} hidden={hidden} onToggle={toggleLayer} />
+        <LayersCard
+          report={report}
+          mode={prefs.layerMode}
+          hidden={hidden}
+          busy={busy !== null}
+          onMode={onLayerMode}
+          onToggle={toggleLayer}
+          onDownloadVisible={() => onDownloadVisible(report.layers.filter((_, i) => hidden.has(i)).map((l) => l.name))}
+        />
       </motion.div>
       <motion.div
         initial={{ opacity: 0, x: 16 }}
@@ -150,7 +190,18 @@ export function Workspace({
         transition={{ delay: 0.1 }}
         className="pointer-events-none px-4 pb-6 lg:absolute lg:top-[76px] lg:right-4 lg:bottom-4 lg:flex lg:w-[364px] lg:p-0"
       >
-        <Inspector report={report} ms={result.ms} timings={result.timings} exporter={exporter} onAddMtl={onAddMtl} onDownloadReport={onDownloadReport} />
+        <Inspector
+          report={report}
+          format={prefs.format}
+          ms={result.ms}
+          timings={result.timings}
+          exporter={inspection?.hints.exporter ?? null}
+          includeName={prefs.includeName}
+          onIncludeName={onIncludeName}
+          onKeepLoose={onKeepLoose}
+          onAddMtl={onAddMtl}
+          onDownloadReport={onDownloadReport}
+        />
       </motion.div>
     </main>
   );

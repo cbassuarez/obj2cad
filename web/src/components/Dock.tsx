@@ -1,113 +1,246 @@
-import { Box, Download, Scan } from "lucide-react";
-import { AnimatePresence, motion } from "motion/react";
+import { Box, Check, ChevronDown, CircleCheck, Download, Scan } from "lucide-react";
+import { motion } from "motion/react";
+import { Menu } from "@mantine/core";
 import { Button } from "@/components/ui/button";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
-import { Tip } from "@/components/ui/tooltip";
-import { UNITS, UPS, type Settings, type Units, type Up } from "@/lib/settings";
-import { bytes } from "@/lib/format";
+import type { Decisions, Report } from "@/lib/engine";
+import { bytes, measure } from "@/lib/format";
+import { FORMATS, UNITS, UPS, formatInfo, unitName, unitSymbol, type Format, type UpAxis, type Units } from "@/lib/settings";
+import { canPickSaveLocation } from "@/lib/files";
+import type { ViewName } from "@/viewer/Viewer";
 
-export interface Suggestion {
-  text: string;
-  apply: () => void;
+const menuStyles = { dropdown: "panel !p-1", item: "!rounded-[3px] !text-[13px]", label: "!text-[11px]" };
+
+function Group({ label, tag, onReset, children }: { label: string; tag?: string; onReset?: () => void; children: React.ReactNode }) {
+  return (
+    <div className="flex flex-col gap-1">
+      <span className="flex items-baseline gap-1.5 px-1 text-[11px] font-medium text-fg-3">
+        {label}
+        {onReset ? (
+          <button type="button" className="cursor-pointer font-semibold text-accent hover:underline" onClick={onReset}>
+            Reset
+          </button>
+        ) : (
+          tag && <span className="text-fg-3/80">· {tag}</span>
+        )}
+      </span>
+      {children}
+    </div>
+  );
 }
 
-/** Bottom command dock (B): every setting that changes the output, plus export. */
-export function Dock({
-  settings,
-  onUnits,
-  onUp,
-  edges,
-  onEdges,
-  onFit,
-  onExport,
-  exportBytes,
-  busy,
-  suggestion,
-}: {
-  settings: Settings;
-  onUnits: (u: Units) => void;
-  onUp: (u: Up) => void;
-  edges: boolean;
-  onEdges: (on: boolean) => void;
-  onFit: () => void;
-  onExport: () => void;
-  exportBytes: number | null;
-  busy: boolean;
-  suggestion: Suggestion | null;
-}) {
-  return (
-    <div className="pointer-events-none flex flex-col items-center gap-2">
-      <AnimatePresence>
-        {suggestion && (
-          <motion.div
-            initial={{ opacity: 0, y: 8 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: 8 }}
-            className="panel pointer-events-auto flex items-center gap-3 !rounded-[4px] py-1.5 pr-1.5 pl-4 text-[13px] text-fg-2"
-            role="status"
-          >
-            <span className="size-1.5 rounded-full bg-info" aria-hidden="true" />
-            {suggestion.text}
-            <Button variant="secondary" size="sm" className="!rounded-[4px]" onClick={suggestion.apply}>
-              Use
-            </Button>
-          </motion.div>
-        )}
-      </AnimatePresence>
+const VIEWS: { value: ViewName; label: string }[] = [
+  { value: "iso", label: "Isometric" },
+  { value: "top", label: "Top" },
+  { value: "front", label: "Front" },
+  { value: "right", label: "Right" },
+];
 
-      <motion.div
-        initial={{ opacity: 0, y: 24 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ type: "spring", stiffness: 300, damping: 30 }}
-        className="panel pointer-events-auto flex max-w-full flex-wrap items-center justify-center gap-2 !rounded-[4px] p-2"
-      >
-        <Tip label="What one unit in your file means. This labels the drawing so CAD scales it correctly; your coordinates are never changed.">
-          <ToggleGroup type="single" value={settings.units} onValueChange={(v) => v && onUnits(v as Units)} aria-label="Units">
-            {UNITS.map((u) => (
-              <ToggleGroupItem key={u.value} value={u.value} className="num px-2.5" aria-label={u.name}>
+const UNITS_FROM: Record<Decisions["units_from"], string | undefined> = { chosen: undefined, file: "auto", size: "auto", default: "default", none: undefined };
+
+/** Bottom command dock: up direction, view, the download, units and real size. */
+export function Dock({
+  report,
+  decisions,
+  format,
+  busy,
+  unitsStated,
+  houseUnits,
+  edges,
+  ortho,
+  downloaded,
+  onUp,
+  onUnits,
+  onHouseUnits,
+  onEdges,
+  onView,
+  onOrtho,
+  onFit,
+  onFormat,
+  curves,
+  onCurves,
+  onDownload,
+  onAnother,
+}: {
+  report: Report;
+  decisions: Decisions;
+  format: Format;
+  busy: string | null;
+  /** The file's exporter states its units. */
+  unitsStated: boolean;
+  houseUnits: Units | null;
+  edges: boolean;
+  ortho: boolean;
+  downloaded: string | null;
+  onUp: (u: UpAxis | null) => void;
+  onUnits: (u: Units | null) => void;
+  onHouseUnits: (u: Units | null) => void;
+  onEdges: (on: boolean) => void;
+  onView: (v: ViewName) => void;
+  onOrtho: (on: boolean) => void;
+  onFit: () => void;
+  onFormat: (f: Format) => void;
+  /** Also write recognized curved surfaces. */
+  curves: boolean;
+  onCurves: (on: boolean) => void;
+  onDownload: (pick: boolean) => void;
+  onAnother: () => void;
+}) {
+  const fmtInfo = formatInfo(format);
+  const size = report.output.bounds && report.output.bounds[1].map((hi, a) => hi - report.output.bounds![0][a]);
+  const symbol = unitSymbol(decisions.units);
+  const upChanged = decisions.up_from === "chosen" && decisions.up_axis !== decisions.detected_up_axis;
+  const unitsChanged = decisions.units_from === "chosen" && decisions.units !== decisions.detected_units;
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 24 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ type: "spring", stiffness: 300, damping: 30 }}
+      className="panel pointer-events-auto flex w-full max-w-[680px] flex-col gap-2.5 p-2.5"
+    >
+      <div className="flex flex-wrap items-end justify-center gap-x-3 gap-y-2">
+        <Group label="Up direction" tag={decisions.up_from === "detected" ? "auto" : undefined} onReset={upChanged ? () => onUp(null) : undefined}>
+          <ToggleGroup type="single" value={decisions.up_axis} onValueChange={(v) => v && onUp(v as UpAxis)} aria-label="Up direction">
+            {UPS.map((u) => (
+              <ToggleGroupItem key={u.value} value={u.value}>
                 {u.label}
               </ToggleGroupItem>
             ))}
           </ToggleGroup>
-        </Tip>
+        </Group>
 
-        <Tip label={<span>Which way is up. Blender, Maya and most 3D apps export Y-up; CAD is Z-up.<br />Rotating is exact: (x, y, z) → (x, −z, y).</span>}>
-          <ToggleGroup type="single" value={settings.up} onValueChange={(v) => v && onUp(v as Up)} aria-label="Orientation">
-            {UPS.map((u) => (
-              <ToggleGroupItem key={u.value} value={u.value} aria-label={u.label}>
-                {u.short}
-              </ToggleGroupItem>
-            ))}
-          </ToggleGroup>
-        </Tip>
-
-        <div className="flex gap-1 rounded-[4px] bg-panel-2 p-[3px]">
-          <Tip label={edges ? "Hide face edges" : "Show face edges (the file's real polygons)"}>
+        <Group label="View">
+          <div className="flex gap-0.5 rounded-[4px] bg-panel-2 p-[3px]">
             <Button
               variant="ghost"
-              size="icon-sm"
-              className="size-9 data-[on=true]:bg-panel-solid data-[on=true]:text-accent"
+              size="sm"
+              className="h-9 px-2.5 data-[on=true]:bg-panel-solid data-[on=true]:text-fg data-[on=true]:shadow-[inset_0_0_0_1px_var(--line)]"
               data-on={edges}
               aria-pressed={edges}
-              aria-label="Show face edges"
               onClick={() => onEdges(!edges)}
             >
               <Box />
+              Edges
             </Button>
-          </Tip>
-          <Tip label="Fit to view">
-            <Button variant="ghost" size="icon-sm" className="size-9" aria-label="Fit to view" onClick={onFit}>
+            <Button variant="ghost" size="sm" className="h-9 px-2.5" onClick={onFit}>
               <Scan />
+              Fit
             </Button>
-          </Tip>
-        </div>
+            <Menu position="top" offset={8} width={180} classNames={menuStyles}>
+              <Menu.Target>
+                <Button variant="ghost" size="sm" className="h-9 px-2.5" aria-label="Views">
+                  Views
+                  <ChevronDown />
+                </Button>
+              </Menu.Target>
+              <Menu.Dropdown>
+                {VIEWS.map((v) => (
+                  <Menu.Item key={v.value} onClick={() => onView(v.value)}>
+                    {v.label}
+                  </Menu.Item>
+                ))}
+                <Menu.Divider />
+                <Menu.Item onClick={() => onOrtho(!ortho)} rightSection={ortho ? <Check className="size-3.5" /> : null}>
+                  Orthographic
+                </Menu.Item>
+              </Menu.Dropdown>
+            </Menu>
+          </div>
+        </Group>
 
-        <Button variant="primary" className="h-[42px] min-w-[150px] rounded-[4px] px-5 text-[15px]" onClick={onExport} disabled={busy || exportBytes === null}>
-          <Download />
-          Export DXF
-          {exportBytes !== null && <span className="num text-[12px] font-normal opacity-70">{bytes(exportBytes)}</span>}
-        </Button>
-      </motion.div>
-    </div>
+        <div className="flex">
+          <Button variant="primary" className="h-[42px] min-w-[180px] rounded-r-none px-5 text-[15px]" onClick={() => onDownload(false)} disabled={busy !== null}>
+            <Download />
+            Download {fmtInfo.label.replace(" (binary)", "")}
+            <span className="num text-[12px] font-normal opacity-75">{busy === null ? bytes(report.output.bytes) : ""}</span>
+          </Button>
+          <Menu position="top-end" offset={8} width={220} classNames={menuStyles}>
+            <Menu.Target>
+              <Button variant="primary" className="h-[42px] rounded-l-none border-l border-white/25 px-2" aria-label="Download options" disabled={busy !== null}>
+                <ChevronDown />
+              </Button>
+            </Menu.Target>
+            <Menu.Dropdown>
+              <Menu.Label>Format</Menu.Label>
+              {FORMATS.map((f) => (
+                <Menu.Item key={f.value} onClick={() => onFormat(f.value)} rightSection={format === f.value ? <Check className="size-3.5" /> : null}>
+                  {f.label}
+                  {f.beta && <span className="ml-1.5 rounded-[2px] bg-warn-soft px-1 py-px text-[10.5px] font-medium text-warn">beta</span>}
+                </Menu.Item>
+              ))}
+              <Menu.Divider />
+              <Menu.Item onClick={() => onCurves(!curves)} rightSection={curves ? <Check className="size-3.5" /> : null}>
+                Curved surfaces
+              </Menu.Item>
+              {canPickSaveLocation() && (
+                <>
+                  <Menu.Divider />
+                  <Menu.Item onClick={() => onDownload(true)}>Save as…</Menu.Item>
+                </>
+              )}
+            </Menu.Dropdown>
+          </Menu>
+        </div>
+      </div>
+
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-1 border-t border-line-soft px-1 pt-2.5 text-[12.5px] text-fg-3" role="status">
+        <span className="flex items-center gap-1.5">
+          Units
+          <Menu position="top-start" offset={6} width={230} classNames={menuStyles}>
+            <Menu.Target>
+              <button type="button" className="inline-flex cursor-pointer items-center gap-0.5 font-semibold text-fg underline decoration-line underline-offset-2 hover:decoration-fg">
+                {decisions.units === "unitless" ? "None" : unitName(decisions.units)}
+                <ChevronDown className="size-3.5" />
+              </button>
+            </Menu.Target>
+            <Menu.Dropdown>
+              {UNITS.map((u) => (
+                <Menu.Item key={u.value} onClick={() => onUnits(u.value)} rightSection={decisions.units === u.value ? <Check className="size-3.5" /> : null}>
+                  {u.name}
+                </Menu.Item>
+              ))}
+              {!unitsStated && decisions.units !== "unitless" && (
+                <>
+                  <Menu.Divider />
+                  <Menu.Item
+                    onClick={() => onHouseUnits(houseUnits === decisions.units ? null : decisions.units)}
+                    rightSection={houseUnits === decisions.units ? <Check className="size-3.5" /> : null}
+                  >
+                    Use for files without units
+                  </Menu.Item>
+                </>
+              )}
+            </Menu.Dropdown>
+          </Menu>
+          {unitsChanged ? (
+            <button type="button" className="cursor-pointer font-semibold text-accent hover:underline" onClick={() => onUnits(null)}>
+              Reset
+            </button>
+          ) : (
+            UNITS_FROM[decisions.units_from] && <span>· {UNITS_FROM[decisions.units_from]}</span>
+          )}
+        </span>
+        {size && (
+          <span className="num">
+            Size in CAD {size.map(measure).join(" × ")}
+            {symbol ? ` ${symbol}` : ""}
+          </span>
+        )}
+        {busy && <span className="ml-auto text-accent">{busy}</span>}
+      </div>
+
+      {downloaded && busy === null && (
+        <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: "auto" }} className="flex items-center gap-2 px-1 text-[13px]">
+          <CircleCheck className="size-4 shrink-0 text-exact" />
+          <span className="min-w-0 truncate">
+            Downloaded <span className="num">{downloaded}</span>
+          </span>
+          <Button variant="link" className="ml-auto text-[13px]" onClick={onAnother}>
+            Convert another file
+          </Button>
+        </motion.div>
+      )}
+    </motion.div>
   );
 }

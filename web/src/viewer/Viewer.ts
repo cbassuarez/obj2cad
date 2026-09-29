@@ -3,39 +3,51 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { CSS2DObject, CSS2DRenderer } from "three/addons/renderers/CSS2DRenderer.js";
-
-export interface Preview {
-  positions: Float32Array;
-  indices: Uint32Array;
-  edges: Uint32Array;
-  colors: Uint8Array;
-  lines: Float32Array;
-  points: Float32Array;
-  /** Per mesh: [layer, indexStart, indexCount, edgeStart, edgeCount]. */
-  groups: Uint32Array;
-}
+import type { PreviewBuffers } from "@/lib/engine";
+import type { UpAxis } from "@/lib/settings";
 
 export interface ViewerTheme {
   grid: string;
   gridMajor: string;
   dim: string;
   edge: string;
-  line: string;
 }
 
 /** View-space direction of each world axis (x right, y up), for the axis gizmo. */
 export type AxisDirs = { x: [number, number, number]; y: [number, number, number]; z: [number, number, number] };
 
-export interface Dimensions {
-  size: [number, number, number];
-}
+export type ViewName = "iso" | "top" | "front" | "right";
+
+/** Camera directions (from target to camera), as AutoCAD names them. */
+const VIEWS: Record<ViewName, THREE.Vector3> = {
+  iso: new THREE.Vector3(1, -1, 1).normalize(), // SE isometric: the drawing's opening view
+  top: new THREE.Vector3(0, -1e-4, 1).normalize(),
+  front: new THREE.Vector3(0, -1, 0),
+  right: new THREE.Vector3(1, 0, 0),
+};
+
+/** Standing a Y-up model upright is +90° about X: (x, y, z) → (x, −z, y). */
+const UPRIGHT = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), Math.PI / 2);
+
+// sRGB bytes → linear bytes: three.js treats vertex colors as linear.
+const TO_LINEAR = Uint8Array.from({ length: 256 }, (_, i) => Math.round(255 * new THREE.Color().setRGB(i / 255, 0, 0, THREE.SRGBColorSpace).r));
+const linear = (c: Uint8Array) => {
+  for (let i = 0; i < c.length; i++) c[i] = TO_LINEAR[c[i]];
+  return c;
+};
+
+const FOV = 38;
+const MARGIN = 1.35; // room for the dimension labels around the model
 
 export class Viewer {
   private renderer: THREE.WebGLRenderer;
   private labels: CSS2DRenderer;
   private scene = new THREE.Scene();
-  private camera = new THREE.PerspectiveCamera(38, 1, 0.01, 1000);
+  private persp = new THREE.PerspectiveCamera(FOV, 1, 0.01, 1000);
+  private ortho = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.01, 1000);
+  private camera: THREE.PerspectiveCamera | THREE.OrthographicCamera = this.persp;
   private controls: OrbitControls;
+  /** The preview geometry; rotated (not rebuilt) when the up direction changes. */
   private content = new THREE.Group();
   private dims = new THREE.Group();
   private grid: THREE.Group | null = null;
@@ -45,21 +57,27 @@ export class Viewer {
   private radius = 1;
   private frame = 0;
   private edgesOn = false;
-  /** False when there is nothing to draw: no dimensions for a placeholder box. */
   private hasContent = false;
   private unit = "";
   private hidden = new Set<number>();
-  private theme: ViewerTheme = { grid: "#1c1f24", gridMajor: "#272b32", dim: "#8fb0ff", edge: "#c6f432", line: "#8fb0ff" };
+  private theme: ViewerTheme = { grid: "#ddd8ce", gridMajor: "#cbc4b7", dim: "#2b55c7", edge: "#1c1d1f" };
   private resizeObserver: ResizeObserver;
+  /** Orientation the current buffers were built in, and the one shown. */
+  private builtUp: UpAxis = "as_is";
+  private shownUp: UpAxis = "as_is";
+  private tween: { step: (t: number) => void; start: number; ms: number; done?: () => void } | null = null;
+  private dimLabels: { obj: CSS2DObject; extent: number }[] = [];
   /** Called after each rendered frame with the camera's current axis directions. */
   onAxes: ((axes: AxisDirs) => void) | null = null;
   private inv = new THREE.Quaternion();
+  private key = new THREE.DirectionalLight(0xffffff, 1.7);
+  private labelSize = new WeakMap<HTMLElement, { w: number; h: number }>();
 
   constructor(private host: HTMLElement) {
     this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     this.renderer.domElement.className = "absolute inset-0 size-full outline-none";
-    this.renderer.domElement.setAttribute("aria-label", "3D preview. Drag to orbit, scroll to zoom.");
+    this.renderer.domElement.setAttribute("aria-label", "3D preview");
     host.appendChild(this.renderer.domElement);
 
     this.labels = new CSS2DRenderer();
@@ -67,17 +85,21 @@ export class Viewer {
     this.labels.domElement.className = "pointer-events-none absolute inset-0 isolate overflow-hidden";
     host.appendChild(this.labels.domElement);
 
-    this.camera.up.set(0, 0, 1);
+    for (const c of [this.persp, this.ortho]) c.up.set(0, 0, 1);
     this.controls = new OrbitControls(this.camera, this.renderer.domElement);
     this.controls.enableDamping = true;
     this.controls.dampingFactor = 0.12;
+    this.controls.zoomToCursor = true;
+    // CAD habits: middle-drag pans (shift+middle orbits), right-drag pans too.
+    this.controls.mouseButtons = { LEFT: THREE.MOUSE.ROTATE, MIDDLE: THREE.MOUSE.PAN, RIGHT: THREE.MOUSE.PAN };
     this.controls.addEventListener("change", () => this.requestRender());
+    // Grabbing the view ends any animation at its end state.
+    this.controls.addEventListener("start", () => this.finishTween());
 
     this.scene.add(new THREE.HemisphereLight(0xffffff, 0x7d8594, 1.5));
-    const key = new THREE.DirectionalLight(0xffffff, 1.7);
-    key.position.set(1, -1.4, 2);
-    this.camera.add(key);
-    this.scene.add(this.camera, this.content, this.dims);
+    this.key.position.set(1, -1.4, 2);
+    this.persp.add(this.key);
+    this.scene.add(this.persp, this.content, this.dims);
 
     this.resizeObserver = new ResizeObserver(() => this.resize());
     this.resizeObserver.observe(host);
@@ -91,10 +113,14 @@ export class Viewer {
     this.requestRender();
   }
 
-  show(p: Preview): Dimensions {
+  /** Show new preview buffers, built in orientation `up`. */
+  show(p: PreviewBuffers, up: UpAxis, refit: boolean): void {
     this.clear();
+    this.tween = null;
+    this.builtUp = this.shownUp = up;
+    this.content.quaternion.identity();
     const position = new THREE.BufferAttribute(p.positions, 3);
-    const color = new THREE.BufferAttribute(p.colors, 3, true);
+    const color = new THREE.BufferAttribute(linear(p.colors), 3, true);
     const surface = new THREE.MeshStandardMaterial({
       vertexColors: true,
       flatShading: true, // facets are the truth; never smooth them away
@@ -106,6 +132,10 @@ export class Viewer {
       polygonOffsetUnits: 1,
     });
     const edgeMat = new THREE.LineBasicMaterial({ color: this.theme.edge, transparent: true, opacity: 0.4 });
+    const add = (layer: number, ...objs: THREE.Object3D[]) => {
+      this.content.add(...objs);
+      this.layers.set(layer, [...(this.layers.get(layer) ?? []), ...objs]);
+    };
 
     for (let g = 0; g < p.groups.length; g += 5) {
       const [layer, i0, ic, e0, ec] = p.groups.subarray(g, g + 5);
@@ -113,41 +143,78 @@ export class Viewer {
       geo.setAttribute("position", position);
       geo.setAttribute("color", color);
       geo.setIndex(new THREE.BufferAttribute(p.indices.subarray(i0, i0 + ic), 1));
-      const mesh = new THREE.Mesh(geo, surface);
       const eg = new THREE.BufferGeometry();
       eg.setAttribute("position", position);
       eg.setIndex(new THREE.BufferAttribute(p.edges.subarray(e0, e0 + ec), 1));
       const edges = new THREE.LineSegments(eg, edgeMat);
+      edges.userData.edges = true;
       this.edgeObjects.push(edges);
-      this.content.add(mesh, edges);
-      const list = this.layers.get(layer) ?? [];
-      list.push(mesh, edges);
-      this.layers.set(layer, list);
-    }
-    if (p.points.length) {
-      const pg = new THREE.BufferGeometry();
-      pg.setAttribute("position", new THREE.BufferAttribute(p.points, 3));
-      this.content.add(new THREE.Points(pg, new THREE.PointsMaterial({ color: this.theme.line, size: 6, sizeAttenuation: false })));
+      add(layer, new THREE.Mesh(geo, surface), edges);
     }
     if (p.lines.length) {
-      const lg = new THREE.BufferGeometry();
-      lg.setAttribute("position", new THREE.BufferAttribute(p.lines, 3));
-      this.content.add(new THREE.LineSegments(lg, new THREE.LineBasicMaterial({ color: this.theme.line })));
+      const pos = new THREE.BufferAttribute(p.lines, 3);
+      const col = new THREE.BufferAttribute(linear(p.lineColors), 3, true);
+      const mat = new THREE.LineBasicMaterial({ vertexColors: true });
+      for (let g = 0; g < p.lineGroups.length; g += 3) {
+        const [layer, start, count] = p.lineGroups.subarray(g, g + 3);
+        const geo = new THREE.BufferGeometry();
+        geo.setAttribute("position", pos);
+        geo.setAttribute("color", col);
+        geo.setDrawRange(start, count);
+        add(layer, new THREE.LineSegments(geo, mat));
+      }
+    }
+    if (p.points.length) {
+      const pos = new THREE.BufferAttribute(p.points, 3);
+      const col = new THREE.BufferAttribute(linear(p.pointColors), 3, true);
+      const mat = new THREE.PointsMaterial({ vertexColors: true, size: 5, sizeAttenuation: false });
+      for (let g = 0; g < p.pointGroups.length; g += 3) {
+        const [layer, start, count] = p.pointGroups.subarray(g, g + 3);
+        const geo = new THREE.BufferGeometry();
+        geo.setAttribute("position", pos);
+        geo.setAttribute("color", col);
+        geo.setDrawRange(start, count);
+        add(layer, new THREE.Points(geo, mat));
+      }
     }
 
     this.applyVisibility();
-    this.box.setFromObject(this.content, true);
-    this.hasContent = !this.box.isEmpty();
-    if (!this.hasContent) this.box.set(new THREE.Vector3(-1, -1, -1), new THREE.Vector3(1, 1, 1));
+    this.measure();
     const size = this.box.getSize(new THREE.Vector3());
     this.radius = Math.max(size.length() / 2, 1e-6);
-    this.camera.near = this.radius / 1000;
-    this.camera.far = this.radius * 1000;
-    this.camera.updateProjectionMatrix();
+    for (const c of [this.persp, this.ortho]) {
+      c.near = this.radius / 1000;
+      c.far = this.radius * 1000;
+      c.updateProjectionMatrix();
+    }
     this.rebuildGrid();
     this.rebuildDims();
-    this.fit();
-    return { size: [size.x, size.y, size.z] };
+    if (refit) this.setView("iso", false);
+    else this.requestRender();
+  }
+
+  /** Show the model in orientation `up`, turning the existing preview (no rebuild). */
+  setOrientation(up: UpAxis, animate = true): void {
+    this.finishTween();
+    if (up === this.shownUp) return;
+    this.shownUp = up;
+    const target = up === this.builtUp ? new THREE.Quaternion() : this.builtUp === "as_is" ? UPRIGHT.clone() : UPRIGHT.clone().invert();
+    const from = this.content.quaternion.clone();
+    const finish = () => {
+      this.content.quaternion.copy(target);
+      this.measure();
+      this.rebuildGrid();
+      this.rebuildDims();
+    };
+    // Hide the dimensions while turning; they are rebuilt for the new box.
+    for (const c of this.dims.children) c.visible = false;
+    this.animate(
+      animate ? 380 : 0,
+      (t) => {
+        this.content.quaternion.slerpQuaternions(from, target, t);
+      },
+      finish,
+    );
   }
 
   /** Unit suffix for dimension labels ("mm", "in", or "" for unitless). */
@@ -162,28 +229,103 @@ export class Viewer {
     this.applyVisibility();
   }
 
-  /** Preview only: the exported file always contains every layer. */
   setLayerVisible(layer: number, visible: boolean): void {
     if (visible) this.hidden.delete(layer);
     else this.hidden.add(layer);
     this.applyVisibility();
   }
 
-  private applyVisibility(): void {
-    for (const [layer, objs] of this.layers) {
-      const shown = !this.hidden.has(layer);
-      for (const o of objs) o.visible = o instanceof THREE.LineSegments ? shown && this.edgesOn : shown;
+  /** Perspective or orthographic projection, keeping what is on screen. */
+  setOrtho(on: boolean): void {
+    const next = on ? this.ortho : this.persp;
+    if (next === this.camera) return;
+    const prev = this.camera;
+    const dist = prev.position.distanceTo(this.controls.target);
+    next.position.copy(prev.position);
+    next.quaternion.copy(prev.quaternion);
+    if (next === this.ortho) {
+      // Match the perspective view's height at the target.
+      const h = 2 * dist * Math.tan(THREE.MathUtils.degToRad(FOV / 2));
+      this.ortho.zoom = 1;
+      this.orthoFrustum(h / 2);
+    } else {
+      // Move the camera so the target keeps its on-screen size.
+      const h = (this.ortho.top - this.ortho.bottom) / this.ortho.zoom;
+      const d = h / 2 / Math.tan(THREE.MathUtils.degToRad(FOV / 2));
+      const dir = next.position.clone().sub(this.controls.target).normalize();
+      next.position.copy(this.controls.target).addScaledVector(dir, d);
     }
+    this.scene.remove(prev);
+    this.scene.add(next);
+    next.add(this.key);
+    this.camera = next;
+    this.controls.object = next;
+    this.resize();
+    this.controls.update();
     this.requestRender();
   }
 
+  get isOrtho(): boolean {
+    return this.camera === this.ortho;
+  }
+
+  /** Look at the whole model from a named direction. */
+  setView(view: ViewName, animate = true): void {
+    this.finishTween();
+    const dir = VIEWS[view];
+    const dist = (this.radius / Math.sin(THREE.MathUtils.degToRad(FOV / 2))) * MARGIN;
+    const fromPos = this.camera.position.clone();
+    const fromTarget = this.controls.target.clone();
+    const toPos = dir.clone().multiplyScalar(dist);
+    const fromDir = fromPos.clone().sub(fromTarget);
+    const fromLen = fromDir.length();
+    fromDir.normalize();
+    const fromZoom = this.orthoHome();
+    this.animate(animate ? 420 : 0, (t) => {
+      // Swing the direction (keeps the model in view) while moving the target home.
+      const d = new THREE.Vector3().copy(fromDir).lerp(dir, t).normalize();
+      const len = THREE.MathUtils.lerp(fromLen, dist, t);
+      this.controls.target.lerpVectors(fromTarget, new THREE.Vector3(), t);
+      this.camera.position.copy(this.controls.target).addScaledVector(d, len);
+      if (this.camera === this.ortho) {
+        this.ortho.zoom = THREE.MathUtils.lerp(fromZoom, 1, t);
+        this.ortho.updateProjectionMatrix();
+      }
+      this.camera.lookAt(this.controls.target);
+    }, () => {
+      this.camera.position.copy(toPos);
+      this.controls.target.set(0, 0, 0);
+      this.controls.update();
+    });
+  }
+
+  /** Frame the whole model, keeping the current viewing direction. */
   fit(): void {
-    const dist = (this.radius / Math.sin(THREE.MathUtils.degToRad(this.camera.fov / 2))) * 1.15;
-    const dir = new THREE.Vector3(1, -1.35, 0.85).normalize();
-    this.controls.target.set(0, 0, 0);
-    this.camera.position.copy(dir.multiplyScalar(dist));
-    this.controls.update();
-    this.requestRender();
+    this.finishTween();
+    const dir = this.camera.position.clone().sub(this.controls.target).normalize();
+    const dist = (this.radius / Math.sin(THREE.MathUtils.degToRad(FOV / 2))) * MARGIN;
+    const from = this.camera.position.clone();
+    const fromTarget = this.controls.target.clone();
+    const fromZoom = this.orthoHome();
+    this.animate(320, (t) => {
+      this.controls.target.lerpVectors(fromTarget, new THREE.Vector3(), t);
+      this.camera.position.lerpVectors(from, dir.clone().multiplyScalar(dist), t);
+      if (this.camera === this.ortho) {
+        this.ortho.zoom = THREE.MathUtils.lerp(fromZoom, 1, t);
+        this.ortho.updateProjectionMatrix();
+      }
+      this.camera.lookAt(this.controls.target);
+    }, () => this.controls.update());
+  }
+
+  /** Reset the orthographic frustum to frame the model at zoom 1, and return the zoom
+   *  that shows what is on screen now (to animate from). */
+  private orthoHome(): number {
+    const visible = (this.ortho.top - this.ortho.bottom) / 2 / this.ortho.zoom;
+    this.orthoFrustum(this.radius * MARGIN);
+    this.ortho.zoom = visible > 0 ? (this.radius * MARGIN) / visible : 1;
+    this.ortho.updateProjectionMatrix();
+    return this.ortho.zoom;
   }
 
   dispose(): void {
@@ -197,6 +339,52 @@ export class Viewer {
   }
 
   // ------------------------------------------------------------------ internals
+
+  /** Run `step(t)` for t in 0..1 over `ms` (eased), then `done`. Callers capture their
+   *  start state after `finishTween()`, so animations never jump back. */
+  private animate(ms: number, step: (t: number) => void, done?: () => void): void {
+    this.finishTween();
+    if (ms <= 0 || window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) {
+      step(1);
+      done?.();
+      this.requestRender();
+      return;
+    }
+    this.tween = { step, start: performance.now(), ms, done };
+    this.requestRender();
+  }
+
+  private finishTween(): void {
+    const t = this.tween;
+    if (!t) return;
+    this.tween = null;
+    t.step(1);
+    t.done?.();
+    this.requestRender();
+  }
+
+  private orthoFrustum(halfHeight: number): void {
+    const { clientWidth: w, clientHeight: h } = this.host;
+    const aspect = w && h ? w / h : 1;
+    Object.assign(this.ortho, { left: -halfHeight * aspect, right: halfHeight * aspect, top: halfHeight, bottom: -halfHeight });
+    this.ortho.updateProjectionMatrix();
+  }
+
+  /** Bounds of what is shown, in world space (exact for the 90° turns we apply). */
+  private measure(): void {
+    this.content.updateMatrixWorld(true);
+    this.box.setFromObject(this.content);
+    this.hasContent = !this.box.isEmpty();
+    if (!this.hasContent) this.box.set(new THREE.Vector3(-1, -1, -1), new THREE.Vector3(1, 1, 1));
+  }
+
+  private applyVisibility(): void {
+    for (const [layer, objs] of this.layers) {
+      const shown = !this.hidden.has(layer);
+      for (const o of objs) o.visible = o.userData.edges ? shown && this.edgesOn : shown;
+    }
+    this.requestRender();
+  }
 
   private rebuildGrid(): void {
     if (this.grid) {
@@ -214,15 +402,13 @@ export class Viewer {
     const group = new THREE.Group();
     const make = (spacing: number, color: string, opacity: number) => {
       const pts: number[] = [];
-      for (let v = -extent; v <= extent + 1e-9; v += spacing) {
-        pts.push(v, -extent, 0, v, extent, 0, -extent, v, 0, extent, v, 0);
-      }
+      for (let v = -extent; v <= extent + 1e-9; v += spacing) pts.push(v, -extent, 0, v, extent, 0, -extent, v, 0, extent, v, 0);
       const geo = new THREE.BufferGeometry();
       geo.setAttribute("position", new THREE.Float32BufferAttribute(pts, 3));
       return new THREE.LineSegments(geo, new THREE.LineBasicMaterial({ color, transparent: true, opacity }));
     };
     group.add(make(step, this.theme.grid, 0.9), make(step * 5, this.theme.gridMajor, 1));
-    group.position.z = this.box.isEmpty() ? 0 : this.box.min.z;
+    group.position.z = this.hasContent ? this.box.min.z : 0;
     this.grid = group;
     this.scene.add(group);
   }
@@ -237,12 +423,15 @@ export class Viewer {
         (c.material as THREE.Material).dispose();
       }
     }
-    if (this.box.isEmpty() || !this.hasContent) return;
+    this.dimLabels = [];
+    if (!this.hasContent) return;
     const { min, max } = this.box;
     const off = this.radius * 0.08;
     const tick = this.radius * 0.025;
+    const flat = this.radius * 1e-9;
     const pts: number[] = [];
     const seg = (a: THREE.Vector3, b: THREE.Vector3) => pts.push(a.x, a.y, a.z, b.x, b.y, b.z);
+    const V = (x: number, y: number, z: number) => new THREE.Vector3(x, y, z);
     const label = (at: THREE.Vector3, value: number) => {
       const el = document.createElement("div");
       el.className = "dim-label";
@@ -250,40 +439,60 @@ export class Viewer {
       const obj = new CSS2DObject(el);
       obj.position.copy(at);
       this.dims.add(obj);
+      this.dimLabels.push({ obj, extent: value });
     };
-    const V = (x: number, y: number, z: number) => new THREE.Vector3(x, y, z);
-    // X along the front edge
+    const dim = (a: THREE.Vector3, b: THREE.Vector3, tickDir: THREE.Vector3) => {
+      const extent = a.distanceTo(b);
+      if (extent <= flat) return; // no dimension across a flat side
+      seg(a, b);
+      const t = tickDir.clone().multiplyScalar(tick);
+      seg(a.clone().sub(t), a.clone().add(t));
+      seg(b.clone().sub(t), b.clone().add(t));
+      label(a.clone().add(b).multiplyScalar(0.5), extent);
+    };
     const y0 = min.y - off;
-    seg(V(min.x, y0, min.z), V(max.x, y0, min.z));
-    seg(V(min.x, y0 - tick, min.z), V(min.x, y0 + tick, min.z));
-    seg(V(max.x, y0 - tick, min.z), V(max.x, y0 + tick, min.z));
-    label(V((min.x + max.x) / 2, y0, min.z), max.x - min.x);
-    // Y along the right edge
+    dim(V(min.x, y0, min.z), V(max.x, y0, min.z), V(0, 1, 0)); // X along the front edge
     const x0 = max.x + off;
-    seg(V(x0, min.y, min.z), V(x0, max.y, min.z));
-    seg(V(x0 - tick, min.y, min.z), V(x0 + tick, min.y, min.z));
-    seg(V(x0 - tick, max.y, min.z), V(x0 + tick, max.y, min.z));
-    label(V(x0, (min.y + max.y) / 2, min.z), max.y - min.y);
-    // Z up the front-left corner
+    dim(V(x0, min.y, min.z), V(x0, max.y, min.z), V(1, 0, 0)); // Y along the right edge
     const xz = min.x - off;
-    seg(V(xz, min.y, min.z), V(xz, min.y, max.z));
-    seg(V(xz - tick, min.y, min.z), V(xz + tick, min.y, min.z));
-    seg(V(xz - tick, min.y, max.z), V(xz + tick, min.y, max.z));
-    label(V(xz, min.y, (min.z + max.z) / 2), max.z - min.z);
+    dim(V(xz, min.y, min.z), V(xz, min.y, max.z), V(1, 0, 0)); // Z up the front-left corner
 
     const geo = new THREE.BufferGeometry();
     geo.setAttribute("position", new THREE.Float32BufferAttribute(pts, 3));
     this.dims.add(new THREE.LineSegments(geo, new THREE.LineBasicMaterial({ color: this.theme.dim })));
   }
 
+  /** Nudge dimension labels apart when they would overlap on screen. */
+  private separateLabels(): void {
+    const { clientWidth: w, clientHeight: h } = this.host;
+    const placed: { x: number; y: number; w: number; h: number }[] = [];
+    for (const { obj } of this.dimLabels) {
+      obj.center.set(0.5, 0.5);
+      const p = obj.getWorldPosition(new THREE.Vector3()).project(this.camera);
+      const el = obj.element;
+      let size = this.labelSize.get(el);
+      if (!size && el.isConnected && el.offsetWidth) this.labelSize.set(el, (size = { w: el.offsetWidth + 6, h: el.offsetHeight + 4 }));
+      if (!size) continue;
+      const box = { x: ((p.x + 1) / 2) * w, y: ((1 - p.y) / 2) * h, ...size };
+      let shift = 0;
+      while (shift < 4 && placed.some((b) => Math.abs(b.x - box.x) < (b.w + box.w) / 2 && Math.abs(b.y - box.y - shift * box.h) < (b.h + box.h) / 2)) shift++;
+      if (shift) obj.center.set(0.5, 0.5 - shift);
+      placed.push({ ...box, y: box.y + shift * box.h });
+    }
+  }
+
   private clear(): void {
+    const materials = new Set<THREE.Material>();
+    const geometries = new Set<THREE.BufferGeometry>();
     for (const c of [...this.content.children]) {
       this.content.remove(c);
       if (c instanceof THREE.Mesh || c instanceof THREE.LineSegments || c instanceof THREE.Points) {
-        c.geometry.dispose();
-        (c.material as THREE.Material).dispose();
+        geometries.add(c.geometry);
+        materials.add(c.material as THREE.Material);
       }
     }
+    for (const g of geometries) g.dispose();
+    for (const m of materials) m.dispose();
     this.layers.clear();
     this.hidden.clear();
     this.edgeObjects = [];
@@ -297,8 +506,9 @@ export class Viewer {
     if (!w || !h) return;
     this.renderer.setSize(w, h, false);
     this.labels.setSize(w, h);
-    this.camera.aspect = w / h;
-    this.camera.updateProjectionMatrix();
+    this.persp.aspect = w / h;
+    this.persp.updateProjectionMatrix();
+    this.orthoFrustum((this.ortho.top - this.ortho.bottom) / 2 || this.radius * MARGIN);
     this.requestRender();
   }
 
@@ -306,8 +516,19 @@ export class Viewer {
     if (this.frame) return;
     this.frame = requestAnimationFrame(() => {
       this.frame = 0;
-      if (this.controls.update()) this.requestRender(); // keep damping until settled
+      if (this.tween) {
+        const t = Math.min(1, (performance.now() - this.tween.start) / this.tween.ms);
+        const eased = 1 - (1 - t) ** 3;
+        this.tween.step(eased);
+        if (t >= 1) {
+          const done = this.tween.done;
+          this.tween = null;
+          done?.();
+        }
+        this.requestRender();
+      } else if (this.controls.update()) this.requestRender(); // keep damping until settled
       this.renderer.render(this.scene, this.camera);
+      this.separateLabels();
       this.labels.render(this.scene, this.camera);
       if (this.onAxes) {
         this.inv.copy(this.camera.quaternion).invert();

@@ -3,7 +3,7 @@
 In-house OBJ → DWG/DXF converter for Ideum devs and designers. Replaces outsourced conversion.
 Priorities, in order: **trustworthy → no surprises → easy → beautiful → fast.**
 
-Repo: `github.com/cbassuarez/obj2cad` (public). Status: planning (2026-09-28).
+Repo: `github.com/cbassuarez/obj2cad` (public). Status: v0.2 live at https://cbassuarez.com/obj2cad/; bundles, point clouds, textures, free-form curves and curved-surface recognition (phase 3's analytic surfaces) built and verified, pending AutoCAD acceptance. UI: single light "drafting" theme.
 
 ---
 
@@ -14,9 +14,10 @@ Repo: `github.com/cbassuarez/obj2cad` (public). Status: planning (2026-09-28).
 | Delivery | Web app, conversion runs **in the browser** (Rust → WebAssembly in a Web Worker). Files never leave the machine. Hosted on GitHub Pages, installable/offline PWA. |
 | Outputs | DWG and DXF. Default version **2018 (AC1032)**; 2013/2010 selectable. More formats later as a curated set. |
 | Parity | Vertices, faces, n-gons, and structure preserved **bit-for-bit** by default. |
-| Curves | **Strict** by default (see §3); user may loosen to a stated tolerance, and loosened output is flagged in the file, UI, and report. Regions that fail the rule stay exactly faceted. The tool never approximates silently. |
+| Curves | Opt-in. **Strict** (see §3): cylinders, cones, spheres and tori written as ACIS surfaces *next to* the exact mesh (own layer), labeled in the file (`obj2cad.curves`), the app and the report. Regions that fail the rule stay faceted. A user-set tolerance for scans is next; it will be flagged the same way. |
+| Bundles | A zip, a folder, or loose files with a cloud or image → one drawing; several loose models → "Combine" or "Separately". OBJ↔MTL↔images matched by file name. `.xyz` clouds exact; textures → one color per face (≤ 32 per texture), labeled approximate; OBJ `curv` → exact SPLINE. |
 | Structure | `o`/`g` → layers; `usemtl` → entity true color from MTL `Kd`. |
-| Units / axis | Asked on first drop (unit guess from bbox + exporter comment; keep axis vs Y-up→Z-up with live preview), remembered, always shown in the export summary. Written to `$INSUNITS`. |
+| Units / axis | Chosen automatically, never asked: up direction detected from geometry (resting base, thin axis; exporter only as fallback), units from exporter convention or size (unitless if no basis). House unit for files that don't state one; resulting size shown next to the download; one-click override. Units written to `$INSUNITS`. |
 | Acceptance | Automated independent-reader checks every commit + teammate AutoCAD checklist every release. |
 
 ## 2. Architecture
@@ -24,8 +25,8 @@ Repo: `github.com/cbassuarez/obj2cad` (public). Status: planning (2026-09-28).
 ```
 crates/
   obj2cad-core     strict lossless OBJ parser, mesh (half-edge), diagnostics
-  obj2cad-curves   segmentation, primitive + B-spline fitting, verification
-  obj2cad-acis     ACIS B-rep IR → SAT (text) / SAB (binary)
+  obj2cad-curves   seeds, primitive fitting (LM), strict region growing, boundaries
+  obj2cad-acis     neutral B-rep → SAB 21800 (DXF ACDSDATA, DWG AcDs) / SAT 7.0
   obj2cad-dxf      own DXF writer (full control of number formatting)
   obj2cad-dwg      DWG via acadrust (MPL-2.0), pinned + audited
   obj2cad-wasm     wasm-bindgen API for the web app
@@ -98,9 +99,31 @@ tests/             corpus fetch scripts, edge-case fixtures, verification harnes
 - **MESH needs a CLASS entry** in DXF that ezdxf omits; we add the one AutoCAD writes. Verify
   in the first AutoCAD acceptance round.
 
+### Curves as built (phase 3, analytic part)
+- **Tolerance:** each vertex's own stated precision (half the decimal quantum of each
+  coordinate, combined), capped at a millionth of the model's size so integer-coordinate
+  files can't pass loose fits.
+- **Vertices don't decide the surface:** a tessellation often has only two rings of
+  vertices, and two coaxial circles lie on a sphere as well as a cylinder. Among the
+  surfaces the vertices allow, the one the *faces* hug (smallest chord height; below a
+  fifth of the longest edge) wins.
+- **Seeds** grow ring by ring to 16 vertices (strips of three faces where a band is one
+  face tall); fits start from closed forms (algebraic sphere, axis from normals, apex from
+  tangent planes, torus tube radius from normal curvature) and are refined by
+  Levenberg–Marquardt on tolerance-weighted distances. Regions grow with refits and merge
+  when one surface fits both (a fillet's first band can pass for a sphere alone).
+- **Boundaries** must be lines and circles that lie on the surface; where two curved
+  surfaces meet in a general curve, both stay faceted (exact trims are phase 4).
+- **Cost:** CAD meshes (planes and primitives) are fast; smooth freeform areas are the
+  worst case at about 135 µs per face natively.
+
 ## 9. Known risks
 
 - **Stitching curved and faceted regions** into one valid watertight solid is the hardest problem. Fallback: separate sheet bodies per region with a reported gap until phase 4 closes it.
 - **acadrust maturity** (v0.5.x). Mitigation: pinned version, independent read-back, AutoCAD sign-off; ODA SDK as a paid escape hatch if DWG output ever fails acceptance.
 - **Browser memory** (wasm32 ≈ 4 GB) caps mesh size around ~10M triangles; the UI states the limit up front.
-- **OBJ freeform (NURBS) input** is supported by the parser but has no real-world fixtures yet.
+- **OBJ free-form input:** curves (`curv`, B-spline/Bézier) convert exactly; surfaces
+  (`surf`) are still left out (listed). No real-world fixtures yet.
+- **ACIS conventions are shared by writer and harness** (e.g. a cone's slope sign): CI
+  can't catch a convention both get wrong. The `acis/` acceptance bodies have known
+  volumes and shapes for exactly that.

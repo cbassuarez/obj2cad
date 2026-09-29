@@ -1,27 +1,60 @@
-import { CircleAlert } from "lucide-react";
+import { CircleAlert, ExternalLink } from "lucide-react";
 import { motion } from "motion/react";
 import { Button } from "@/components/ui/button";
+import { CLI_URL, problemUrl, type Explained } from "@/lib/errors";
 
-export function FailedScreen({ name, message, onPick }: { name: string; message: string; onPick: () => void }) {
+export function FailedScreen({
+  name,
+  explained,
+  onPick,
+  onRetry,
+}: {
+  name: string;
+  explained: Explained;
+  onPick: () => void;
+  onRetry?: () => void;
+}) {
+  const e = explained;
   return (
-    <main className="paper flex min-h-full items-center justify-center px-4 pt-20 pb-10">
-      <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="panel flex w-full max-w-[600px] flex-col gap-5 p-6" role="alert">
+    <main className="paper flex min-h-dvh items-center justify-center px-4 pt-20 pb-10">
+      <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="panel flex w-full max-w-[620px] flex-col gap-5 p-6" role="alert">
         <div className="flex gap-3 rounded-[4px] bg-danger-soft p-4 text-danger">
           <CircleAlert className="mt-0.5 size-5 shrink-0" aria-hidden="true" />
-          <div>
-            <div className="font-semibold">This file can't be converted exactly</div>
-            <div className="text-[13.5px] text-fg-2">obj2cad stops instead of guessing when a file is ambiguous. Nothing was written.</div>
+          <div className="min-w-0">
+            <div className="font-semibold">{e.title}</div>
+            <div className="truncate text-[13.5px] text-fg-2">{name}</div>
           </div>
         </div>
-        <pre className="num m-0 rounded-[4px] bg-panel-2 p-4 text-[12.5px] whitespace-pre-wrap text-fg">
-          {name}
-          {"\n"}
-          {message}
-        </pre>
-        <div>
-          <Button variant="primary" onClick={onPick}>
-            Choose another file…
+        <p className="m-0 text-[14px]">{e.action}</p>
+        {e.lines.length > 0 && (
+          <pre className="num m-0 max-h-[240px] overflow-auto rounded-[4px] bg-panel-2 p-4 text-[12.5px] whitespace-pre-wrap text-fg">
+            {e.lines.join("\n")}
+            {e.more && "\n…"}
+          </pre>
+        )}
+        <div className="flex flex-wrap items-center gap-3">
+          {onRetry && (
+            <Button variant="primary" onClick={onRetry}>
+              Try again
+            </Button>
+          )}
+          <Button variant={onRetry ? "secondary" : "primary"} onClick={onPick}>
+            Choose a file…
           </Button>
+          {e.cli && (
+            <Button variant="link" asChild>
+              <a href={CLI_URL} target="_blank" rel="noreferrer">
+                Command-line version <ExternalLink />
+              </a>
+            </Button>
+          )}
+          {e.report && (
+            <Button variant="link" asChild>
+              <a href={problemUrl(e.title, e.lines.join("\n"))} target="_blank" rel="noreferrer">
+                Report a problem <ExternalLink />
+              </a>
+            </Button>
+          )}
         </div>
       </motion.div>
     </main>

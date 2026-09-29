@@ -1,121 +1,246 @@
 /// <reference lib="webworker" />
-// Runs the Rust core off the main thread. The worker keeps the loaded file so changing a
-// setting re-converts without copying the (possibly large) OBJ again.
-import init, { Session } from "./wasm/obj2cad_wasm.js";
+// Runs the Rust engine off the main thread. The worker keeps the parsed file, so a
+// settings change only re-converts. Two engine modules: the small default one, and one
+// with the DWG writer that is loaded the first time DWG is chosen.
+import initCore, * as core from "./wasm/obj2cad_wasm.js";
+import type { EngineSettings } from "@/lib/settings";
+import { geometryKey } from "@/lib/settings";
 
-export type Request =
-  | { id: number; type: "load"; obj: ArrayBuffer; mtl: ArrayBuffer | null; name: string }
-  | { id: number; type: "mtl"; mtl: ArrayBuffer }
-  | { id: number; type: "convert"; units: string; up: string };
+type Module = typeof core;
+type Kind = "core" | "dwg";
 
-export interface Inspection {
-  vertices: number;
-  faces: number;
-  lines: number;
-  points: number;
-  objects: number;
-  groups: number;
-  materials: string[];
-  mtllibs: string[];
-  header_comments: string[];
-  parse_ms: number;
-  hints: {
-    exporter: string | null;
-    units: string;
-    units_reason: string;
-    up_axis: string;
-    up_axis_reason: string;
-  };
+export interface Progress {
+  stage: "read" | "parse";
+  done: number;
+  total: number;
 }
 
-export interface ConvertResult {
-  dxf: Uint8Array;
-  report: string;
+export interface ParseFailure {
+  /** The file of the drawing that couldn't be read. */
+  file: string;
+  kind: string;
+  line: number;
+  message: string;
+  issues: { line: number; kind: string; message: string }[];
+  truncated: boolean;
+}
+
+/** `parse`: the file can't be read without guessing. `crash`: the engine stopped (the
+ *  worker must be replaced). `engine`: the engine couldn't start. */
+export type Failure =
+  | { kind: "parse"; parse: ParseFailure }
+  | { kind: "crash"; message: string }
+  | { kind: "engine"; message: string }
+  | { kind: "read"; message: string }
+  | { kind: "other"; message: string };
+
+export interface PreviewBuffers {
   positions: Float32Array;
+  colors: Uint8Array;
   indices: Uint32Array;
   edges: Uint32Array;
-  colors: Uint8Array;
-  lines: Float32Array;
-  /** Per mesh: [layer, indexStart, indexCount, edgeStart, edgeCount]. */
   groups: Uint32Array;
+  lines: Float32Array;
+  lineColors: Uint8Array;
+  lineGroups: Uint32Array;
   points: Float32Array;
-  /** False when the model is too large to display; the DXF is unaffected. */
-  previewAvailable: boolean;
+  pointColors: Uint8Array;
+  pointGroups: Uint32Array;
   origin: number[];
-  ms: number;
-  timings: Record<string, number>;
+  available: boolean;
 }
 
-export type Response =
-  | { id: number; ok: true; result: Inspection | ConvertResult | null }
-  | { id: number; ok: false; error: string };
+export interface Converted {
+  file: Blob;
+  report: string;
+  decisions: string;
+  timings: Record<string, number>;
+  preview: PreviewBuffers | null;
+  ms: number;
+}
 
-const ready = init();
-// The parsed file lives in wasm memory for as long as it is open.
-let session: Session | null = null;
+/** One file of a drawing (see `Source` in lib/files.ts). */
+export interface SourceFile {
+  file: File;
+  path: string;
+}
 
-async function sha256(data: ArrayBuffer | Uint8Array): Promise<string> {
-  const digest = await crypto.subtle.digest("SHA-256", data as BufferSource);
+export type Request =
+  | { id: number; type: "open"; sources: SourceFile[]; name: string; dwg: boolean }
+  | { id: number; type: "convert"; settings: EngineSettings; preview: boolean };
+
+export type Reply =
+  | { id: number; type: "progress"; progress: Progress }
+  | { id: number; type: "ok"; result: unknown }
+  | { id: number; type: "error"; failure: Failure };
+
+const post = (msg: Reply, transfer: Transferable[] = []) => (self as DedicatedWorkerGlobalScope).postMessage(msg, transfer);
+
+// ---------------------------------------------------------------- engine modules
+
+let panicMessage: string | null = null;
+const modules: Partial<Record<Kind, Promise<Module>>> = {};
+
+function engine(kind: Kind): Promise<Module> {
+  const onPanic = (m: string) => {
+    panicMessage = m;
+  };
+  modules[kind] ??=
+    kind === "core"
+      ? initCore().then(() => {
+          core.on_panic(onPanic);
+          return core;
+        })
+      : import("./wasm/obj2cad_wasm_dwg.js").then(async (m) => {
+          await m.default();
+          m.on_panic(onPanic);
+          return m as unknown as Module;
+        });
+  return modules[kind]!;
+}
+// Start compiling the default engine right away.
+void engine("core").catch(() => undefined);
+
+// ---------------------------------------------------------------- state
+
+interface Open {
+  kind: Kind;
+  session: core.Session;
+  sources: SourceFile[];
+  name: string;
+  /** Parity hash per geometry-changing settings. */
+  parity: Map<string, string>;
+}
+let open: Open | null = null;
+let dead = false;
+
+async function sha256(data: BufferSource): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", data);
   return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-const reply = (msg: Response, transfer: Transferable[] = []) => (self as DedicatedWorkerGlobalScope).postMessage(msg, transfer);
+/** Read a file, reporting progress for big ones. */
+async function read(file: File, progress: (done: number) => void): Promise<Uint8Array<ArrayBuffer>> {
+  if (file.size < 16 << 20) return new Uint8Array(await file.arrayBuffer());
+  const out = new Uint8Array(file.size);
+  const reader = file.stream().getReader();
+  let at = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (at + value.length > out.length) throw new ReadError("The file changed while it was being read.");
+    out.set(value, at);
+    at += value.length;
+    progress(at);
+  }
+  if (at !== out.length) throw new ReadError("The file changed while it was being read.");
+  return out;
+}
+
+class ReadError extends Error {}
+
+async function load(id: number, sources: SourceFile[], name: string, kind: Kind): Promise<Open> {
+  const mod = await engine(kind).catch((e: unknown) => {
+    throw Object.assign(new Error(String(e instanceof Error ? e.message : e)), { engineFailed: true });
+  });
+  open?.session.free();
+  open = null;
+  const session = new mod.Session();
+  const total = sources.reduce((n, s) => n + s.file.size, 0);
+  let before = 0;
+  try {
+    for (const s of sources) {
+      const bytes = await read(s.file, (done) => post({ id, type: "progress", progress: { stage: "read", done: before + done, total } }));
+      before += s.file.size;
+      // Whole seconds, like the command-line tool; -1 when the date is unknown.
+      const modified = s.file.lastModified > 0 ? Math.floor(s.file.lastModified / 1000) : -1;
+      session.add_file(s.path, bytes, await sha256(bytes), modified);
+    }
+    session.load(name, (done: number, all: number) => post({ id, type: "progress", progress: { stage: "parse", done, total: all } }));
+  } catch (e) {
+    session.free();
+    throw e;
+  }
+  return { kind, session, sources, name, parity: new Map() };
+}
+
+function convert(o: Open, settings: EngineSettings, wantPreview: boolean): Promise<Converted> {
+  return (async () => {
+    const t0 = performance.now();
+    const json = JSON.stringify(settings);
+    const key = geometryKey(settings);
+    let parity = o.parity.get(key);
+    if (!parity) {
+      parity = await sha256(o.session.parity_stream(json) as Uint8Array<ArrayBuffer>);
+      o.parity.set(key, parity);
+    }
+    const chunks: Uint8Array<ArrayBuffer>[] = [];
+    const c = o.session.convert(json, parity, wantPreview, (chunk: Uint8Array<ArrayBuffer>) => chunks.push(chunk));
+    try {
+      const preview: PreviewBuffers | null = c.has_preview()
+        ? {
+            positions: c.take_positions(),
+            colors: c.take_colors(),
+            indices: c.take_indices(),
+            edges: c.take_edges(),
+            groups: c.take_groups(),
+            lines: c.take_lines(),
+            lineColors: c.take_line_colors(),
+            lineGroups: c.take_line_groups(),
+            points: c.take_points(),
+            pointColors: c.take_point_colors(),
+            pointGroups: c.take_point_groups(),
+            origin: Array.from(c.origin()),
+            available: c.preview_available(),
+          }
+        : null;
+      return {
+        file: new Blob(chunks, { type: "application/octet-stream" }),
+        report: c.report(),
+        decisions: c.decisions(),
+        timings: JSON.parse(c.timings()) as Record<string, number>,
+        preview,
+        ms: performance.now() - t0,
+      };
+    } finally {
+      c.free();
+    }
+  })();
+}
+
+function failure(err: unknown): Failure {
+  if (panicMessage !== null || err instanceof WebAssembly.RuntimeError) {
+    dead = true;
+    return { kind: "crash", message: panicMessage ?? String(err) };
+  }
+  if (err && typeof err === "object" && "kind" in err && "line" in err && "issues" in err) return { kind: "parse", parse: err as ParseFailure };
+  if (err instanceof Error && "engineFailed" in err) return { kind: "engine", message: err.message };
+  if (err instanceof ReadError || (err instanceof DOMException && err.name === "NotReadableError")) return { kind: "read", message: (err as Error).message };
+  return { kind: "other", message: err instanceof Error ? err.message : String(err) };
+}
 
 self.onmessage = async (e: MessageEvent<Request>) => {
   const req = e.data;
+  if (dead) {
+    post({ id: req.id, type: "error", failure: { kind: "crash", message: panicMessage ?? "the engine stopped" } });
+    return;
+  }
   try {
-    await ready;
-    if (req.type === "load") {
-      session?.free();
-      session = null;
-      const sha = await sha256(req.obj); // native, hardware-accelerated
-      session = new Session(new Uint8Array(req.obj), req.mtl ? new Uint8Array(req.mtl) : undefined, req.name, sha);
-      reply({ id: req.id, ok: true, result: JSON.parse(session.inspect()) as Inspection });
-    } else if (req.type === "mtl") {
-      if (!session) throw new Error("no file loaded");
-      session.set_mtl(new Uint8Array(req.mtl));
-      reply({ id: req.id, ok: true, result: null });
+    if (req.type === "open") {
+      open = await load(req.id, req.sources, req.name, req.dwg ? "dwg" : "core");
+      post({ id: req.id, type: "ok", result: JSON.parse(open.session.inspect()) });
     } else {
-      if (!session) throw new Error("no file loaded");
-      const t0 = performance.now();
-      // Parity hash: canonical bytes from Rust, SHA-256 from the browser (hardware-accelerated).
-      const parity = await sha256(session.parity_stream(req.units, req.up));
-      const hashMs = performance.now() - t0;
-      const c = session.convert(req.units, req.up, parity);
-      const dxf = c.take_dxf();
-      const t1 = performance.now();
-      const report = JSON.parse(c.report());
-      report.output.sha256 = await sha256(dxf);
-      const timings = { ...JSON.parse(c.timings()), parity_ms: hashMs, output_sha_ms: performance.now() - t1 };
-      const result: ConvertResult = {
-        dxf,
-        report: JSON.stringify(report, null, 2),
-        positions: c.take_positions(),
-        indices: c.take_indices(),
-        edges: c.take_edges(),
-        colors: c.take_colors(),
-        lines: c.take_lines(),
-        groups: c.take_groups(),
-        points: c.take_points(),
-        previewAvailable: c.preview_available(),
-        origin: Array.from(c.origin()),
-        ms: performance.now() - t0,
-        timings,
-      };
-      c.free();
-      reply({ id: req.id, ok: true, result }, [
-        result.dxf.buffer,
-        result.positions.buffer,
-        result.indices.buffer,
-        result.edges.buffer,
-        result.colors.buffer,
-        result.lines.buffer,
-        result.groups.buffer,
-        result.points.buffer,
-      ]);
+      if (!open) throw new Error("no file is open");
+      // DWG needs the larger engine: move the open file into it once.
+      if (req.settings.format === "dwg" && open.kind !== "dwg") open = await load(req.id, open.sources, open.name, "dwg");
+      const r = await convert(open, req.settings, req.preview);
+      const p = r.preview;
+      const transfer = p
+        ? [p.positions, p.colors, p.indices, p.edges, p.groups, p.lines, p.lineColors, p.lineGroups, p.points, p.pointColors, p.pointGroups].map((a) => a.buffer)
+        : [];
+      post({ id: req.id, type: "ok", result: r }, transfer);
     }
   } catch (err) {
-    reply({ id: req.id, ok: false, error: err instanceof Error ? err.message : String(err) });
+    post({ id: req.id, type: "error", failure: failure(err) });
   }
 };
-
