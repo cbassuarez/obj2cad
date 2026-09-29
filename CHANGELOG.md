@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/cbassuarez/obj2cad/compare/obj2cad-v0.4.0...obj2cad-v0.5.0) (2026-09-29)
+
+
+### Features
+
+* texture and vertex colors as close as a CAD mesh allows; Intel Mac CLI builds again ([#11](https://github.com/cbassuarez/obj2cad/issues/11)) ([ff12616](https://github.com/cbassuarez/obj2cad/commit/ff1261616d5465efbd7781ba99cccfc4a1accaeb))
+
 ## [0.4.0](https://github.com/cbassuarez/obj2cad/compare/obj2cad-v0.3.0...obj2cad-v0.4.0) (2026-09-29)
 
 
