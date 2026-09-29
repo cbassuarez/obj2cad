@@ -113,10 +113,12 @@ test("loose files with a point cloud make one drawing, like the command-line too
 test("a bundle lists what's missing, unused and approximate", async ({ page }) => {
   await open(page, [zipFolder(path.join(fixtures, "bundle", "site"))]);
   await expect(downloadButton(page)).toBeEnabled();
-  await expect(page.getByText("Texture colors, approximate")).toBeVisible();
+  await expect(page.getByText("Colors from textures, averaged per face")).toBeVisible();
   await expect(page.getByText("Not used: unused.png")).toBeVisible();
   await open(page, [zipFolder(path.join(fixtures, "bundle", "two_models"))]);
   await expect(page.getByText("Missing: missing.mtl")).toBeVisible();
+  await open(page, [zipFolder(path.join(fixtures, "bundle", "textured"))]);
+  await expect(page.getByText("Colors from textures and vertex colors, averaged per face")).toBeVisible();
 });
 
 test("several loose models: combine into one drawing", async ({ page }) => {

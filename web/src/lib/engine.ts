@@ -77,6 +77,8 @@ export interface Report {
   };
   options: { units: Units; up_axis: UpAxis; layer_mode: LayerMode; keep_loose_points: boolean; exclude_layers: string[] };
   texture_colored_faces: number;
+  /** Faces colored with the average of their vertices' colors. */
+  vertex_colored_faces?: number;
   files: BundleFile[];
   /** Curved surfaces written next to the mesh (crates/obj2cad-curves). */
   curves: { kind: "cylinder" | "cone" | "sphere" | "torus"; faces: number[]; max_deviation: number; tolerance: number }[];

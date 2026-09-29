@@ -5,10 +5,11 @@
 //! IEEE-754 arithmetic (axis permutation and negation); units are recorded as metadata,
 //! never applied by scaling.
 
+use crate::color::{self, Mix};
 use crate::diag::{Code, Diagnostic, Diagnostics, Severity};
 use crate::mtl::Palette;
 use crate::obj::{ObjDocument, NO_UV};
-use crate::texture::{self, Texture};
+use crate::texture::Texture;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -16,9 +17,10 @@ use std::collections::{HashMap, HashSet};
 /// AutoCAD's default SMOOTHMESHMAXFACE; larger meshes are split so they open with default settings.
 pub const MAX_FACES_PER_MESH: usize = 1_000_000;
 
-/// Face colors sampled from one texture are reduced to at most this many, so a textured
-/// model becomes a few meshes rather than one per face.
-pub const TEXTURE_COLORS: usize = 32;
+/// Face colors from one texture (or from one layer's vertex colors) are reduced to at most
+/// this many, so a textured model becomes a bounded number of meshes rather than one per
+/// face. Colors are only merged when they are indistinguishable or there are more than this.
+pub const FACE_COLORS: usize = 256;
 
 /// Material colors and textures for a conversion.
 #[derive(Default)]
@@ -286,6 +288,8 @@ pub struct CadModel<'a> {
     pub point_cloud: bool,
     /// Faces whose color was sampled from a texture (approximate colors).
     pub texture_colored_faces: u64,
+    /// Faces whose color is the average of their vertices' colors (approximate colors).
+    pub vertex_colored_faces: u64,
 }
 
 impl CadModel<'_> {
@@ -491,10 +495,28 @@ fn vertex_rgb(doc: &ObjDocument, v: u32) -> Option<[u8; 3]> {
         .map(|c| c.map(|x| (f64::from(x).clamp(0.0, 1.0) * 255.0).round() as u8))
 }
 
-/// Per-face colors sampled from textures, reduced per texture (see [`TEXTURE_COLORS`]).
-/// `None` for faces that keep their material color.
-fn texture_colors(doc: &ObjDocument, materials: &Materials) -> Option<Vec<Option<[u8; 3]>>> {
-    if materials.textures.is_empty() || doc.face_uvs.is_empty() {
+/// Per-face colors from textures and vertex colors (`None`: the face keeps its material
+/// color). A face on a textured material with texture coordinates shows the texture's
+/// average over its area; otherwise a face whose corners all have colors shows their
+/// average. Colors are reduced per texture and per layer (see [`FACE_COLORS`]), weighted
+/// by face area so what covers most of the model stays closest.
+struct FaceColors {
+    colors: Vec<Option<[u8; 3]>>,
+    from_texture: u64,
+    from_vertices: u64,
+    /// Distinct colors written for textured faces.
+    texture_palette: usize,
+}
+
+fn face_colors(
+    doc: &ObjDocument,
+    materials: &Materials,
+    layer_of_attr: &[u32],
+    excluded: &HashSet<u32>,
+    lost: &mut [bool],
+) -> Option<FaceColors> {
+    let textured = !materials.textures.is_empty() && !doc.face_uvs.is_empty();
+    if !textured && doc.counts.vertices_with_color == 0 {
         return None;
     }
     let tex_of_attr: Vec<Option<(usize, &Texture)>> = doc
@@ -506,49 +528,105 @@ fn texture_colors(doc: &ObjDocument, materials: &Materials) -> Option<Vec<Option
             materials.textures.get(name).map(|t| (m as usize, t))
         })
         .collect();
-    if tex_of_attr.iter().all(Option::is_none) {
-        return None;
-    }
-    let mut out: Vec<Option<[u8; 3]>> = vec![None; doc.faces.len()];
-    // Sampled colors per material, then reduced.
-    let mut sampled: HashMap<usize, (Vec<usize>, Vec<[u8; 3]>)> = HashMap::new();
+    // (0, material) for texture colors, (1, layer) for vertex colors: faces, colors, areas.
+    type Group = (Vec<usize>, Vec<[u8; 3]>, Vec<f64>);
+    let mut groups: std::collections::BTreeMap<(u8, usize), Group> = Default::default();
     let mut uvs: Vec<[f32; 2]> = Vec::new();
-    for fi in 0..doc.faces.len() {
-        let Some((m, tex)) = tex_of_attr[doc.faces.attr[fi] as usize] else {
+    for (fi, face) in doc.faces.iter().enumerate() {
+        let attr = doc.faces.attr[fi] as usize;
+        if excluded.contains(&layer_of_attr[attr]) {
             continue;
-        };
+        }
         let range = doc.faces.offsets[fi] as usize..doc.faces.offsets[fi + 1] as usize;
         uvs.clear();
-        for &t in &doc.face_uvs[range] {
-            if t == NO_UV {
-                break;
+        if textured {
+            for &t in doc.face_uvs.get(range).unwrap_or(&[]) {
+                if t == NO_UV {
+                    break;
+                }
+                uvs.push(doc.texcoords[t as usize]);
             }
-            uvs.push(doc.texcoords[t as usize]);
         }
-        if uvs.len() != doc.faces.get(fi).len() {
-            continue;
-        }
-        let c = tex
-            .face_color(&uvs)
-            .map(|x| x.round().clamp(0.0, 255.0) as u8);
-        let e = sampled.entry(m).or_default();
-        e.0.push(fi);
-        e.1.push(c);
+        let (key, c) = match tex_of_attr[attr] {
+            Some((m, tex)) if uvs.len() == face.len() => {
+                mark_lost(doc, face, lost);
+                ((0, m), tex.face_color(&uvs))
+            }
+            _ => match mean_vertex_color(doc, face) {
+                Some(c) => ((1, layer_of_attr[attr] as usize), c),
+                None => {
+                    mark_lost(doc, face, lost);
+                    continue;
+                }
+            },
+        };
+        let g = groups.entry(key).or_default();
+        g.0.push(fi);
+        g.1.push(c);
+        g.2.push(face_area(doc, face));
     }
-    let mut keys: Vec<usize> = sampled.keys().copied().collect();
-    keys.sort_unstable();
-    for m in keys {
-        let (faces, colors) = &sampled[&m];
-        let (palette, index) = texture::quantize(colors, TEXTURE_COLORS);
+    let mut out = FaceColors {
+        colors: vec![None; doc.faces.len()],
+        from_texture: 0,
+        from_vertices: 0,
+        texture_palette: 0,
+    };
+    for ((kind, _), (faces, colors, areas)) in groups {
+        let (palette, index) = color::reduce(&colors, &areas, FACE_COLORS);
         for (&fi, &k) in faces.iter().zip(&index) {
-            out[fi] = Some(palette[k as usize]);
+            out.colors[fi] = Some(palette[k as usize]);
+        }
+        if kind == 0 {
+            out.from_texture += faces.len() as u64;
+            out.texture_palette += palette.len();
+        } else {
+            out.from_vertices += faces.len() as u64;
         }
     }
     Some(out)
 }
 
+/// The average (in linear light) of the corners' vertex colors, if they all have one.
+fn mean_vertex_color(doc: &ObjDocument, corners: &[u32]) -> Option<[u8; 3]> {
+    let mut mix = Mix::default();
+    for &v in corners {
+        mix.add(vertex_rgb(doc, v)?, 1.0);
+    }
+    mix.srgb()
+}
+
+/// Note vertex colors an element carries but can't show (it has a texture, or corners
+/// without a color).
+fn mark_lost(doc: &ObjDocument, corners: &[u32], lost: &mut [bool]) {
+    if !lost.is_empty() {
+        for &v in corners {
+            lost[v as usize] |= doc.colors.get(v as usize).is_some_and(Option::is_some);
+        }
+    }
+}
+
+/// A face's area (a fan from its first corner; exact for planar convex faces).
+fn face_area(doc: &ObjDocument, face: &[u32]) -> f64 {
+    let p = |i: usize| doc.positions[face[i] as usize];
+    let a = p(0);
+    let mut sum = 0.0;
+    for k in 1..face.len().saturating_sub(1) {
+        let (b, c) = (p(k), p(k + 1));
+        let e1 = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+        let e2 = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+        let n = [
+            e1[1] * e2[2] - e1[2] * e2[1],
+            e1[2] * e2[0] - e1[0] * e2[2],
+            e1[0] * e2[1] - e1[1] * e2[0],
+        ];
+        sum += (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt() / 2.0;
+    }
+    sum
+}
+
 /// [`convert`] with textures: faces on a textured material that have texture coordinates
-/// are colored from the image (one color per face, approximate). Shapes are unchanged.
+/// are colored from the image (one color per face, approximate), see [`face_colors`].
+/// Shapes are unchanged.
 pub fn convert_with<'a>(
     doc: &'a ObjDocument,
     materials: &Materials,
@@ -655,17 +733,25 @@ pub fn convert_with<'a>(
     let keys: Vec<(u32, Option<[u8; 3]>)> = (0..doc.attrs.len() as u32)
         .map(|a| (layer_of_attr[a as usize], color_of_attr(a)))
         .collect();
-    let face_colors = texture_colors(doc, materials);
-    let texture_colored_faces = face_colors
+    let mut colors_lost = if doc.counts.vertices_with_color > 0 {
+        vec![false; doc.positions.len()]
+    } else {
+        Vec::new()
+    };
+    let face_colors = face_colors(doc, materials, &layer_of_attr, &excluded, &mut colors_lost);
+    let (texture_colored_faces, vertex_colored_faces) = face_colors
         .as_ref()
-        .map_or(0, |c| c.iter().filter(|x| x.is_some()).count() as u64);
-    if texture_colored_faces > 0 {
+        .map_or((0, 0), |c| (c.from_texture, c.from_vertices));
+    if let Some(c) = face_colors.as_ref().filter(|c| c.from_texture > 0) {
+        let k = c.texture_palette;
         diags.push(Severity::Info, Code::TextureColors, 0, || {
             format!(
-                "{texture_colored_faces} faces are colored from textures, at most {TEXTURE_COLORS} colors per texture (approximate)"
+                "{texture_colored_faces} faces are colored from textures, each with its texture's \
+                 average over the face ({k} colors; approximate)"
             )
         });
     }
+    let face_colors = face_colors.map(|c| c.colors);
     // Source vertex -> (mesh, local index) for the first mesh that used it; vertices shared
     // with other meshes fall back to a map (rare: only on layer/material borders).
     let mut slot: Vec<(u32, u32)> = vec![(u32::MAX, 0); doc.positions.len()];
@@ -757,6 +843,7 @@ pub fn convert_with<'a>(
     }
 
     let mut polylines = Vec::new();
+    let mut vertex_colored_lines = 0u64;
     for (i, l) in doc.lines.iter().enumerate() {
         let attr = doc.lines.attr[i];
         l.iter().for_each(|&v| referenced[v as usize] = true);
@@ -764,10 +851,39 @@ pub fn convert_with<'a>(
             omissions.excluded_lines += 1;
             continue;
         }
+        let from_vertices = mean_vertex_color(doc, l);
+        vertex_colored_lines += u64::from(from_vertices.is_some());
+        if from_vertices.is_none() {
+            mark_lost(doc, l, &mut colors_lost);
+        }
         polylines.push(PolylineEntity {
             layer: layer_of_attr[attr as usize],
-            color: color_of_attr(attr),
+            color: from_vertices.or_else(|| color_of_attr(attr)),
             vertices: l.to_vec(),
+        });
+    }
+    if vertex_colored_faces + vertex_colored_lines > 0 {
+        diags.push(Severity::Info, Code::VertexColorsAveraged, 0, || {
+            let parts: Vec<String> = [
+                (vertex_colored_faces, "face", "faces"),
+                (vertex_colored_lines, "line", "lines"),
+            ]
+            .iter()
+            .filter(|p| p.0 > 0)
+            .map(|&(n, one, many)| format!("{n} {}", if n == 1 { one } else { many }))
+            .collect();
+            format!(
+                "{} take the average of their vertices' colors (one color per entity; approximate)",
+                parts.join(" and ")
+            )
+        });
+    }
+    let lost = colors_lost.iter().filter(|x| **x).count() as u64;
+    if lost > 0 {
+        diags.push(Severity::Warning, Code::VertexColorsDropped, 0, || {
+            format!(
+                "per-vertex colors on faces with a texture or with uncolored corners are not written ({lost} in source)"
+            )
         });
     }
     let mut points = Vec::new();
@@ -878,6 +994,7 @@ pub fn convert_with<'a>(
         omissions,
         point_cloud,
         texture_colored_faces,
+        vertex_colored_faces,
     }
 }
 
@@ -900,19 +1017,7 @@ fn note_dropped(doc: &ObjDocument, d: &mut Diagnostics) {
             .filter(|&(v, &w)| w != 1.0 && !carried[v])
             .count() as u64
     };
-    // Points carry their vertex's color; faces and lines carry one color per entity.
-    let colors_lost = if c.vertices_with_color == 0 {
-        0
-    } else {
-        let mut seen = vec![false; doc.positions.len()];
-        for &v in doc.faces.indices.iter().chain(&doc.lines.indices) {
-            if doc.colors[v as usize].is_some() {
-                seen[v as usize] = true;
-            }
-        }
-        seen.iter().filter(|x| **x).count() as u64
-    };
-    let drops: [(u64, Code, &str); 6] = [
+    let drops: [(u64, Code, &str); 5] = [
         (
             c.texcoords,
             Code::TexcoordsDropped,
@@ -932,11 +1037,6 @@ fn note_dropped(doc: &ObjDocument, d: &mut Diagnostics) {
             weights_lost,
             Code::VertexWeightDropped,
             "homogeneous vertex weights (w ≠ 1) were not written",
-        ),
-        (
-            colors_lost,
-            Code::VertexColorsDropped,
-            "per-vertex colors on faces and lines are not written",
         ),
         (
             c.smoothing_statements,
@@ -1038,6 +1138,32 @@ mod tests {
         assert_eq!(m.meshes.len(), 2);
         assert_eq!(m.meshes[0].color, Some([255, 0, 0]));
         assert_eq!(m.meshes[0].face_count(), 2);
+    }
+
+    #[test]
+    fn faces_and_lines_take_their_vertices_average_color() {
+        // Red, green and blue corners mix in linear light: a third of the light each.
+        let doc = parse(
+            b"v 0 0 0 1 0 0\nv 1 0 0 0 1 0\nv 0 1 0 0 0 1\nv 5 5 5\n\
+              usemtl red\nf 1 2 3\nf 1 2 4\nl 1 2\n",
+        )
+        .unwrap();
+        let pal = crate::mtl::parse(b"newmtl red\nKd 1 0 0\n");
+        let m = convert(&doc, Some(&pal), Options::default());
+        let colors: Vec<_> = m.meshes.iter().map(|x| (x.color, x.face_count())).collect();
+        // The face with an uncolored corner keeps its material's color.
+        assert_eq!(
+            colors,
+            vec![(Some([156, 156, 156]), 1), (Some([255, 0, 0]), 1)]
+        );
+        assert_eq!(m.polylines[0].color, Some([188, 188, 0]));
+        assert_eq!(m.vertex_colored_faces, 1);
+        let codes: Vec<Code> = m.diagnostics.iter().map(|d| d.code).collect();
+        assert!(codes.contains(&Code::VertexColorsAveraged));
+        assert!(
+            codes.contains(&Code::VertexColorsDropped),
+            "the uncolored face's corners"
+        );
     }
 
     #[test]

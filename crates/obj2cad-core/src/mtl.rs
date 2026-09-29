@@ -15,6 +15,8 @@ pub struct TextureRef {
     pub offset: [f64; 2],
     /// `-s u v`: multiplies texture coordinates.
     pub scale: [f64; 2],
+    /// `-clamp on`: outside 0..1 the image's edge extends instead of repeating.
+    pub clamp: bool,
 }
 
 /// Everything obj2cad uses from an MTL file.
@@ -71,6 +73,7 @@ fn texture_ref(rest: &str) -> Option<TextureRef> {
         file: String::new(),
         offset: [0.0, 0.0],
         scale: [1.0, 1.0],
+        clamp: false,
     };
     let mut i = 0;
     while i < toks.len() && toks[i].starts_with('-') && toks[i].len() > 1 {
@@ -102,8 +105,12 @@ fn texture_ref(rest: &str) -> Option<TextureRef> {
             "-t" => {
                 numbers(&mut i);
             }
+            "-clamp" => {
+                t.clamp = toks.get(i).is_some_and(|x| x.eq_ignore_ascii_case("on"));
+                i += 1;
+            }
             "-mm" => i += 2,
-            _ => i += 1, // -blendu, -blendv, -bm, -boost, -cc, -clamp, -imfchan, -texres
+            _ => i += 1, // -blendu, -blendv, -bm, -boost, -cc, -imfchan, -texres
         }
     }
     t.file = toks.get(i..)?.join(" ");
@@ -130,6 +137,7 @@ mod tests {
         assert_eq!(l.textures["b"].file, "b.png");
         assert_eq!(l.textures["b"].scale, [2.0, 3.0]);
         assert_eq!(l.textures["b"].offset, [0.5, 0.0]);
+        assert!(l.textures["b"].clamp && !l.textures["a"].clamp);
         assert!(!l.textures.contains_key("c"));
     }
 }

@@ -1005,10 +1005,10 @@ impl Parser {
                             );
                         }
                         let before = self.doc.faces.indices.len();
-                        if uvs.iter().any(|&u| u != NO_UV) && self.doc.face_uvs.is_empty() {
+                        // Kept from the first face with a texture coordinate on (earlier
+                        // faces padded), including when that is the very first face.
+                        if uvs.iter().any(|&u| u != NO_UV) || !self.doc.face_uvs.is_empty() {
                             self.doc.face_uvs.resize(before, NO_UV);
-                        }
-                        if !self.doc.face_uvs.is_empty() {
                             self.doc.face_uvs.extend_from_slice(&uvs);
                         }
                         self.doc.faces.push(&idx, attr, line)
@@ -1340,6 +1340,16 @@ mod tests {
         assert!(d.curves[0].rational);
         assert_eq!(d.curves[1].knots, [0.0, 0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 2.0]);
         assert_eq!(d.curves[1].control, [0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn texture_coordinates_are_kept_from_the_first_face() {
+        let d =
+            parse(b"v 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0 0\nvt 1 0\nvt 0 1\nf 1/1 2/2 3/3\nf 1 2 3\n")
+                .unwrap();
+        assert_eq!(d.face_uvs, vec![0, 1, 2, NO_UV, NO_UV, NO_UV]);
+        let d = parse(b"v 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0 0\nf 1 2 3\nf 1/1 2/1 3/1\n").unwrap();
+        assert_eq!(d.face_uvs, vec![NO_UV, NO_UV, NO_UV, 0, 0, 0]);
     }
 
     #[test]

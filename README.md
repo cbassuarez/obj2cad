@@ -38,9 +38,20 @@ The report lists every file as used, not used or missing.
 - **Point clouds** (`.xyz`): each point becomes a CAD point with its exact coordinate
   text, and RGB columns become its color. Column layouts that could mean two things
   (colors or normals) are rejected, not guessed.
-- **Textures** color faces, one color per face and at most 32 per texture, sampled with the
-  same decoder in the browser and the command-line tool. The shapes stay exact; the
-  colors are labeled approximate.
+- **Colors**: a material's `Kd` becomes the entity's true color. A CAD mesh entity has one
+  color, so faces with more detail than that get one color each, the color they show from
+  far enough away to look uniform:
+  - **Textures**: the image averaged over the face's area, about four samples per texel,
+    mixed in linear light (so fine black and white stripes read as the mid gray they look
+    like, not dark gray), with transparent parts left out and `-s`, `-o` and `-clamp`
+    applied. Decoded by the same code in the browser and the command-line tool.
+  - **Vertex colors** (`v x y z r g b`, common in scans): the average of the face's or
+    line's corners, also in linear light. Points keep their own color.
+
+  Faces are grouped into one mesh entity per color. Colors are only merged when they
+  are within 4 levels of each other or a texture has more than 256 colors, and then the
+  colors covering the most area are kept closest. The shapes stay exact; these colors
+  are labeled approximate, and the parity harness checks each against its own reference.
 - **Free-form curves** in the OBJ (`curv`, B-spline or Bézier) become exact splines: the
   control points are the OBJ's vertices, the knots and weights its own numbers.
 

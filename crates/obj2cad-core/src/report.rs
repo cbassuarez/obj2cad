@@ -24,6 +24,8 @@ pub struct Report {
     pub omissions: Omissions,
     /// Faces colored from texture images (approximate colors; shapes are exact).
     pub texture_colored_faces: u64,
+    /// Faces colored with the average of their vertices' colors (approximate colors).
+    pub vertex_colored_faces: u64,
     /// Every file in the bundle and what it was used for (empty for a single file).
     pub files: Vec<FileEntry>,
     /// Curved surfaces written next to the mesh, in the order of their entities.
@@ -193,6 +195,7 @@ pub fn build(model: &CadModel, source: &Source, parity: &str, written: Written) 
         point_cloud: model.point_cloud,
         omissions: model.omissions.clone(),
         texture_colored_faces: model.texture_colored_faces,
+        vertex_colored_faces: model.vertex_colored_faces,
         curves: model
             .surfaces
             .iter()
