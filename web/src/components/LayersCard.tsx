@@ -13,6 +13,7 @@ export function LayersCard({
   busy,
   onMode,
   onToggle,
+  onShowAll,
 }: {
   report: Report;
   mode: LayerMode;
@@ -20,6 +21,7 @@ export function LayersCard({
   busy: boolean;
   onMode: (m: LayerMode) => void;
   onToggle: (layer: number) => void;
+  onShowAll: () => void;
 }) {
   const rows = report.layers.map((l, i) => ({ ...l, i })).filter((l) => l.faces + l.polylines + l.points > 0);
   const total = (l: (typeof rows)[number]) => l.faces + l.polylines + l.points;
@@ -72,9 +74,12 @@ export function LayersCard({
           );
         })}
       </ul>
-      {hidden.size > 0 && shown > 0 && (
-        <div className="border-t border-line-soft px-4 py-2 text-[12px] text-fg-3">
-          {shown} of {rows.length} shown · hidden layers are left out of the download
+      {hidden.size > 0 && (
+        <div className="flex items-baseline gap-3 border-t border-line-soft px-4 py-2 text-[12px] text-fg-3">
+          <span className="min-w-0 flex-1">{shown > 0 ? `${shown} of ${rows.length} shown · hidden layers are left out of the download` : "Every layer is hidden"}</span>
+          <Button variant="link" className="h-auto shrink-0 px-0 text-[12px]" onClick={onShowAll}>
+            Show all
+          </Button>
         </div>
       )}
     </section>

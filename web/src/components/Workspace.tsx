@@ -38,6 +38,7 @@ export function Workspace({
   onIncludeName,
   onDownload,
   onDownloadVisible,
+  onLayersChanged,
   onDownloadReport,
   onAddMtl,
   onAnother,
@@ -57,6 +58,8 @@ export function Workspace({
   onIncludeName: (on: boolean) => void;
   onDownload: (pick: boolean) => void;
   onDownloadVisible: (hiddenLayers: string[]) => void;
+  /** Layers were hidden or shown: what a download holds has changed. */
+  onLayersChanged: () => void;
   onDownloadReport: () => void;
   onAddMtl: () => void;
   onAnother: () => void;
@@ -103,11 +106,35 @@ export function Workspace({
     else next.add(layer);
     setHidden(next);
     viewer.current?.setLayerVisible(layer, !next.has(layer));
+    onLayersChanged();
+  };
+
+  const showAll = () => {
+    for (const layer of hidden) viewer.current?.setLayerVisible(layer, true);
+    setHidden(new Set());
+    onLayersChanged();
   };
 
   const available = preview?.buffers.available ?? true;
   const layerCount = report.layers.filter((l) => l.faces + l.polylines + l.points > 0).length;
-  const downloadVisible = () => onDownloadVisible(report.layers.filter((_, i) => hidden.has(i)).map((l) => l.name));
+  /** The download, as the button and the keyboard make it: hidden layers left out. */
+  const download = (pickLocation: boolean) => {
+    if (busy !== null) return;
+    if (hidden.size === 0) onDownload(pickLocation);
+    else if (hidden.size < layerCount) onDownloadVisible(report.layers.filter((_, i) => hidden.has(i)).map((l) => l.name));
+  };
+  const downloadRef = useRef(download);
+  downloadRef.current = download;
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") {
+        e.preventDefault();
+        downloadRef.current(e.shiftKey);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
   const onOrtho = (on: boolean) => {
     setOrtho(on);
     viewer.current?.setOrtho(on);
@@ -138,8 +165,7 @@ export function Workspace({
     onView: (v) => viewer.current?.setView(v),
     onOrtho,
     onFit: () => viewer.current?.fit(),
-    onDownload,
-    onDownloadVisible: downloadVisible,
+    onDownload: download,
     onDownloadReport,
     onAddMtl,
     onAnother,
@@ -161,7 +187,7 @@ export function Workspace({
               initial={{ opacity: 0, y: -6 }}
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0 }}
-              className="panel absolute top-[72px] left-1/2 z-10 flex -translate-x-1/2 items-center gap-2.5 !rounded-[4px] px-4 py-2 text-[13px] text-fg-2 lg:top-5"
+              className="panel absolute top-[72px] left-1/2 z-10 flex -translate-x-1/2 items-center gap-2.5 !rounded-[4px] px-4 py-2 text-[13px] text-fg-2 lg:top-[76px]"
               role="status"
             >
               <span className="size-3.5 animate-spin rounded-full border-2 border-line border-t-accent" />
@@ -196,7 +222,7 @@ export function Workspace({
           transition={{ delay: 0.05 }}
           className="pointer-events-none lg:absolute lg:top-[76px] lg:left-4 lg:flex lg:max-h-[calc(100%-200px)] lg:w-[268px]"
         >
-          <LayersCard report={report} mode={prefs.layerMode} hidden={hidden} busy={busy !== null} onMode={onLayerMode} onToggle={toggleLayer} />
+          <LayersCard report={report} mode={prefs.layerMode} hidden={hidden} busy={busy !== null} onMode={onLayerMode} onToggle={toggleLayer} onShowAll={showAll} />
         </motion.div>
       </div>
     </main>

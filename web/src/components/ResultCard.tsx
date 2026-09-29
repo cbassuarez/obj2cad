@@ -4,6 +4,7 @@
 // menu, so the card holds one button only: the download.
 import { useState } from "react";
 import { Menu, Modal } from "@mantine/core";
+import { notifications } from "@mantine/notifications";
 import { Check, ChevronDown, Copy, ExternalLink, FileText, Info, MoreHorizontal, Palette, TriangleAlert } from "lucide-react";
 import { AnimatePresence, motion } from "motion/react";
 import { Button } from "@/components/ui/button";
@@ -244,7 +245,11 @@ export function ResultCard(p: ResultProps) {
   const s = summarize(report);
   const size = sizeText(report, decisions);
   const [details, setDetails] = useState(false);
-  const copyHash = () => void navigator.clipboard?.writeText(report.parity_hash).catch(() => {});
+  const copyHash = () =>
+    void navigator.clipboard
+      ?.writeText(report.parity_hash)
+      .then(() => notifications.show({ message: "Parity hash copied" }))
+      .catch(() => notifications.show({ color: "red", message: "Couldn't copy: open Technical details to select the hash" }));
 
   return (
     <aside className="panel pointer-events-auto flex max-h-full min-h-0 w-full flex-col overflow-hidden" aria-label="Result">

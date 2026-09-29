@@ -180,7 +180,7 @@ export function App() {
     setBusy(label);
     setDownloaded(null);
     try {
-      const r = await engine.convert(settings, wantPreview, () => setBusy(settings.format === "dwg" ? "Preparing DWG…" : label));
+      const r = await engine.convert(cur, settings, wantPreview, () => setBusy(settings.format === "dwg" ? "Preparing DWG…" : label));
       if (token !== convertToken.current) return false;
       if (isEmpty(r.report)) {
         setFailed({ name: cur.file.name, explained: explain({ kind: "empty" }) });
@@ -219,10 +219,10 @@ export function App() {
       if (!opts.reload) setScreen("loading");
       else setBusy("Reloading…");
       try {
-        const info = await engine.open(file, null, prefsRef.current.format === "dwg", (p) => setLoading({ name: file.name, progress: p }));
+        const info = await engine.open(file, prefsRef.current.format === "dwg", (p) => setLoading({ name: file.name, progress: p }));
         if (token !== openToken.current) return;
         const mtl = pickMtl(info.mtllibs, mtls, true);
-        if (mtl) await engine.setMtl(mtl);
+        if (mtl) await engine.setMtl(file, mtl);
         const cur: Current = { id: ++seq.current, file, mtl, mtls, handle, inspection: info, choices: opts.choices ?? AUTO, batchItem: opts.batchItem ?? null };
         setCur(cur);
         if (!(await convert(cur, true)) || token !== openToken.current) return;
@@ -245,10 +245,10 @@ export function App() {
       if (token !== batchToken.current) return;
       updateBatch(item.id, { status: "converting", result: undefined, error: undefined });
       try {
-        const info = await engine.open(item.file, null, prefsRef.current.format === "dwg");
+        const info = await engine.open(item.file, prefsRef.current.format === "dwg");
         const mtl = pickMtl(info.mtllibs, batchMtls.current, false);
-        if (mtl) await engine.setMtl(mtl);
-        const r = await engine.convert(engineSettings(prefsRef.current, AUTO, item.file), false);
+        if (mtl) await engine.setMtl(item.file, mtl);
+        const r = await engine.convert({ file: item.file, mtl }, engineSettings(prefsRef.current, AUTO, item.file), false);
         if (isEmpty(r.report)) updateBatch(item.id, { status: "failed", error: explain({ kind: "empty" }) });
         else updateBatch(item.id, { status: "done", result: r });
       } catch (e) {
@@ -299,7 +299,7 @@ export function App() {
     const cur = currentRef.current;
     if (!cur) return;
     try {
-      await engine.setMtl(mtl);
+      await engine.setMtl(cur.file, mtl);
     } catch (e) {
       return fail(cur.file.name, e);
     }
@@ -360,7 +360,7 @@ export function App() {
     if (!cur) return;
     setBusy("Converting…");
     try {
-      const r = await engine.convert(engineSettings(prefsRef.current, cur.choices, cur.file, hiddenLayers), false);
+      const r = await engine.convert(cur, engineSettings(prefsRef.current, cur.choices, cur.file, hiddenLayers), false);
       await save(r.file, `${stem(cur.file.name)} (visible layers).${ext()}`);
     } catch (e) {
       notifications.show({ color: "red", title: "Couldn't convert the visible layers", message: (e as Error).message });
@@ -375,7 +375,7 @@ export function App() {
     if (!cur || !r) return;
     const report = { ...r.report, output: { ...r.report.output, sha256: await sha256Hex(r.file) } };
     const saved = await saveFile(new Blob([JSON.stringify(report, null, 2)], { type: "application/json" }), `${stem(cur.file.name)}.report.json`).catch(() => null);
-    if (saved) setDownloaded(saved);
+    if (saved) notifications.show({ message: `Saved ${saved}` });
   };
 
   const downloadAll = async () => {
@@ -424,12 +424,10 @@ export function App() {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (!(e.ctrlKey || e.metaKey)) return;
+      // Ctrl/⌘+S is the workspace's: it knows which layers are hidden.
       if (e.key.toLowerCase() === "o") {
         e.preventDefault();
         void pick();
-      } else if (e.key.toLowerCase() === "s" && screenRef.current === "work") {
-        e.preventDefault();
-        download(e.shiftKey);
       }
     };
     window.addEventListener("keydown", onKey);
@@ -495,6 +493,7 @@ export function App() {
               onIncludeName={(includeName) => changePrefs({ includeName })}
               onDownload={download}
               onDownloadVisible={(hidden) => void downloadVisible(hidden)}
+              onLayersChanged={() => setDownloaded(null)}
               onDownloadReport={() => void downloadReport()}
               onAddMtl={() => mtlInput.current?.click()}
               onAnother={() => void pick()}

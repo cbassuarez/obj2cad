@@ -1,6 +1,12 @@
 // Main-thread side of the conversion worker. The worker owns the WebAssembly engine and
 // the parsed file; the UI sends small commands and receives the file as a Blob plus
 // transferable preview buffers. If the engine crashes, the worker is replaced.
+//
+// The worker holds one file at a time and the viewer and the file list both use it, so
+// every call here runs alone, in order, and a conversion names the file it is for: when
+// the worker holds another one, that file is opened again first. Without this, opening a
+// file from the list while the list was still converting could show (and download)
+// another file's drawing under its name.
 import type { Converted, Failure, ParseFailure, PreviewBuffers, Progress, Reply, Request } from "@/worker";
 import type { EngineSettings, LayerMode, UpAxis, Units } from "@/lib/settings";
 
@@ -92,10 +98,19 @@ interface Pending {
   progress?: (p: Progress) => void;
 }
 
+/** A model and the material library that goes with it. */
+export interface Source {
+  file: File;
+  mtl: File | null;
+}
+
 class Engine {
   private worker!: Worker;
   private seq = 0;
   private pending = new Map<number, Pending>();
+  /** What the worker holds now; `null` after a crash or before the first open. */
+  private loaded: Source | null = null;
+  private queue: Promise<unknown> = Promise.resolve();
 
   constructor() {
     this.start();
@@ -127,6 +142,7 @@ class Engine {
   }
 
   private failAll(failure: Failure) {
+    this.loaded = null;
     for (const p of this.pending.values()) p.reject(new EngineError(failure));
     this.pending.clear();
   }
@@ -146,25 +162,58 @@ class Engine {
     });
   }
 
-  open(file: File, mtl: File | null, dwg: boolean, progress?: (p: Progress) => void): Promise<Inspection> {
-    return this.call<Inspection>({ type: "open", file, mtl, dwg }, progress);
+  /** Run `task` after every call before it has finished, and before any call after it. */
+  private serial<T>(task: () => Promise<T>): Promise<T> {
+    const run = this.queue.then(task, task);
+    this.queue = run.catch(() => undefined);
+    return run;
   }
 
-  setMtl(mtl: File): Promise<void> {
-    return this.call<void>({ type: "mtl", mtl });
+  /** Make the worker hold `src` (and its material library), opening it again if needed. */
+  private async hold(src: Source, dwg: boolean): Promise<void> {
+    const l = this.loaded;
+    if (l?.file === src.file && (l.mtl === src.mtl || src.mtl === null)) return;
+    if (l?.file === src.file && src.mtl) {
+      await this.call<void>({ type: "mtl", mtl: src.mtl });
+      this.loaded = { file: src.file, mtl: src.mtl };
+      return;
+    }
+    this.loaded = null;
+    await this.call<Inspection>({ type: "open", file: src.file, mtl: src.mtl, dwg });
+    this.loaded = { file: src.file, mtl: src.mtl };
   }
 
-  async convert(settings: EngineSettings, preview: boolean, progress?: (p: Progress) => void): Promise<Result> {
-    const r = await this.call<Converted>({ type: "convert", settings, preview }, progress);
-    return {
-      file: r.file,
-      report: JSON.parse(r.report) as Report,
-      decisions: JSON.parse(r.decisions) as Decisions,
-      preview: r.preview,
-      timings: r.timings,
-      ms: r.ms,
-    };
+  open(file: File, dwg: boolean, progress?: (p: Progress) => void): Promise<Inspection> {
+    return this.serial(async () => {
+      this.loaded = null;
+      const info = await this.call<Inspection>({ type: "open", file, mtl: null, dwg }, progress);
+      this.loaded = { file, mtl: null };
+      return info;
+    });
   }
+
+  /** Give `file` its material library. */
+  setMtl(file: File, mtl: File): Promise<void> {
+    return this.serial(() => this.hold({ file, mtl }, false));
+  }
+
+  convert(src: Source, settings: EngineSettings, preview: boolean, progress?: (p: Progress) => void): Promise<Result> {
+    return this.serial(async () => {
+      await this.hold(src, settings.format === "dwg");
+      return parse(await this.call<Converted>({ type: "convert", settings, preview }, progress));
+    });
+  }
+}
+
+function parse(r: Converted): Result {
+  return {
+    file: r.file,
+    report: JSON.parse(r.report) as Report,
+    decisions: JSON.parse(r.decisions) as Decisions,
+    preview: r.preview,
+    timings: r.timings,
+    ms: r.ms,
+  };
 }
 
 export const engine = new Engine();

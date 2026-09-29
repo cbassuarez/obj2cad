@@ -51,7 +51,7 @@ export function DropScreen({ onPick }: { onPick: () => void }) {
             <Button variant="primary" size="lg" onClick={onPick}>
               Choose files…
             </Button>
-            <p className="text-center text-[14px] text-fg-3">or drop them anywhere on this page</p>
+            <p className="text-center text-[14px] text-fg-3 [@media(pointer:coarse)]:hidden">or drop them anywhere on this page</p>
           </div>
         </div>
       </motion.div>

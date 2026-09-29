@@ -8,7 +8,7 @@ import type { Decisions, Report } from "@/lib/engine";
 import { canPickSaveLocation } from "@/lib/files";
 import { bytes, measure } from "@/lib/format";
 import { UNITS, formatInfo, unitName, unitSymbol, type Format, type UpAxis, type Units } from "@/lib/settings";
-import { cn } from "@/lib/utils";
+import { cn, shortcut } from "@/lib/utils";
 import type { ViewName } from "@/viewer/Viewer";
 
 export const menuStyles = { dropdown: "panel !p-1", item: "!rounded-[3px] !text-[13px]", label: "!text-[11px]" };
@@ -53,8 +53,8 @@ export interface ResultProps {
   onView: (v: ViewName) => void;
   onOrtho: (on: boolean) => void;
   onFit: () => void;
+  /** Download the drawing, leaving out hidden layers; `pick` asks where to save. */
   onDownload: (pick: boolean) => void;
-  onDownloadVisible: () => void;
   onDownloadReport: () => void;
   onAddMtl: () => void;
   onAnother: () => void;
@@ -133,7 +133,10 @@ export function sizeText(report: Report, decisions: Decisions): string | null {
     .join(" × ")}${symbol ? ` ${symbol}` : ""}`;
 }
 
-/** The one filled button on the page. Hidden layers are left out when `visibleOnly`. */
+/** What the download holds, given the layers hidden in the viewer. */
+export const layersShown = ({ hiddenCount, layerCount }: Pick<ResultProps, "hiddenCount" | "layerCount">) => (hiddenCount === 0 ? "all" : hiddenCount < layerCount ? "some" : "none");
+
+/** The one filled button on the page. Hidden layers are left out. */
 export function DownloadButton({
   report,
   format,
@@ -141,18 +144,19 @@ export function DownloadButton({
   hiddenCount,
   layerCount,
   onDownload,
-  onDownloadVisible,
   className,
-}: Pick<ResultProps, "report" | "format" | "busy" | "hiddenCount" | "layerCount" | "onDownload" | "onDownloadVisible"> & { className?: string }) {
-  const visibleOnly = hiddenCount > 0 && hiddenCount < layerCount;
+}: Pick<ResultProps, "report" | "format" | "busy" | "hiddenCount" | "layerCount" | "onDownload"> & { className?: string }) {
+  const shown = layersShown({ hiddenCount, layerCount });
   return (
-    <Button variant="primary" size="lg" className={cn("w-full justify-between px-5", className)} onClick={() => (visibleOnly ? onDownloadVisible() : onDownload(false))} disabled={busy !== null}>
-      <span className="flex items-center gap-2.5">
-        <Download />
-        Download {shortFormat(format)}
-      </span>
-      <span className="num text-[12px] font-normal opacity-80">{busy !== null ? "…" : visibleOnly ? `${layerCount - hiddenCount} of ${layerCount} layers` : bytes(report.output.bytes)}</span>
-    </Button>
+    <Tip label={`Download (${shortcut("S")})`}>
+      <Button variant="primary" size="lg" className={cn("w-full justify-between px-5", className)} onClick={() => onDownload(false)} disabled={busy !== null || shown === "none"}>
+        <span className="flex items-center gap-2.5">
+          <Download />
+          Download {shortFormat(format)}
+        </span>
+        <span className="num text-[12px] font-normal opacity-80">{busy !== null ? "…" : shown === "all" ? bytes(report.output.bytes) : `${layerCount - hiddenCount} of ${layerCount} layers`}</span>
+      </Button>
+    </Tip>
   );
 }
 
@@ -165,8 +169,8 @@ export function DownloadAfter({
   onDownload,
   onAnother,
 }: Pick<ResultProps, "busy" | "downloaded" | "hiddenCount" | "layerCount" | "onDownload" | "onAnother">) {
-  const visibleOnly = hiddenCount > 0 && hiddenCount < layerCount;
-  if (downloaded && busy === null)
+  const shown = layersShown({ hiddenCount, layerCount });
+  if (downloaded && busy === null && shown !== "none")
     return (
       <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: "auto" }} className="flex items-center gap-2 text-[13px]">
         <CircleCheck className="size-4 shrink-0 text-exact" />
@@ -180,8 +184,8 @@ export function DownloadAfter({
     );
   return (
     <div className="flex min-h-5 items-center gap-3 text-[12.5px] text-fg-3">
-      {visibleOnly ? <span>Hidden layers are left out</span> : <span>Everything in the viewer is included</span>}
-      {canPickSaveLocation() && !visibleOnly && (
+      <span>{shown === "all" ? "Everything in the viewer is included" : shown === "some" ? "Hidden layers are left out" : "Every layer is hidden: show one to download"}</span>
+      {canPickSaveLocation() && shown === "all" && (
         <Button variant="link" className="ml-auto h-auto px-0 text-[12.5px]" onClick={() => onDownload(true)} disabled={busy !== null}>
           Save as…
         </Button>
