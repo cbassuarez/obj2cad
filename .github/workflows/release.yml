@@ -36,7 +36,7 @@ jobs:
           app-id: ${{ secrets.RELEASE_APP_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
       - id: rp
-        uses: googleapis/release-please-action@v4
+        uses: googleapis/release-please-action@v5
         with:
           token: ${{ steps.app.outputs.token || github.token }}
           config-file: release-please-config.json
@@ -58,9 +58,9 @@ jobs:
     env:
       VERSION: ${{ needs.release-please.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup show active-toolchain || rustup toolchain install
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - run: python tools/vendor/fetch_acadrust.py
@@ -79,7 +79,7 @@ jobs:
           cp target/release/${{ matrix.exe }} README.md LICENSE "$name/"
           if [ "${{ runner.os }}" = "Windows" ]; then 7z a "$name.zip" "$name" > /dev/null; else tar czf "$name.tar.gz" "$name"; fi
           rm -rf "$name"
-      - uses: actions/attest-build-provenance@v2
+      - uses: actions/attest-build-provenance@v4
         with:
           subject-path: obj2cad-cli-*
       - name: Upload
@@ -96,16 +96,16 @@ jobs:
     env:
       VERSION: ${{ needs.release-please.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
           tool: wasm-bindgen-cli@0.2.129
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
           cache: npm
@@ -164,7 +164,7 @@ jobs:
           sha256sum obj2cad-web-$VERSION.tar.gz sbom.spdx.json > SHA256SUMS
           gh release upload "$TAG" obj2cad-web-$VERSION.tar.gz sbom.spdx.json SHA256SUMS --clobber
 
-      - uses: actions/attest-build-provenance@v2
+      - uses: actions/attest-build-provenance@v4
         with:
           subject-path: obj2cad-web-${{ env.VERSION }}.tar.gz
 
