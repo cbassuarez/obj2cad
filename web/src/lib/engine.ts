@@ -104,8 +104,49 @@ export interface Early {
   decisions: Decisions;
 }
 
+/** A written file, as the writer's pieces (transferred from the worker, not copied). They
+ *  become one `Blob` a few megabytes at a time while the page is idle: in one go, a
+ *  large file (a scan's 370 MB) held the page for seconds. `blob()` finishes the job at
+ *  once when it's needed sooner. */
+export class OutputFile {
+  readonly size: number;
+  private parts: ArrayBuffer[];
+  private packed: Blob[] = [];
+  private whole: Blob | null = null;
+
+  constructor(parts: ArrayBuffer[]) {
+    this.parts = parts;
+    this.size = parts.reduce((n, p) => n + p.byteLength, 0);
+    this.schedule();
+  }
+
+  private schedule() {
+    if (!this.parts.length) return;
+    const idle = window.requestIdleCallback ?? ((cb: () => void) => setTimeout(cb, 16));
+    idle(() => {
+      this.pack(8);
+      this.schedule();
+    });
+  }
+
+  private pack(n: number) {
+    const take = this.parts.splice(0, n);
+    if (take.length) this.packed.push(new Blob(take));
+  }
+
+  /** The file (pieces not packed yet are packed now; a blob of blobs is not copied again). */
+  blob(): Blob {
+    if (!this.whole) {
+      while (this.parts.length) this.pack(64);
+      this.whole = new Blob(this.packed, { type: "application/octet-stream" });
+      this.packed = [];
+    }
+    return this.whole;
+  }
+}
+
 export interface Result {
-  file: Blob;
+  file: OutputFile;
   report: Report;
   decisions: Decisions;
   preview: PreviewBuffers | null;
@@ -128,6 +169,8 @@ interface Pending {
   reject: (e: EngineError) => void;
   progress?: (p: Progress) => void;
   early?: (e: EarlyReply) => void;
+  /** Reading or converting a drawing (not warming up an engine module). */
+  work: boolean;
 }
 
 /** The files of one drawing, as the app holds them (`Job` in lib/files.ts). A drawing is
@@ -144,6 +187,8 @@ class Engine {
   /** The drawing the worker holds; `null` after a crash or before the first open. */
   private loaded: Drawing | null = null;
   private queue: Promise<unknown> = Promise.resolve();
+  /** Counts restarts: calls queued before one are dropped, not run. */
+  private generation = 0;
 
   constructor() {
     this.start();
@@ -186,6 +231,7 @@ class Engine {
 
   /** Replace the worker (after a crash). The open file is lost and must be opened again. */
   restart() {
+    this.generation++;
     this.worker.terminate();
     this.failAll({ kind: "crash", message: RESTARTED });
     this.start();
@@ -194,14 +240,17 @@ class Engine {
   private call<T>(req: Without<Request, "id">, progress?: (p: Progress) => void, early?: (e: EarlyReply) => void): Promise<T> {
     const id = ++this.seq;
     return new Promise<T>((resolve, reject) => {
-      this.pending.set(id, { resolve: resolve as (r: unknown) => void, reject, progress, early });
+      this.pending.set(id, { resolve: resolve as (r: unknown) => void, reject, progress, early, work: req.type !== "warm" });
       this.worker.postMessage({ ...req, id } as Request);
     });
   }
 
-  /** Run `task` after every call before it has finished, and before any call after it. */
+  /** Run `task` after every call before it has finished, and before any call after it.
+   *  A task queued before a restart is dropped (it was for work that was stopped). */
   private serial<T>(task: () => Promise<T>): Promise<T> {
-    const run = this.queue.then(task, task);
+    const generation = this.generation;
+    const start = () => (generation === this.generation ? task() : Promise.reject(new EngineError({ kind: "crash", message: RESTARTED })));
+    const run = this.queue.then(start, start);
     this.queue = run.catch(() => undefined);
     return run;
   }
@@ -218,9 +267,22 @@ class Engine {
     void this.call({ type: "warm", dwg }).catch(() => undefined);
   }
 
-  /** Read the files of one drawing. Its `name` names it when it holds several models. */
-  open(d: Drawing, dwg: boolean, progress?: (p: Progress) => void): Promise<Inspection> {
+  /** Read the files of one drawing. Its `name` names it when it holds several models.
+   *  With `interrupt`, whatever the engine is doing for another drawing is stopped rather
+   *  than waited for (a person opened another file; the old one's work is moot). */
+  open(d: Drawing, dwg: boolean, progress?: (p: Progress) => void, interrupt = false): Promise<Inspection> {
+    if (interrupt && [...this.pending.values()].some((p) => p.work)) this.restart();
     return this.serial(() => this.load(d, dwg, progress));
+  }
+
+  /** The model to show, with a provisional report, and no file (part of a bundle, shown
+   *  while the rest of it loads; the file is written once, by `convert`, from all of it). */
+  preview(d: Drawing, settings: EngineSettings): Promise<Early> {
+    return this.serial(async () => {
+      if (this.loaded !== d) await this.load(d, settings.format === "dwg");
+      const e = await this.call<EarlyReply>({ type: "preview", settings });
+      return { preview: e.preview, report: JSON.parse(e.report) as Report, decisions: JSON.parse(e.decisions) as Decisions };
+    });
   }
 
   /** Convert the drawing. With `early`, the preview comes to it as soon as the model can be
@@ -233,9 +295,8 @@ class Engine {
         ((e: EarlyReply) => early({ preview: e.preview, report: JSON.parse(e.report) as Report, decisions: JSON.parse(e.decisions) as Decisions }));
       const r = await this.call<Converted>({ type: "convert", settings, preview, early: early !== undefined }, progress, onEarly);
       return {
-        // Assembled here from the transferred pieces: fast on this thread, while in the
-        // worker it held back the result by a large fraction of a second.
-        file: new Blob(r.parts, { type: "application/octet-stream" }),
+        // The transferred pieces; packed into one Blob a little at a time (see OutputFile).
+        file: new OutputFile(r.parts),
         report: JSON.parse(r.report) as Report,
         decisions: JSON.parse(r.decisions) as Decisions,
         preview: r.preview,

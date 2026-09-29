@@ -37,7 +37,10 @@ The report lists every file as used, not used or missing.
 
 - **Point clouds** (`.xyz`): each point becomes a CAD point with its exact coordinate
   text, and RGB columns become its color. Column layouts that could mean two things
-  (colors or normals) are rejected, not guessed.
+  (colors or normals) are rejected, not guessed. In the app, a large cloud (16 MB or
+  more) loads after the models it comes with, which are shown first; the file is written
+  once, from everything. Clouds over 4 million points are shown evenly thinned; the file
+  has every point.
 - **Colors**: a material's `Kd` becomes the entity's true color. A CAD mesh entity has one
   color, so faces with more detail than that get one color each, the color they show from
   far enough away to look uniform:

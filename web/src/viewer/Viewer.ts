@@ -29,13 +29,6 @@ const VIEWS: Record<ViewName, THREE.Vector3> = {
 /** Standing a Y-up model upright is +90° about X: (x, y, z) → (x, −z, y). */
 const UPRIGHT = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), Math.PI / 2);
 
-// sRGB bytes → linear bytes: three.js treats vertex colors as linear.
-const TO_LINEAR = Uint8Array.from({ length: 256 }, (_, i) => Math.round(255 * new THREE.Color().setRGB(i / 255, 0, 0, THREE.SRGBColorSpace).r));
-const linear = (c: Uint8Array) => {
-  for (let i = 0; i < c.length; i++) c[i] = TO_LINEAR[c[i]];
-  return c;
-};
-
 const FOV = 38;
 /** Dimension label numbers: up to 3 decimals, grouped thousands (like the result card). */
 const LENGTH = new Intl.NumberFormat("en-US", { maximumFractionDigits: 3 });
@@ -149,7 +142,8 @@ export class Viewer {
     this.builtUp = this.shownUp = up;
     this.content.quaternion.identity();
     const position = new THREE.BufferAttribute(p.positions, 3);
-    const color = new THREE.BufferAttribute(linear(p.colors), 3, true);
+    // Colors come in linear light, as the renderer takes vertex colors.
+    const color = new THREE.BufferAttribute(p.colors, 3, true);
     const surface = new THREE.MeshStandardMaterial({
       vertexColors: true,
       flatShading: true, // facets are the truth; never smooth them away
@@ -161,12 +155,18 @@ export class Viewer {
       polygonOffsetUnits: 1,
     });
     const edgeMat = new THREE.LineBasicMaterial({ color: this.theme.edge, transparent: true, opacity: 0.4 });
-    // The layers share one vertex buffer, so their extents come from their own elements.
-    const extend = (layer: number, pos: ArrayLike<number>, at: (k: number) => number, count: number) => {
-      const b = this.layerBoxes.get(layer) ?? new THREE.Box3();
-      const v = new THREE.Vector3();
-      for (let k = 0; k < count; k++) b.expandByPoint(v.fromArray(pos as number[], at(k) * 3));
-      this.layerBoxes.set(layer, b);
+    // Each layer's extent comes from the engine. The layers share vertex buffers, so
+    // three.js would otherwise scan the whole buffer for every object (millions of points
+    // several times over); each geometry gets its layer's box and sphere instead.
+    const lb = p.layerBounds;
+    for (let k = 0; k + 7 <= lb.length; k += 7) {
+      this.layerBoxes.set(lb[k], new THREE.Box3(new THREE.Vector3(lb[k + 1], lb[k + 2], lb[k + 3]), new THREE.Vector3(lb[k + 4], lb[k + 5], lb[k + 6])));
+    }
+    const fit = (geo: THREE.BufferGeometry, layer: number) => {
+      const b = this.layerBoxes.get(layer) ?? new THREE.Box3(new THREE.Vector3(), new THREE.Vector3());
+      geo.boundingBox = b.clone();
+      geo.boundingSphere = b.getBoundingSphere(new THREE.Sphere());
+      return geo;
     };
     const add = (layer: number, ...objs: THREE.Object3D[]) => {
       for (const o of objs) o.userData.layer = layer;
@@ -176,14 +176,15 @@ export class Viewer {
 
     for (let g = 0; g < p.groups.length; g += 5) {
       const [layer, i0, ic, e0, ec] = p.groups.subarray(g, g + 5);
-      extend(layer, p.positions, (k) => p.indices[i0 + k], ic);
       const geo = new THREE.BufferGeometry();
       geo.setAttribute("position", position);
       geo.setAttribute("color", color);
       geo.setIndex(new THREE.BufferAttribute(p.indices.subarray(i0, i0 + ic), 1));
+      fit(geo, layer);
       const eg = new THREE.BufferGeometry();
       eg.setAttribute("position", position);
       eg.setIndex(new THREE.BufferAttribute(p.edges.subarray(e0, e0 + ec), 1));
+      fit(eg, layer);
       const edges = new THREE.LineSegments(eg, edgeMat);
       edges.userData.edges = true;
       this.edgeObjects.push(edges);
@@ -191,30 +192,28 @@ export class Viewer {
     }
     if (p.lines.length) {
       const pos = new THREE.BufferAttribute(p.lines, 3);
-      const col = new THREE.BufferAttribute(linear(p.lineColors), 3, true);
+      const col = new THREE.BufferAttribute(p.lineColors, 3, true);
       const mat = new THREE.LineBasicMaterial({ vertexColors: true });
       for (let g = 0; g < p.lineGroups.length; g += 3) {
         const [layer, start, count] = p.lineGroups.subarray(g, g + 3);
-        extend(layer, p.lines, (k) => start + k, count);
         const geo = new THREE.BufferGeometry();
         geo.setAttribute("position", pos);
         geo.setAttribute("color", col);
         geo.setDrawRange(start, count);
-        add(layer, new THREE.LineSegments(geo, mat));
+        add(layer, new THREE.LineSegments(fit(geo, layer), mat));
       }
     }
     if (p.points.length) {
       const pos = new THREE.BufferAttribute(p.points, 3);
-      const col = new THREE.BufferAttribute(linear(p.pointColors), 3, true);
+      const col = new THREE.BufferAttribute(p.pointColors, 3, true);
       const mat = new THREE.PointsMaterial({ vertexColors: true, size: 5, sizeAttenuation: false });
       for (let g = 0; g < p.pointGroups.length; g += 3) {
         const [layer, start, count] = p.pointGroups.subarray(g, g + 3);
-        extend(layer, p.points, (k) => start + k, count);
         const geo = new THREE.BufferGeometry();
         geo.setAttribute("position", pos);
         geo.setAttribute("color", col);
         geo.setDrawRange(start, count);
-        add(layer, new THREE.Points(geo, mat));
+        add(layer, new THREE.Points(fit(geo, layer), mat));
       }
     }
 
