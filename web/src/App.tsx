@@ -75,6 +75,8 @@ export function App() {
   const [prefs, setPrefsState] = useState<Prefs>(loadPrefs);
   const [current, setCurrent] = useState<Current | null>(null);
   const [result, setResult] = useState<Result | null>(null);
+  /** The drawing without the layers left out: what Download saves then. */
+  const [visible, setVisible] = useState<Result | null>(null);
   const [preview, setPreview] = useState<PreviewState | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [loading, setLoading] = useState<{ name: string; progress: Progress | null }>({ name: "", progress: null });
@@ -92,6 +94,16 @@ export function App() {
   const prefsRef = useRef(prefs);
   const currentRef = useRef<Current | null>(null);
   const resultRef = useRef<Result | null>(null);
+  const visibleRef = useRef<Result | null>(null);
+  const visibleToken = useRef(0);
+  /** Names of the layers left out of the drawing (unticked in the layers pane). They
+   *  survive a rebuilt preview (a reload, loose points) while those layers still exist. */
+  const [hidden, setHiddenState] = useState<string[]>([]);
+  const hiddenRef = useRef<string[]>([]);
+  const setHidden = (names: string[]) => {
+    hiddenRef.current = names;
+    setHiddenState(names);
+  };
   const batchRef = useRef<BatchItem[]>([]);
   const shownPreview = useRef<{ key: string; fileId: number } | null>(null);
   const choiceRef = useRef<{ combined: Job; separate: Job[] } | null>(null);
@@ -181,10 +193,14 @@ export function App() {
     const key = previewKey(settings);
     const shown = shownPreview.current;
     const wantPreview = forcePreview || !shown || shown.key !== key || shown.fileId !== cur.id;
+    // Until the conversion below finishes, no visible-layers drawing is current.
+    ++visibleToken.current;
+    visibleRef.current = null;
+    setVisible(null);
     setBusy(label);
     setDownloaded(null);
     try {
-      const r = await engine.convert(settings, wantPreview, () => setBusy(settings.format === "dwg" ? "Preparing DWG…" : label));
+      const r = await engine.convert(cur.job, settings, wantPreview, () => setBusy(settings.format === "dwg" ? "Preparing DWG…" : label));
       if (token !== convertToken.current) return false;
       if (isEmpty(r.report)) {
         setFailed({ name: cur.inspection.name, explained: explain({ kind: "empty" }) });
@@ -198,6 +214,11 @@ export function App() {
         setPreview({ buffers: r.preview, builtUp: r.decisions.up_axis, id: ++seq.current, fileId: cur.id });
       }
       if (cur.batchItem !== null) updateBatch(cur.batchItem, { status: "done", result: r });
+      // Keep the layers left out that still exist (a reload can remove some).
+      const names = new Set(r.report.layers.filter((l) => l.faces + l.polylines + l.points + l.surfaces > 0).map((l) => l.name));
+      const kept = hiddenRef.current.filter((n) => names.has(n));
+      if (kept.length !== hiddenRef.current.length) setHidden(kept);
+      if (kept.length) await convertVisible(cur);
       return true;
     } catch (e) {
       if (token !== convertToken.current) return false;
@@ -207,6 +228,28 @@ export function App() {
       if (token === convertToken.current) setBusy(null);
     }
     // Stable: everything it reads is a ref or a state setter (openJob is only called later).
+  }, []);
+
+  /** Convert the drawing without the layers left out, so everything shown describes the download. */
+  const convertVisible = useCallback(async (cur: Current) => {
+    const token = ++visibleToken.current;
+    visibleRef.current = null;
+    setVisible(null);
+    const names = hiddenRef.current;
+    const full = resultRef.current;
+    const layers = full ? full.report.layers.filter((l) => l.faces + l.polylines + l.points + l.surfaces > 0).length : 0;
+    if (!names.length || names.length >= layers) return; // nothing left out, or nothing left to download
+    setBusy("Converting…");
+    try {
+      const r = await engine.convert(cur.job, engineSettings(prefsRef.current, cur.choices, names), false);
+      if (token !== visibleToken.current) return;
+      visibleRef.current = r;
+      setVisible(r);
+    } catch (e) {
+      if (token === visibleToken.current) notifications.show({ color: "red", title: "Couldn't convert the visible layers", message: (e as Error).message });
+    } finally {
+      if (token === visibleToken.current) setBusy(null);
+    }
   }, []);
 
   /** Open one drawing into the workspace. */
@@ -222,10 +265,12 @@ export function App() {
       const token = ++openToken.current;
       const previous = screenRef.current === "work" ? currentRef.current?.inspection.name : undefined;
       setLoading({ name, progress: null });
-      if (!opts.reload) setScreen("loading");
-      else setBusy("Reloading…");
+      if (!opts.reload) {
+        setScreen("loading");
+        setHidden([]); // another drawing: every layer in again
+      } else setBusy("Reloading…");
       try {
-        const info = await engine.open(job.sources, job.name, prefsRef.current.format === "dwg", (p) => setLoading({ name, progress: p }));
+        const info = await engine.open(job, prefsRef.current.format === "dwg", (p) => setLoading({ name, progress: p }));
         if (token !== openToken.current) return;
         const cur: Current = { id: ++seq.current, job, handle, inspection: info, choices: opts.choices ?? AUTO, batchItem: opts.batchItem ?? null };
         setCur(cur);
@@ -249,8 +294,8 @@ export function App() {
       if (token !== batchToken.current) return;
       updateBatch(item.id, { status: "converting", result: undefined, error: undefined });
       try {
-        await engine.open(item.job.sources, item.job.name, prefsRef.current.format === "dwg");
-        const r = await engine.convert(engineSettings(prefsRef.current, AUTO), false);
+        await engine.open(item.job, prefsRef.current.format === "dwg");
+        const r = await engine.convert(item.job, engineSettings(prefsRef.current, AUTO), false);
         if (isEmpty(r.report)) updateBatch(item.id, { status: "failed", error: explain({ kind: "empty" }) });
         else updateBatch(item.id, { status: "done", result: r });
       } catch (e) {
@@ -355,33 +400,34 @@ export function App() {
     }
   };
 
+  /** What Download saves: the drawing, or without the layers left out when some are. */
+  const downloadable = () => {
+    const cur = currentRef.current;
+    const partial = hiddenRef.current.length > 0;
+    const r = partial ? visibleRef.current : resultRef.current;
+    return cur && r ? { r, name: `${stem(cur.inspection.name)}${partial ? " (visible layers)" : ""}` } : null;
+  };
+
   const download = (pickLocation: boolean) => {
-    const cur = currentRef.current;
-    const r = resultRef.current;
-    if (cur && r && !busy) void save(r.file, `${stem(cur.inspection.name)}.${ext()}`, pickLocation);
+    const d = downloadable();
+    if (d && !busy) void save(d.r.file, `${d.name}.${ext()}`, pickLocation);
   };
 
-  const downloadVisible = async (hiddenLayers: string[]) => {
+  const changeHidden = (names: string[]) => {
+    setHidden(names);
+    setDownloaded(null);
     const cur = currentRef.current;
-    if (!cur) return;
-    setBusy("Converting…");
-    try {
-      const r = await engine.convert(engineSettings(prefsRef.current, cur.choices, hiddenLayers), false);
-      await save(r.file, `${stem(cur.inspection.name)} (visible layers).${ext()}`);
-    } catch (e) {
-      notifications.show({ color: "red", title: "Couldn't convert the visible layers", message: (e as Error).message });
-    } finally {
-      setBusy(null);
-    }
+    if (cur) void convertVisible(cur);
   };
 
+  /** The report of exactly what Download saves. */
   const downloadReport = async () => {
-    const cur = currentRef.current;
-    const r = resultRef.current;
-    if (!cur || !r) return;
+    const d = downloadable();
+    if (!d) return;
+    const { r } = d;
     const report = { ...r.report, output: { ...r.report.output, sha256: await sha256Hex(r.file) } };
-    const saved = await saveFile(new Blob([JSON.stringify(report, null, 2)], { type: "application/json" }), `${stem(cur.inspection.name)}.report.json`).catch(() => null);
-    if (saved) setDownloaded(saved);
+    const saved = await saveFile(new Blob([JSON.stringify(report, null, 2)], { type: "application/json" }), `${d.name}.report.json`).catch(() => null);
+    if (saved) notifications.show({ message: `Saved ${saved}` });
   };
 
   const downloadAll = async () => {
@@ -432,12 +478,10 @@ export function App() {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (!(e.ctrlKey || e.metaKey)) return;
+      // Ctrl/⌘+S is the workspace's: it knows which layers are left out.
       if (e.key.toLowerCase() === "o") {
         e.preventDefault();
         void pick();
-      } else if (e.key.toLowerCase() === "s" && screenRef.current === "work") {
-        e.preventDefault();
-        download(e.shiftKey);
       }
     };
     window.addEventListener("keydown", onKey);
@@ -447,7 +491,7 @@ export function App() {
   // ---------------------------------------------------------------- render
   const inBatch = current?.batchItem != null && batch.length > 0;
   return (
-    <div className="relative min-h-dvh">
+    <div className="relative h-dvh overflow-hidden">
       <TopBar
         file={
           screen === "work" && current
@@ -501,6 +545,8 @@ export function App() {
           <Suspense fallback={<main className="h-dvh bg-viewport" />}>
             <Workspace
               result={result}
+              visible={visible}
+              hidden={hidden}
               preview={preview}
               inspection={current?.inspection ?? null}
               prefs={prefs}
@@ -510,12 +556,15 @@ export function App() {
               onUnits={(units: Units | null) => change({ units })}
               onHouseUnits={(houseUnits: Units | null) => changePrefs({ houseUnits })}
               onKeepLoose={(keepLoose) => change({ keepLoose })}
-              onLayerMode={(layerMode: LayerMode) => changePrefs({ layerMode })}
+              onLayerMode={(layerMode: LayerMode) => {
+                setHidden([]); // other layers: nothing is left out any more
+                changePrefs({ layerMode });
+              }}
               onFormat={(format: Format) => changePrefs({ format })}
               onIncludeName={(includeName) => changePrefs({ includeName })}
               onCurves={(curves) => changePrefs({ curves })}
               onDownload={download}
-              onDownloadVisible={(hidden) => void downloadVisible(hidden)}
+              onHidden={changeHidden}
               onDownloadReport={() => void downloadReport()}
               onAddMtl={() => mtlInput.current?.click()}
               onAnother={() => void pick()}

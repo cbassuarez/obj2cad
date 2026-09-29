@@ -18,7 +18,7 @@ export class ErrorBoundary extends Component<{ children: ReactNode }, { error: E
     if (!error) return this.props.children;
     const stale = /dynamically imported module|Loading chunk|Failed to fetch/i.test(error.message);
     return (
-      <main className="paper flex min-h-dvh items-center justify-center p-6" role="alert">
+      <main className="paper flex h-dvh items-center justify-center overflow-hidden p-6" role="alert">
         <div className="panel flex max-w-md flex-col gap-3 p-6">
           <div className="text-[16px] font-semibold">{stale ? "obj2cad was updated" : "Something went wrong"}</div>
           <p className="m-0 text-[13.5px] text-fg-2">Reload the page.</p>

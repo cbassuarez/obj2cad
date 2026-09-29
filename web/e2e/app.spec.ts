@@ -3,6 +3,7 @@
 // tests/harness/parity.py verifies for the CLI holds for the web app too.
 import { expect, test, type Page } from "@playwright/test";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -24,6 +25,7 @@ async function open(page: Page, files: string[], format: Format = "dxf", curves 
 }
 
 const downloadButton = (page: Page) => page.getByRole("button", { name: /^Download (DXF|DWG)/ });
+const card = (page: Page) => page.getByRole("complementary", { name: "Result" });
 
 async function download(page: Page): Promise<{ name: string; bytes: Buffer }> {
   await expect(downloadButton(page)).toBeEnabled();
@@ -31,11 +33,29 @@ async function download(page: Page): Promise<{ name: string; bytes: Buffer }> {
   return { name: d.suggestedFilename(), bytes: readFileSync((await d.path())!) };
 }
 
-function cliOutput(inputs: string | string[], format: Format, extra: string[] = []): Buffer {
-  const out = path.join(mkdtempSync(path.join(tmpdir(), "obj2cad-e2e-")), `out.${format === "dwg" ? "dwg" : "dxf"}`);
-  execFileSync(cli, ["convert", ...[inputs].flat(), "-o", out, "--format", format, "--quiet", ...extra]);
-  return readFileSync(out);
+function cliRun(inputs: string | string[], format: Format, extra: string[] = []): { bytes: Buffer; report: Record<string, unknown> } {
+  const dir = mkdtempSync(path.join(tmpdir(), "obj2cad-e2e-"));
+  const out = path.join(dir, `out.${format === "dwg" ? "dwg" : "dxf"}`);
+  const report = path.join(dir, "out.report.json");
+  execFileSync(cli, ["convert", ...[inputs].flat(), "-o", out, "--report", report, "--format", format, "--quiet", ...extra]);
+  return { bytes: readFileSync(out), report: JSON.parse(readFileSync(report, "utf8")) };
 }
+const cliOutput = (inputs: string | string[], format: Format, extra: string[] = []) => cliRun(inputs, format, extra).bytes;
+
+/** Save the report from the result card's "⋯" menu. */
+async function saveReport(page: Page): Promise<{ name: string; report: Record<string, unknown> }> {
+  await card(page).getByRole("button", { name: "More" }).click();
+  const [d] = await Promise.all([page.waitForEvent("download"), page.getByRole("menuitem", { name: /conversion report/ }).click()]);
+  return { name: d.suggestedFilename(), report: JSON.parse(readFileSync((await d.path())!, "utf8")) };
+}
+
+/** A report with the left-out layers in one order (the app lists them in layer order, the CLI in flag order). */
+const normalized = (r: Record<string, unknown>) => {
+  const c = structuredClone(r) as { options: { exclude_layers: string[] } };
+  c.options.exclude_layers.sort();
+  return c;
+};
+const sha256 = (b: Buffer) => createHash("sha256").update(b).digest("hex");
 
 /** A bundle folder as a .zip on disk (its date is the CLI's and the browser's). */
 function zipFolder(dir: string): string {
@@ -122,12 +142,12 @@ test("curved surfaces are listed and get their own layer", async ({ page }) => {
   await open(page, [path.join(fixtures, "curves", "capsule.obj")], "dxf", true);
   await expect(downloadButton(page)).toBeEnabled();
   await expect(page.getByText("Curved surfaces: 1 cylinder, 2 spheres")).toBeVisible();
-  await expect(page.getByRole("button", { name: "Hide layer Curves" })).toBeVisible();
-  // Off by default, from the download menu.
+  await expect(page.getByRole("checkbox", { name: "Curves in the drawing" })).toBeVisible();
+  // Off by default, from the Format menu.
   await open(page, [path.join(fixtures, "curves", "capsule.obj")]);
   await expect(downloadButton(page)).toBeEnabled();
   await expect(page.getByText(/^Curved surfaces:/)).toHaveCount(0);
-  await page.getByRole("button", { name: "Download options" }).click();
+  await card(page).getByRole("button", { name: /^DXF/ }).click();
   await page.getByRole("menuitem", { name: "Curved surfaces" }).click();
   await expect(page.getByText("Curved surfaces: 1 cylinder, 2 spheres")).toBeVisible();
 });
@@ -146,7 +166,7 @@ for (const name of objs("invalid")) {
 test("a byte-order mark is not content", async ({ page }) => {
   await open(page, [path.join(fixtures, "edge", "bom.obj")]);
   await expect(page.getByText("Exact copy")).toBeVisible();
-  await expect(page.getByText(/Size in CAD 10 × 10 × 10/)).toBeVisible();
+  await expect(card(page).getByText(/^10 × 10 × 10/)).toBeVisible();
 });
 
 test("free-form surfaces are never called exact", async ({ page }) => {
@@ -164,7 +184,7 @@ test("a point cloud converts to points", async ({ page }) => {
 test("Back returns to the start, and the Open button stays available", async ({ page }) => {
   await open(page, [path.join(fixtures, "edge", "names_layers.obj")]);
   await expect(downloadButton(page)).toBeEnabled();
-  await expect(page.getByRole("button", { name: "Open" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Open files" })).toBeVisible();
   await page.goBack();
   await expect(page.getByRole("button", { name: "Choose files…" })).toBeVisible();
   await page.goForward();
@@ -175,14 +195,17 @@ test("changing units relabels the drawing without moving geometry", async ({ pag
   await open(page, [path.join(fixtures, "edge", "names_layers.obj")]);
   await expect(downloadButton(page)).toBeEnabled();
   const hash = async () => {
-    const details = page.getByRole("button", { name: "Technical details" });
-    if ((await details.getAttribute("aria-expanded")) !== "true") await details.click();
-    return page.locator("code[title]").first().getAttribute("title");
+    await card(page).getByRole("button", { name: "More" }).click();
+    await page.getByRole("menuitem", { name: /Technical details/ }).click();
+    const h = await page.getByRole("dialog").locator("code[title]").first().getAttribute("title");
+    await page.keyboard.press("Escape");
+    await expect(page.getByRole("dialog")).toHaveCount(0);
+    return h;
   };
   const before = await hash();
-  await page.getByRole("status").getByRole("button", { name: /Millimeters|Meters|None/ }).click();
+  await card(page).getByRole("button", { name: /^(Millimeters|Meters|None)/ }).click();
   await page.getByRole("menuitem", { name: "Feet" }).click();
-  await expect(page.getByText(/Size in CAD .* ft$/)).toBeVisible();
+  await expect(card(page).getByText(/ ft$/)).toBeVisible();
   await expect(downloadButton(page)).toBeEnabled();
   expect(await hash()).toBe(before);
 });
@@ -204,4 +227,39 @@ test("a .zip with a model and its materials opens as one file", async ({ page })
   await expect(downloadButton(page)).toBeEnabled();
   await expect(page.getByText("cube_materials.obj")).toBeVisible();
   await expect(page.getByText("2 files")).toBeVisible();
+});
+
+test("the saved report describes the download: the command-line report, with its SHA-256", async ({ page }) => {
+  const obj = path.join(fixtures, "edge", "names_layers.obj");
+  await open(page, [obj]);
+  const got = await download(page);
+  const saved = await saveReport(page);
+  const ref = cliRun(obj, "dxf");
+  expect(saved.name).toBe("names_layers.report.json");
+  expect((saved.report.output as { sha256: string }).sha256).toBe(sha256(got.bytes));
+  expect(saved.report).toEqual(ref.report);
+  await expect(page.getByText(`Saved ${saved.name}`)).toBeVisible();
+});
+
+test("unticked layers are left out: download, report and Ctrl+S match --exclude-layer", async ({ page }) => {
+  const obj = path.join(fixtures, "edge", "names_layers.obj");
+  await open(page, [obj]);
+  await expect(downloadButton(page)).toBeEnabled();
+  const boxes = page.getByRole("checkbox", { name: / in the drawing$/ });
+  const layers = (await boxes.evaluateAll((bs) => bs.map((b) => b.getAttribute("aria-label")!.replace(/ in the drawing$/, "")))).slice(0, 2);
+  for (const l of layers) await page.getByRole("checkbox", { name: `${l} in the drawing` }).click();
+  await expect(downloadButton(page)).toHaveText(/of \d+ layers/);
+  const got = await download(page);
+  expect(got.name).toBe("names_layers (visible layers).dxf");
+  const ref = cliRun(obj, "dxf", layers.flatMap((l) => ["--exclude-layer", l]));
+  expect(got.bytes.equals(ref.bytes), "web and CLI outputs differ").toBe(true);
+  const [k] = await Promise.all([page.waitForEvent("download"), page.keyboard.press("Control+s")]);
+  expect(readFileSync((await k.path())!).equals(got.bytes), "Ctrl+S saves what the button saves").toBe(true);
+  const saved = await saveReport(page);
+  expect(saved.name).toBe("names_layers (visible layers).report.json");
+  expect((saved.report.output as { sha256: string }).sha256).toBe(sha256(got.bytes));
+  expect(normalized(saved.report)).toEqual(normalized(ref.report));
+  // Every layer back: the whole drawing again.
+  await page.getByRole("button", { name: "Include all" }).click();
+  expect((await download(page)).bytes.equals(cliOutput(obj, "dxf"))).toBe(true);
 });

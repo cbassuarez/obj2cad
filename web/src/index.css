@@ -90,10 +90,14 @@
 }
 
 @layer base {
+  /* A one-page app: the document never scrolls. Each screen is the viewport's size
+     and scrolls only inside its own panels when the window is too small. */
   html,
   body,
   #root {
-    min-height: 100%;
+    height: 100%;
+    overflow: hidden;
+    overscroll-behavior: none;
   }
   body {
     margin: 0;

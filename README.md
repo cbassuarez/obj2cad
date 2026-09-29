@@ -90,7 +90,8 @@ cylinder, cone, sphere, torus) for checking in AutoCAD.
 
 The web app has browser tests (`web/e2e`, Playwright) on the built site: every fixture is
 opened, downloaded in each format, and must be byte-identical to the command-line output
-for the same file. The parser is also property-tested (`crates/obj2cad-core/tests`) and
+for the same file; the report the app saves must be the command-line report for that same
+download (also for a download without some layers). The parser is also property-tested (`crates/obj2cad-core/tests`) and
 fuzzed nightly (`fuzz/`).
 
 ## Try it

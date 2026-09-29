@@ -1,8 +1,10 @@
 import { ArrowLeft, Check, ChevronDown, FolderOpen, Lock, RefreshCw } from "lucide-react";
 import { Menu } from "@mantine/core";
 import { Button } from "@/components/ui/button";
+import { Tip } from "@/components/ui/tooltip";
 import { Logo } from "@/components/brand";
 import { bytes } from "@/lib/format";
+import { shortcut } from "@/lib/utils";
 
 declare const __APP_VERSION__: string;
 
@@ -84,10 +86,12 @@ export function TopBar({
           </>
         )}
       </div>
-      <Button variant="primary" className="pointer-events-auto h-11" onClick={onOpen}>
-        <FolderOpen />
-        <span className="hidden sm:inline">Open</span>
-      </Button>
+      <Tip label={`Open files (${shortcut("O")})`} side="bottom">
+        <Button variant="secondary" className="pointer-events-auto h-11 shadow-panel" onClick={onOpen} aria-label="Open files">
+          <FolderOpen />
+          <span className="hidden sm:inline">Open</span>
+        </Button>
+      </Tip>
     </header>
   );
 }

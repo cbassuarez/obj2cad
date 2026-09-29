@@ -1,6 +1,12 @@
 // Main-thread side of the conversion worker. The worker owns the WebAssembly engine and
 // the parsed file; the UI sends small commands and receives the file as a Blob plus
 // transferable preview buffers. If the engine crashes, the worker is replaced.
+//
+// The worker holds one drawing at a time and the viewer and the file list both use it, so
+// every call here runs alone, in order, and a conversion names the drawing it is for: when
+// the worker holds another one, that drawing is opened again first. Without this, opening
+// a file from the list while the list was still converting could show (and download)
+// another file's drawing under its name.
 import type { Converted, Failure, ParseFailure, PreviewBuffers, Progress, Reply, Request, SourceFile } from "@/worker";
 import type { EngineSettings, LayerMode, UpAxis, Units } from "@/lib/settings";
 
@@ -110,10 +116,20 @@ interface Pending {
   progress?: (p: Progress) => void;
 }
 
+/** The files of one drawing, as the app holds them (`Job` in lib/files.ts). A drawing is
+ *  known by this object: a new one (another file, added materials, a reload) is new. */
+export interface Drawing {
+  name: string;
+  sources: SourceFile[];
+}
+
 class Engine {
   private worker!: Worker;
   private seq = 0;
   private pending = new Map<number, Pending>();
+  /** The drawing the worker holds; `null` after a crash or before the first open. */
+  private loaded: Drawing | null = null;
+  private queue: Promise<unknown> = Promise.resolve();
 
   constructor() {
     this.start();
@@ -145,6 +161,7 @@ class Engine {
   }
 
   private failAll(failure: Failure) {
+    this.loaded = null;
     for (const p of this.pending.values()) p.reject(new EngineError(failure));
     this.pending.clear();
   }
@@ -164,21 +181,38 @@ class Engine {
     });
   }
 
-  /** Read the files of one drawing. `name` names it when it holds several models. */
-  open(sources: SourceFile[], name: string, dwg: boolean, progress?: (p: Progress) => void): Promise<Inspection> {
-    return this.call<Inspection>({ type: "open", sources, name, dwg }, progress);
+  /** Run `task` after every call before it has finished, and before any call after it. */
+  private serial<T>(task: () => Promise<T>): Promise<T> {
+    const run = this.queue.then(task, task);
+    this.queue = run.catch(() => undefined);
+    return run;
   }
 
-  async convert(settings: EngineSettings, preview: boolean, progress?: (p: Progress) => void): Promise<Result> {
-    const r = await this.call<Converted>({ type: "convert", settings, preview }, progress);
-    return {
-      file: r.file,
-      report: JSON.parse(r.report) as Report,
-      decisions: JSON.parse(r.decisions) as Decisions,
-      preview: r.preview,
-      timings: r.timings,
-      ms: r.ms,
-    };
+  private async load(d: Drawing, dwg: boolean, progress?: (p: Progress) => void): Promise<Inspection> {
+    this.loaded = null;
+    const info = await this.call<Inspection>({ type: "open", sources: d.sources, name: d.name, dwg }, progress);
+    this.loaded = d;
+    return info;
+  }
+
+  /** Read the files of one drawing. Its `name` names it when it holds several models. */
+  open(d: Drawing, dwg: boolean, progress?: (p: Progress) => void): Promise<Inspection> {
+    return this.serial(() => this.load(d, dwg, progress));
+  }
+
+  convert(d: Drawing, settings: EngineSettings, preview: boolean, progress?: (p: Progress) => void): Promise<Result> {
+    return this.serial(async () => {
+      if (this.loaded !== d) await this.load(d, settings.format === "dwg");
+      const r = await this.call<Converted>({ type: "convert", settings, preview }, progress);
+      return {
+        file: r.file,
+        report: JSON.parse(r.report) as Report,
+        decisions: JSON.parse(r.decisions) as Decisions,
+        preview: r.preview,
+        timings: r.timings,
+        ms: r.ms,
+      };
+    });
   }
 }
 
