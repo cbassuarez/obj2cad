@@ -14,9 +14,9 @@ import { TopBar } from "@/components/TopBar";
 import { WorkspaceSkeleton } from "@/components/WorkspaceSkeleton";
 import { Button } from "@/components/ui/button";
 import type { PreviewState } from "@/components/Workspace";
-import { engine, EngineError, isEmpty, RESTARTED, sha256Hex, type Failure, type Inspection, type Progress, type Result } from "@/lib/engine";
+import { engine, EngineError, isEmpty, OutputFile, RESTARTED, sha256Hex, type Failure, type Inspection, type Progress, type Result } from "@/lib/engine";
 import { CLI_URL, explain, type Explained } from "@/lib/errors";
-import { baseName, jobName, plan, saveFile, stem, zipFiles, type Job, type Source } from "@/lib/files";
+import { baseName, heavySplit, jobName, plan, saveFile, sourceSize, stem, zipFiles, type Job, type Source } from "@/lib/files";
 import {
   AUTO,
   engineSettings,
@@ -80,7 +80,7 @@ const loadWorkspace = () => import("@/components/Workspace");
 const Workspace = lazy(() => loadWorkspace().then((m) => ({ default: m.Workspace })));
 
 const failureOf = (e: unknown): Failure => (e instanceof EngineError ? e.failure : { kind: "other", message: e instanceof Error ? e.message : String(e) });
-const jobSize = (job: Job) => job.sources.reduce((n, s) => n + s.file.size, 0);
+const jobSize = (job: Job) => job.sources.reduce((n, s) => n + sourceSize(s), 0);
 /** The file a failure is about: the one that couldn't be read, else the drawing. */
 const failedName = (job: Job, e: unknown) => (e instanceof EngineError && e.failure.kind === "parse" && e.failure.parse.file) || jobName(job);
 
@@ -93,6 +93,13 @@ export function App() {
   const [visible, setVisible] = useState<Result | null>(null);
   const [preview, setPreview] = useState<PreviewState | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
+  /** Files of the open drawing still loading (a large scan, shown after the rest). */
+  const [pending, setPendingState] = useState<string[]>([]);
+  const pendingRef = useRef<string[]>([]);
+  const setPending = (names: string[]) => {
+    pendingRef.current = names;
+    setPendingState(names);
+  };
   const [loading, setLoading] = useState<{ name: string; progress: Progress | null; startedAt: number }>({ name: "", progress: null, startedAt: 0 });
   const [failed, setFailed] = useState<{ name: string; explained: Explained; retry?: () => void } | null>(null);
   const [preflight, setPreflight] = useState<{ name: string; size: number; go: () => void } | null>(null);
@@ -230,12 +237,13 @@ export function App() {
         // the result is provisional (Download waits, busy) until the file arrives.
         (e) => {
           if (token !== convertToken.current || isEmpty(e.report)) return;
-          const provisional: Result = { file: new Blob([]), report: e.report, decisions: e.decisions, preview: null, timings: {}, ms: 0 };
+          const provisional: Result = { file: new OutputFile([]), report: e.report, decisions: e.decisions, preview: null, timings: {}, ms: 0 };
           resultRef.current = provisional;
           setResult(provisional);
           shownPreview.current = { key, fileId: cur.id };
           setPreview({ buffers: e.preview, builtUp: e.decisions.up_axis, id: ++seq.current, fileId: cur.id });
           setBusy(busyLabel("hash", settings.format));
+          setPending([]);
           if (screenRef.current === "loading") setScreen("work", "push");
         },
       );
@@ -307,10 +315,60 @@ export function App() {
         setScreen("loading");
         setHidden([]); // another drawing: every layer in again
       } else setBusy("Reloading…");
+      // Another drawing: work still running for the one before is dropped, not waited for.
+      ++convertToken.current;
+      ++visibleToken.current;
+      const dwg = prefsRef.current.format === "dwg";
+      // A large point cloud next to lighter models: show the models first, while the
+      // cloud loads. The file is still written once, from everything, after that.
+      const split = heavySplit(job);
+      const heavyNames = split ? split.heavy.map((h) => baseName(h.path)) : [];
+      const toLoading = (p: Progress) => setLoading((l) => ({ ...l, progress: p }));
       try {
-        const info = await engine.open(job, prefsRef.current.format === "dwg", (p) => setLoading((l) => ({ ...l, progress: p })));
+        if (split) {
+          const light = await engine.open(split.light, dwg, toLoading, true);
+          if (token !== openToken.current) return;
+          // Named and sized as the whole drawing (the top bar, adding materials), shown in part.
+          const lightCur: Current = {
+            id: ++seq.current,
+            job,
+            handle,
+            inspection: { ...light, name: jobName(job) },
+            choices: opts.choices ?? AUTO,
+            batchItem: opts.batchItem ?? null,
+          };
+          const e = await engine.preview(split.light, engineSettings(prefsRef.current, lightCur.choices));
+          if (token !== openToken.current) return;
+          if (!isEmpty(e.report)) {
+            setCur(lightCur);
+            const provisional: Result = { file: new OutputFile([]), report: e.report, decisions: e.decisions, preview: null, timings: {}, ms: 0 };
+            resultRef.current = provisional;
+            setResult(provisional);
+            shownPreview.current = null; // the full drawing brings its own
+            setPreview({ buffers: e.preview, builtUp: e.decisions.up_axis, id: ++seq.current, fileId: lightCur.id });
+            setPending(heavyNames);
+            setBusy(`Loading ${heavyNames.join(", ")}…`);
+            if (screenRef.current !== "work") setScreen("work", "push");
+          }
+        }
+        const info = await engine.open(
+          job,
+          dwg,
+          (p) => {
+            if (screenRef.current === "loading") toLoading(p);
+            else if (split) {
+              // Reading is the first half, parsing the second.
+              const frac = p.total > 0 && (p.stage === "read" || p.stage === "parse") ? (p.stage === "parse" ? 0.5 : 0) + (p.done / p.total) * 0.5 : null;
+              const pct = frac === null ? "" : ` ${Math.round(frac * 100)}%`;
+              setBusy(`Loading ${heavyNames.join(", ")}…${pct}`);
+            }
+          },
+          !split,
+        );
         if (token !== openToken.current) return;
-        const cur: Current = { id: ++seq.current, job, handle, inspection: info, choices: opts.choices ?? AUTO, batchItem: opts.batchItem ?? null };
+        // Choices made while part of it was shown carry over.
+        const choices = (split && currentRef.current?.job === job ? currentRef.current.choices : null) ?? opts.choices ?? AUTO;
+        const cur: Current = { id: ++seq.current, job, handle, inspection: info, choices, batchItem: opts.batchItem ?? null };
         setCur(cur);
         if (!(await convert(cur, true)) || token !== openToken.current) return;
         setScreen("work", opts.reload || screenRef.current === "work" ? "replace" : "push");
@@ -319,6 +377,7 @@ export function App() {
       } catch (e) {
         if (token === openToken.current) fail(failedName(job, e), e, () => void openJob(job, handle, { ...opts, force: true }));
       } finally {
+        if (token === openToken.current) setPending([]);
         if (opts.reload) setBusy(null);
       }
     },
@@ -391,7 +450,7 @@ export function App() {
       setWatching(false);
       if (p.kind === "one") {
         const only = p.job.sources.length === 1 ? p.job.sources[0] : null;
-        const handle = only ? (handles.find((h) => h.name === only.file.name) ?? null) : null;
+        const handle = only && !only.zip ? (handles.find((h) => h.name === only.file.name) ?? null) : null;
         return openJob(p.job, handle);
       }
       if (p.kind === "choose") {
@@ -434,13 +493,14 @@ export function App() {
     if (!cur) return;
     const next = { ...cur, choices: { ...cur.choices, ...choices } };
     setCur(next);
-    void convert(next);
+    // Part of the drawing is still loading: the choice applies when all of it is converted.
+    if (!pendingRef.current.length) void convert(next);
   };
 
   const changePrefs = (update: Partial<Prefs>) => {
     setPrefs(update);
     const cur = currentRef.current;
-    if (cur && screenRef.current === "work") void convert(cur);
+    if (cur && screenRef.current === "work" && !pendingRef.current.length) void convert(cur);
   };
 
   // ---------------------------------------------------------------- downloads
@@ -465,7 +525,7 @@ export function App() {
 
   const download = (pickLocation: boolean) => {
     const d = downloadable();
-    if (d && !busy) void save(d.r.file, `${d.name}.${ext()}`, pickLocation);
+    if (d && !busy) void save(d.r.file.blob(), `${d.name}.${ext()}`, pickLocation);
   };
 
   const changeHidden = (names: string[]) => {
@@ -480,7 +540,7 @@ export function App() {
     const d = downloadable();
     if (!d || busy) return; // while busy the report may be provisional
     const { r } = d;
-    const report = { ...r.report, output: { ...r.report.output, sha256: await sha256Hex(r.file) } };
+    const report = { ...r.report, output: { ...r.report.output, sha256: await sha256Hex(r.file.blob()) } };
     const saved = await saveFile(new Blob([JSON.stringify(report, null, 2)], { type: "application/json" }), `${d.name}.report.json`).catch(() => null);
     if (saved) notifications.show({ message: `Saved ${saved}` });
   };
@@ -494,7 +554,7 @@ export function App() {
         let name = `${stem(i.name)}.${ext()}`;
         for (let n = 2; names.has(name.toLowerCase()); n++) name = `${stem(i.name)} (${n}).${ext()}`;
         names.add(name.toLowerCase());
-        return { name, blob: i.result!.file };
+        return { name, blob: i.result!.file.blob() };
       });
       await save(await zipFiles(files), `obj2cad ${done.length} files.zip`);
     } catch (e) {
@@ -617,7 +677,7 @@ export function App() {
             void runBatch(batchRef.current);
           }}
           onOpen={(item) => void openJob(item.job, null, { batchItem: item.id })}
-          onDownload={(item) => item.result && void save(item.result.file, `${stem(item.name)}.${ext()}`)}
+          onDownload={(item) => item.result && void save(item.result.file.blob(), `${stem(item.name)}.${ext()}`)}
           onDownloadAll={() => void downloadAll()}
         />
       )}
@@ -630,6 +690,7 @@ export function App() {
               hidden={hidden}
               preview={preview}
               inspection={current?.inspection ?? null}
+              pending={pending}
               prefs={prefs}
               busy={busy}
               downloaded={downloaded}

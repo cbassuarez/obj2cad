@@ -115,6 +115,41 @@ test("opening a large file names each step and can be cancelled; the next file s
   expect(got.bytes.equals(cliOutput(obj, "dxf")), "web and CLI outputs differ").toBe(true);
 });
 
+test("opening another file doesn't wait for the one still loading", async ({ page }) => {
+  const big = path.join(mkdtempSync(path.join(tmpdir(), "obj2cad-e2e-")), "big.obj");
+  execFileSync(cli, ["synth", "900", big]);
+  await open(page, [big]);
+  await expect(page.getByRole("status", { name: "Opening big.obj" })).toBeVisible();
+  const obj = path.join(fixtures, "edge", "cube_materials.obj");
+  const mtl = path.join(fixtures, "edge", "cube_materials.mtl");
+  await input(page).setInputFiles([obj, mtl]);
+  const got = await download(page);
+  expect(got.name).toBe("cube_materials.dxf");
+  expect(got.bytes.equals(cliOutput(obj, "dxf")), "web and CLI outputs differ").toBe(true);
+  await expect(page.getByText("big.obj")).toHaveCount(0);
+});
+
+test("a large scan loads after the model it comes with; the file is written once, from both", async ({ page }) => {
+  const dir = mkdtempSync(path.join(tmpdir(), "obj2cad-e2e-"));
+  const obj = path.join(dir, "building.obj");
+  const scan = path.join(dir, "scan.xyz");
+  writeFileSync(obj, "o Building\nv 0 0 0\nv 20 0 0\nv 20 12 0\nv 0 12 0\nf 1 2 3 4\n");
+  // About 20 MB of colored points.
+  const rows: string[] = [];
+  for (let i = 0; i < 750_000; i++) rows.push(`${(i % 1000) - 500}.123 ${Math.floor(i / 1000)}.456 0.789 ${i % 256} 120 ${255 - (i % 256)}\n`);
+  writeFileSync(scan, rows.join(""));
+  await open(page, [obj, scan]);
+  // The model is shown while the scan is still loading, and the layers say so.
+  await expect(page.getByRole("status", { name: "Loading scan.xyz" })).toBeVisible();
+  await expect(card(page).getByText("1 face on 1 layer")).toBeVisible();
+  await expect(downloadButton(page)).toBeDisabled();
+  await expect(page.getByRole("status", { name: "Loading scan.xyz" })).toHaveCount(0, { timeout: 60_000 });
+  await expect(downloadButton(page)).toBeEnabled({ timeout: 60_000 });
+  await expect(card(page).getByText("750,001 shapes on 2 layers")).toBeVisible();
+  const got = await download(page);
+  expect(got.bytes.equals(cliOutput([obj, scan], "dxf")), "web and CLI outputs differ").toBe(true);
+});
+
 test("loose files with a point cloud make one drawing, like the command-line tool", async ({ page }) => {
   const site = path.join(fixtures, "bundle", "site");
   const files = ["site.obj", "Site.MTL", "scan.xyz", "ground.png"].map((f) => path.join(site, f));

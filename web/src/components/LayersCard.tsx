@@ -42,6 +42,7 @@ export function LayersCard({
   onHidden,
   onSelect,
   onHover,
+  pending = [],
 }: {
   report: Report;
   mode: LayerMode;
@@ -55,6 +56,8 @@ export function LayersCard({
   onHidden: (next: Set<number>) => void;
   onSelect: (layer: number | null) => void;
   onHover: (layer: number | null) => void;
+  /** Files of the drawing still loading (a large scan shown after the rest). */
+  pending?: string[];
 }) {
   const rows = report.layers.map((l, i) => ({ ...l, i, total: l.faces + l.polylines + l.points + l.surfaces })).filter((l) => l.total > 0);
   const [query, setQuery] = useState("");
@@ -311,6 +314,15 @@ export function LayersCard({
           );
         })}
         {itemVirtual && <li aria-hidden="true" style={{ height: (items.length - last) * ROW }} />}
+        {pending.map((name) => (
+          <li key={`pending:${name}`} className="flex h-8 items-center gap-2 px-1.5 text-[13px]" role="status" aria-label={`Loading ${name}`}>
+            <span className="size-3.5 shrink-0 animate-spin rounded-full border-2 border-line border-t-accent" aria-hidden="true" />
+            <span className="min-w-0 flex-1 truncate font-medium" title={name}>
+              {name}
+            </span>
+            <span className="text-[12px] text-fg-3">Loading…</span>
+          </li>
+        ))}
         {q && shownRows.length === 0 && <li className="px-2 py-3 text-[12.5px] text-fg-3">No layer matches “{query}”</li>}
       </ul>
 

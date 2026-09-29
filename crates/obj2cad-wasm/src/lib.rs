@@ -153,8 +153,9 @@ impl Session {
         }
     }
 
-    /// Add a file (`path` may include folders; `sha256` from the browser's native digest;
-    /// `modified` in Unix seconds, or a negative number when unknown).
+    /// Add a file (`path` may include folders; `sha256` from the browser's native digest,
+    /// or empty to give it after loading with `set_hashes`; `modified` in Unix seconds,
+    /// or a negative number when unknown).
     pub fn add_file(&mut self, path: String, bytes: Vec<u8>, sha256: String, modified: f64) {
         let modified = (modified >= 0.0).then_some(modified);
         self.pending.push((path, bytes, sha256, modified));
@@ -193,6 +194,17 @@ impl Session {
         self.parse_ms = now() - t;
         self.hints = Some(hints::hints(&bundle.doc));
         self.bundle = Some(bundle);
+        Ok(())
+    }
+
+    /// The SHA-256 of each file added, in the order they were added, when they were added
+    /// without one (so the browser can hash them while the engine parses).
+    pub fn set_hashes(&mut self, sha256: Vec<String>) -> Result<(), JsError> {
+        let b = self
+            .bundle
+            .as_mut()
+            .ok_or_else(|| JsError::new("no file is loaded"))?;
+        b.set_hashes(&sha256);
         Ok(())
     }
 
@@ -263,6 +275,41 @@ impl Session {
             textures,
         };
         Ok(convert_with(&b.doc, &materials, self.options(s)?))
+    }
+
+    /// The model to show, with a provisional report (no parity hash, no output size), and
+    /// no file: for showing part of a bundle while the rest of it loads. The file is only
+    /// ever written by `convert`, once, from everything.
+    pub fn preview(&self, settings: &str) -> Result<Conversion, JsError> {
+        let s = settings_from(settings)?;
+        let t0 = now();
+        let model = self.model(&s)?;
+        let (b, h) = self.loaded()?;
+        let report = report::build(
+            &model,
+            &report::Source {
+                name: &b.name,
+                len: b.source_len,
+                sha256: &b.source_sha256,
+                files: &b.files,
+            },
+            "",
+            report::Written {
+                format: s.format.id(),
+                bytes: 0,
+                sha256: None,
+            },
+        );
+        let preview = Preview::build(&model);
+        let timings =
+            serde_json::json!({ "parse_ms": self.parse_ms, "preview_ms": now() - t0 }).to_string();
+        Ok(Conversion {
+            parity: String::new(),
+            report: serde_json::to_string(&report).map_err(|e| JsError::new(&e.to_string()))?,
+            decisions: decisions(&s, &model, h),
+            timings,
+            preview: Some(preview),
+        })
     }
 
     /// Convert and write. The file goes to `sink(chunk: Uint8Array)` in pieces of about
@@ -518,6 +565,8 @@ take! {
     take_point_colors: point_colors -> Vec<u8>;
     /// Per layer: `[layer, point_start, point_count]`.
     take_point_groups: point_groups -> Vec<u32>;
+    /// Per layer shown: `[layer, min x, y, z, max x, y, z]` in display coordinates.
+    take_layer_bounds: layer_bounds -> Vec<f32>;
 }
 
 #[wasm_bindgen]
@@ -544,6 +593,10 @@ impl Conversion {
     /// False when the model's extent is too large to display in float32.
     pub fn preview_available(&self) -> bool {
         self.preview.as_ref().is_some_and(|p| p.available)
+    }
+    /// 1, or n when a large cloud is shown as every n-th point.
+    pub fn point_stride(&self) -> u32 {
+        self.preview.as_ref().map_or(1, |p| p.point_stride)
     }
     /// Where the preview's origin is in drawing coordinates.
     pub fn origin(&self) -> Vec<f64> {

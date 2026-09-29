@@ -17,11 +17,16 @@ pub struct Preview {
     pub line_colors: Vec<u8>,
     /// Per layer with lines: `[layer, vertex_start, vertex_count]`.
     pub line_groups: Vec<u32>,
-    /// Points (xyz) and their colors, grouped by layer.
+    /// Points (xyz) and their colors, grouped by layer. At most [`MAX_SHOWN_POINTS`]:
+    /// larger clouds are shown evenly thinned (every `point_stride`-th point of a layer).
     pub points: Vec<f32>,
     pub point_colors: Vec<u8>,
     /// Per layer with points: `[layer, point_start, point_count]`.
     pub point_groups: Vec<u32>,
+    pub point_stride: u32,
+    /// Per layer shown: `[layer, min x, y, z, max x, y, z]`, in display coordinates, so
+    /// the viewer never scans the buffers for extents.
+    pub layer_bounds: Vec<f32>,
     pub origin: [f64; 3],
     /// False when the model is too large to display in float32; buffers are then empty.
     pub available: bool,
@@ -30,8 +35,45 @@ pub struct Preview {
 /// Extents beyond this can't be displayed in float32 (and three.js's squared-length math).
 const MAX_EXTENT: f64 = 1e12;
 
+/// Points drawn at most. A browser draws a few million easily; beyond that a cloud is
+/// shown thinned, evenly (the file always has every point).
+pub const MAX_SHOWN_POINTS: usize = 4_000_000;
+
+/// Per-layer extents, grown as positions are added.
+#[derive(Default)]
+struct Bounds(std::collections::BTreeMap<u32, [f32; 6]>);
+
+impl Bounds {
+    fn grow(&mut self, layer: u32, p: [f32; 3]) {
+        let b = self.0.entry(layer).or_insert([
+            f32::INFINITY,
+            f32::INFINITY,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+        ]);
+        for a in 0..3 {
+            b[a] = b[a].min(p[a]);
+            b[a + 3] = b[a + 3].max(p[a]);
+        }
+    }
+
+    fn flat(self) -> Vec<f32> {
+        self.0
+            .into_iter()
+            .flat_map(|(layer, b)| std::iter::once(layer as f32).chain(b))
+            .collect()
+    }
+}
+
 impl Preview {
     pub fn build(model: &CadModel) -> Self {
+        Self::build_within(model, MAX_SHOWN_POINTS)
+    }
+
+    /// [`Self::build`], showing at most `max_points` points.
+    fn build_within(model: &CadModel, max_points: usize) -> Self {
         let origin = model
             .bounds()
             .map(|(lo, hi)| [0, 1, 2].map(|a| lo[a] / 2.0 + hi[a] / 2.0))
@@ -50,9 +92,12 @@ impl Preview {
             points: Vec::with_capacity(model.points.len() * 3),
             point_colors: Vec::with_capacity(model.points.len() * 3),
             point_groups: Vec::new(),
+            point_stride: 1,
+            layer_bounds: Vec::new(),
             origin,
             available: true,
         };
+        let mut bounds = Bounds::default();
         let displayable = model.bounds().is_none_or(|(lo, hi)| {
             (0..3).all(|a| (hi[a] - lo[a]).is_finite() && hi[a] - lo[a] < MAX_EXTENT)
         });
@@ -65,8 +110,13 @@ impl Preview {
             let p = model.position(v);
             [0, 1, 2].map(|a| p[a] - origin[a])
         };
-        let color =
-            |c: Option<[u8; 3]>, layer: u32| c.unwrap_or(model.layers[layer as usize].color);
+        // Colors go out in linear light, as the renderer takes vertex colors.
+        let linear: [u8; 256] =
+            std::array::from_fn(|i| (obj2cad_core::color::TO_LINEAR[i] * 255.0).round() as u8);
+        let color = |c: Option<[u8; 3]>, layer: u32| {
+            c.unwrap_or(model.layers[layer as usize].color)
+                .map(|x| linear[x as usize])
+        };
 
         let mut tri = Triangulator::default();
         // Layer by layer, so each layer is one group (one draw) however many colors or
@@ -79,7 +129,9 @@ impl Preview {
             let rgb = color(m.color, m.layer);
             let local: Vec<[f64; 3]> = m.vertices.iter().map(|&v| rel(v)).collect();
             for p in &local {
-                out.positions.extend(p.map(|c| c as f32));
+                let f = p.map(|c| c as f32);
+                bounds.grow(m.layer, f);
+                out.positions.extend(f);
                 out.colors.extend_from_slice(&rgb);
             }
             for f in m.faces() {
@@ -110,7 +162,9 @@ impl Preview {
             let rgb = color(l.color, l.layer);
             for w in l.vertices.windows(2) {
                 for v in w {
-                    out.lines.extend(rel(*v).map(|c| c as f32));
+                    let f = rel(*v).map(|c| c as f32);
+                    bounds.grow(l.layer, f);
+                    out.lines.extend(f);
                     out.line_colors.extend_from_slice(&rgb);
                 }
             }
@@ -132,7 +186,9 @@ impl Preview {
             let pts = sample_spline(c.degree as usize, &c.knots, &cps, c.weights.as_deref());
             for w in pts.windows(2) {
                 for p in w {
-                    out.lines.extend(p.map(|x| x as f32));
+                    let f = p.map(|x| x as f32);
+                    bounds.grow(c.layer, f);
+                    out.lines.extend(f);
                     out.line_colors.extend_from_slice(&rgb);
                 }
             }
@@ -145,10 +201,23 @@ impl Preview {
         }
         let mut by_layer: Vec<usize> = (0..model.points.len()).collect();
         by_layer.sort_by_key(|&i| model.points[i].layer);
+        let stride = model.points.len().div_ceil(max_points.max(1)).max(1);
+        out.point_stride = stride as u32;
+        let (mut layer, mut k) = (u32::MAX, 0usize);
         for i in by_layer {
             let p = &model.points[i];
+            // Every `stride`-th point of each layer (a layer's extent still counts them all).
+            if p.layer != layer {
+                (layer, k) = (p.layer, 0);
+            }
+            let f = rel(p.vertex).map(|c| c as f32);
+            bounds.grow(p.layer, f);
+            k += 1;
+            if (k - 1) % stride != 0 {
+                continue;
+            }
             let start = (out.points.len() / 3) as u32;
-            out.points.extend(rel(p.vertex).map(|c| c as f32));
+            out.points.extend(f);
             out.point_colors.extend_from_slice(&color(p.color, p.layer));
             push_group(&mut out.point_groups, p.layer, start, 1);
         }
@@ -163,8 +232,9 @@ impl Preview {
             for poly in outline(&s.body) {
                 for w in poly.windows(2) {
                     for p in w {
-                        out.lines
-                            .extend([0, 1, 2].map(|a| (p[a] - origin[a]) as f32));
+                        let f = [0, 1, 2].map(|a| (p[a] - origin[a]) as f32);
+                        bounds.grow(s.layer, f);
+                        out.lines.extend(f);
                         out.line_colors.extend_from_slice(&rgb);
                     }
                 }
@@ -176,6 +246,7 @@ impl Preview {
                 (out.lines.len() / 3) as u32 - start,
             );
         }
+        out.layer_bounds = bounds.flat();
         out
     }
 }
@@ -455,7 +526,21 @@ mod tests {
     #[test]
     fn layer_colors_come_from_the_engine() {
         let p = preview("o a\nv 0 0 0\nv 1 0 0\nv 1 1 0\nf 1 2 3\n");
-        assert_eq!(&p.colors[..3], &obj2cad_core::convert::layer_color(1));
+        // In linear light, as the renderer takes them.
+        let lin = obj2cad_core::convert::layer_color(1)
+            .map(|c| (obj2cad_core::color::TO_LINEAR[c as usize] * 255.0).round() as u8);
+        assert_eq!(&p.colors[..3], &lin);
+    }
+
+    #[test]
+    fn big_clouds_are_shown_thinned_with_their_full_extent() {
+        let src: String = (0..10).map(|i| format!("{i} 0 0\n")).collect();
+        let doc = obj2cad_core::xyz::parse(src.as_bytes(), "scan.xyz").unwrap();
+        let model = obj2cad_core::convert(&doc, None, obj2cad_core::Options::default());
+        let p = Preview::build_within(&model, 4);
+        assert_eq!((p.point_stride, p.points.len() / 3), (3, 4)); // points 0, 3, 6, 9
+                                                                  // One layer, and its extent covers all ten points (x from -4.5 to 4.5 around the middle).
+        assert_eq!(p.layer_bounds, vec![1.0, -4.5, 0.0, 0.0, 4.5, 0.0, 0.0]);
     }
 
     #[test]

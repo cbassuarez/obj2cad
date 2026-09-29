@@ -318,13 +318,24 @@ impl CadModel<'_> {
     /// The original token behind output coordinate `axis` of vertex `v`, and whether the
     /// axis mapping negates it. Lets writers emit text without allocating.
     pub fn coord_source(&self, v: u32, axis: usize) -> (&str, bool) {
-        let (src_axis, negate) = match (self.options.up_axis, axis) {
+        let (src_axis, negate) = self.source_axis(axis);
+        (self.doc.coord_text(v as usize, src_axis), negate)
+    }
+
+    /// [`Self::coord_source`] as bytes (for writers copying the text as it is).
+    pub fn coord_source_bytes(&self, v: u32, axis: usize) -> (&[u8], bool) {
+        let (src_axis, negate) = self.source_axis(axis);
+        (self.doc.coord_bytes(v as usize, src_axis), negate)
+    }
+
+    /// The source axis an output axis comes from, and whether it is negated.
+    fn source_axis(&self, axis: usize) -> (usize, bool) {
+        match (self.options.up_axis, axis) {
             (UpAxis::AsIs, a) => (a, false),
             (UpAxis::YUpToZUp, 0) => (0, false),
             (UpAxis::YUpToZUp, 1) => (2, true),
             (UpAxis::YUpToZUp, _) => (1, false),
-        };
-        (self.doc.coord_text(v as usize, src_axis), negate)
+        }
     }
 
     /// Axis-aligned bounds of all written vertices, or `None` if nothing is written.
