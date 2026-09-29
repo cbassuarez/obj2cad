@@ -1,20 +1,19 @@
-// Controls shared by the result layouts: each layout arranges the same pieces.
+// The result card's controls and the viewport's view tools.
 import { Box, Check, ChevronDown, CircleCheck, Download, Rotate3d, Scan } from "lucide-react";
 import { motion } from "motion/react";
 import { Menu } from "@mantine/core";
 import { Button } from "@/components/ui/button";
-import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { Tip } from "@/components/ui/tooltip";
 import type { Decisions, Report } from "@/lib/engine";
 import { canPickSaveLocation } from "@/lib/files";
 import { bytes, measure } from "@/lib/format";
-import { FORMATS, UNITS, UPS, formatInfo, unitName, unitSymbol, type Format, type UpAxis, type Units } from "@/lib/settings";
+import { UNITS, formatInfo, unitName, unitSymbol, type Format, type UpAxis, type Units } from "@/lib/settings";
 import { cn } from "@/lib/utils";
 import type { ViewName } from "@/viewer/Viewer";
 
 export const menuStyles = { dropdown: "panel !p-1", item: "!rounded-[3px] !text-[13px]", label: "!text-[11px]" };
 
-export const VIEWS: { value: ViewName; label: string }[] = [
+const VIEWS: { value: ViewName; label: string }[] = [
   { value: "iso", label: "Isometric" },
   { value: "top", label: "Top" },
   { value: "front", label: "Front" },
@@ -25,7 +24,7 @@ const UNITS_FROM: Record<Decisions["units_from"], string | undefined> = { chosen
 
 export const shortFormat = (f: Format) => formatInfo(f).label.replace(" (binary)", "");
 
-/** Everything a result layout shows and changes. */
+/** Everything the result card shows and changes. */
 export interface ResultProps {
   report: Report;
   decisions: Decisions;
@@ -63,7 +62,6 @@ export interface ResultProps {
 
 export const upChanged = (d: Decisions) => d.up_from === "chosen" && d.up_axis !== d.detected_up_axis;
 export const unitsChanged = (d: Decisions) => d.units_from === "chosen" && d.units !== d.detected_units;
-export const upLabel = (d: Decisions) => UPS.find((u) => u.value === d.up_axis)!.label;
 export const unitsLabel = (d: Decisions) => (d.units === "unitless" ? "None" : unitName(d.units));
 
 /** "auto" / "default" beside a value the app decided, or a Reset link once the user changed it. */
@@ -79,18 +77,6 @@ export function Provenance({ tag, onReset, className }: { tag?: string; onReset?
 
 export const upTag = (d: Decisions) => (d.up_from === "detected" ? "auto" : undefined);
 export const unitsTag = (d: Decisions) => UNITS_FROM[d.units_from];
-
-export function UpToggle({ decisions, onUp, className }: Pick<ResultProps, "decisions" | "onUp"> & { className?: string }) {
-  return (
-    <ToggleGroup type="single" value={decisions.up_axis} onValueChange={(v) => v && onUp(v as UpAxis)} aria-label="Up direction" className={className}>
-      {UPS.map((u) => (
-        <ToggleGroupItem key={u.value} value={u.value} className="flex-1">
-          {u.label}
-        </ToggleGroupItem>
-      ))}
-    </ToggleGroup>
-  );
-}
 
 /** The units, as an underlined value that opens the list. */
 export function UnitsMenu({
@@ -145,20 +131,6 @@ export function sizeText(report: Report, decisions: Decisions): string | null {
     .map((hi, a) => hi - b[0][a])
     .map(measure)
     .join(" × ")}${symbol ? ` ${symbol}` : ""}`;
-}
-
-/** Segmented format choice: the format is always visible, never hidden behind a chevron. */
-export function FormatToggle({ format, busy, onFormat, className }: Pick<ResultProps, "format" | "busy" | "onFormat"> & { className?: string }) {
-  return (
-    <ToggleGroup type="single" value={format} onValueChange={(v) => v && onFormat(v as Format)} aria-label="Format" className={cn("w-full", className)} disabled={busy !== null}>
-      {FORMATS.map((f) => (
-        <ToggleGroupItem key={f.value} value={f.value} className="flex-1 gap-1 px-2">
-          {f.value === "dxf-binary" ? "DXF binary" : f.label}
-          {f.beta && <span className="rounded-[2px] bg-warn-soft px-1 text-[10px] font-medium text-warn">beta</span>}
-        </ToggleGroupItem>
-      ))}
-    </ToggleGroup>
-  );
 }
 
 /** The one filled button on the page. Hidden layers are left out when `visibleOnly`. */
@@ -218,70 +190,49 @@ export function DownloadAfter({
   );
 }
 
-/** Edges, fit, named views and projection. `icons` draws a compact icon-only strip. */
-export function ViewTools({
-  edges,
-  ortho,
-  onEdges,
-  onFit,
-  onView,
-  onOrtho,
-  icons = false,
-  vertical = false,
-}: Pick<ResultProps, "edges" | "ortho" | "onEdges" | "onFit" | "onView" | "onOrtho"> & { icons?: boolean; vertical?: boolean }) {
-  const on = "data-[on=true]:bg-panel-solid data-[on=true]:text-fg data-[on=true]:shadow-[inset_0_0_0_1px_var(--line)]";
-  const side = vertical ? "left" : "top";
-  const item = (label: string, node: React.ReactElement) =>
-    icons ? (
-      <Tip label={label} side={side}>
-        {node}
-      </Tip>
-    ) : (
-      node
-    );
+/** Edges, fit, named views and projection: a vertical icon strip beside the result card. */
+export function ViewTools({ edges, ortho, onEdges, onFit, onView, onOrtho }: Pick<ResultProps, "edges" | "ortho" | "onEdges" | "onFit" | "onView" | "onOrtho">) {
   return (
-    <div className={cn("flex gap-0.5 rounded-[4px] bg-panel-2 p-[3px]", vertical && "flex-col")}>
-      {item(
-        "Edges",
-        <Button
-          variant="ghost"
-          size={icons ? "icon-sm" : "sm"}
-          className={cn(!icons && "h-8 flex-1 px-2.5", on)}
-          data-on={edges}
-          aria-pressed={edges}
-          aria-label="Edges"
-          onClick={() => onEdges(!edges)}
-        >
-          <Box />
-          {!icons && "Edges"}
-        </Button>,
-      )}
-      {item(
-        "Fit to view",
-        <Button variant="ghost" size={icons ? "icon-sm" : "sm"} className={cn(!icons && "h-8 flex-1 px-2.5")} aria-label="Fit" onClick={onFit}>
-          <Scan />
-          {!icons && "Fit"}
-        </Button>,
-      )}
-      <Menu position={vertical ? "left-start" : "bottom-end"} offset={8} width={180} classNames={menuStyles}>
-        <Menu.Target>
-          <Button variant="ghost" size={icons ? "icon-sm" : "sm"} className={cn(!icons && "h-8 flex-1 px-2.5")} aria-label="Views">
-            {icons ? <Rotate3d /> : "Views"}
-            {!icons && <ChevronDown />}
+    <div className="panel pointer-events-auto p-1">
+      <div className="flex flex-col gap-0.5 rounded-[4px] bg-panel-2 p-[3px]">
+        <Tip label="Edges" side="left">
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            className="data-[on=true]:bg-panel-solid data-[on=true]:text-fg data-[on=true]:shadow-[inset_0_0_0_1px_var(--line)]"
+            data-on={edges}
+            aria-pressed={edges}
+            aria-label="Edges"
+            onClick={() => onEdges(!edges)}
+          >
+            <Box />
           </Button>
-        </Menu.Target>
-        <Menu.Dropdown>
-          {VIEWS.map((v) => (
-            <Menu.Item key={v.value} onClick={() => onView(v.value)}>
-              {v.label}
+        </Tip>
+        <Tip label="Fit to view" side="left">
+          <Button variant="ghost" size="icon-sm" aria-label="Fit to view" onClick={onFit}>
+            <Scan />
+          </Button>
+        </Tip>
+        <Menu position="left-start" offset={8} width={180} classNames={menuStyles}>
+          <Menu.Target>
+            <Button variant="ghost" size="icon-sm" aria-label="Views">
+              <Rotate3d />
+            </Button>
+          </Menu.Target>
+          <Menu.Dropdown>
+            <Menu.Label>Views</Menu.Label>
+            {VIEWS.map((v) => (
+              <Menu.Item key={v.value} onClick={() => onView(v.value)}>
+                {v.label}
+              </Menu.Item>
+            ))}
+            <Menu.Divider />
+            <Menu.Item onClick={() => onOrtho(!ortho)} rightSection={ortho ? <Check className="size-3.5" /> : null}>
+              Orthographic
             </Menu.Item>
-          ))}
-          <Menu.Divider />
-          <Menu.Item onClick={() => onOrtho(!ortho)} rightSection={ortho ? <Check className="size-3.5" /> : null}>
-            Orthographic
-          </Menu.Item>
-        </Menu.Dropdown>
-      </Menu>
+          </Menu.Dropdown>
+        </Menu>
+      </div>
     </div>
   );
 }
