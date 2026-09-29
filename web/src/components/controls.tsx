@@ -6,7 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Tip } from "@/components/ui/tooltip";
 import type { Decisions, Report } from "@/lib/engine";
 import { canPickSaveLocation } from "@/lib/files";
-import { bytes, measure } from "@/lib/format";
+import { bytes, fmt, measure } from "@/lib/format";
 import { UNITS, formatInfo, unitName, unitSymbol, type Format, type UpAxis, type Units } from "@/lib/settings";
 import { cn, shortcut } from "@/lib/utils";
 import type { ViewName } from "@/viewer/Viewer";
@@ -154,7 +154,7 @@ export function DownloadButton({
           <Download />
           Download {shortFormat(format)}
         </span>
-        <span className="num text-[12px] font-normal opacity-80">{busy !== null ? "…" : shown === "all" ? bytes(report.output.bytes) : `${layerCount - hiddenCount} of ${layerCount} layers`}</span>
+        <span className="num text-[12px] font-normal opacity-80">{busy !== null ? "…" : shown === "all" ? bytes(report.output.bytes) : `${fmt(layerCount - hiddenCount)} of ${fmt(layerCount)} layers`}</span>
       </Button>
     </Tip>
   );
@@ -184,7 +184,7 @@ export function DownloadAfter({
     );
   return (
     <div className="flex min-h-5 items-center gap-3 text-[12.5px] text-fg-3">
-      <span>{shown === "all" ? "Everything in the viewer is included" : shown === "some" ? "Hidden layers are left out" : "Every layer is hidden: show one to download"}</span>
+      <span>{shown === "all" ? "Everything in the viewer is included" : shown === "some" ? "Unticked layers are left out" : "No layer is ticked: tick one to download"}</span>
       {canPickSaveLocation() && shown === "all" && (
         <Button variant="link" className="ml-auto h-auto px-0 text-[12.5px]" onClick={() => onDownload(true)} disabled={busy !== null}>
           Save as…

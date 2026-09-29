@@ -92,8 +92,14 @@ export function App() {
   const currentRef = useRef<Current | null>(null);
   const resultRef = useRef<Result | null>(null);
   const visibleRef = useRef<Result | null>(null);
-  /** Names of the layers hidden in the viewer. */
+  /** Names of the layers left out of the drawing (unticked in the layers pane). They
+   *  survive a rebuilt preview (a reload, loose points) while those layers still exist. */
+  const [hidden, setHiddenState] = useState<string[]>([]);
   const hiddenRef = useRef<string[]>([]);
+  const setHidden = (names: string[]) => {
+    hiddenRef.current = names;
+    setHiddenState(names);
+  };
   const visibleToken = useRef(0);
   const batchRef = useRef<BatchItem[]>([]);
   const batchMtls = useRef<File[]>([]);
@@ -183,8 +189,7 @@ export function App() {
     const key = previewKey(settings);
     const shown = shownPreview.current;
     const wantPreview = forcePreview || !shown || shown.key !== key || shown.fileId !== cur.id;
-    // A new preview shows every layer again; until then no visible-layers drawing is current.
-    if (wantPreview) hiddenRef.current = [];
+    // Until the conversion below finishes, no visible-layers drawing is current.
     ++visibleToken.current;
     visibleRef.current = null;
     setVisible(null);
@@ -205,7 +210,11 @@ export function App() {
         setPreview({ buffers: r.preview, builtUp: r.decisions.up_axis, id: ++seq.current, fileId: cur.id });
       }
       if (cur.batchItem !== null) updateBatch(cur.batchItem, { status: "done", result: r });
-      if (hiddenRef.current.length) await convertVisible(cur);
+      // Keep the layers left out that still exist (a reload can remove some).
+      const names = new Set(r.report.layers.filter((l) => l.faces + l.polylines + l.points > 0).map((l) => l.name));
+      const kept = hiddenRef.current.filter((n) => names.has(n));
+      if (kept.length !== hiddenRef.current.length) setHidden(kept);
+      if (kept.length) await convertVisible(cur);
       return true;
     } catch (e) {
       if (token !== convertToken.current) return false;
@@ -250,8 +259,10 @@ export function App() {
       const token = ++openToken.current;
       const previous = screenRef.current === "work" ? currentRef.current?.file.name : undefined;
       setLoading({ name: file.name, progress: null });
-      if (!opts.reload) setScreen("loading");
-      else setBusy("Reloading…");
+      if (!opts.reload) {
+        setScreen("loading");
+        setHidden([]); // another file: every layer in again
+      } else setBusy("Reloading…");
       try {
         const info = await engine.open(file, prefsRef.current.format === "dwg", (p) => setLoading({ name: file.name, progress: p }));
         if (token !== openToken.current) return;
@@ -397,7 +408,7 @@ export function App() {
   };
 
   const changeHidden = (names: string[]) => {
-    hiddenRef.current = names;
+    setHidden(names);
     setDownloaded(null);
     const cur = currentRef.current;
     if (cur) void convertVisible(cur);
@@ -515,6 +526,7 @@ export function App() {
             <Workspace
               result={result}
               visible={visible}
+              hidden={hidden}
               preview={preview}
               inspection={current?.inspection ?? null}
               prefs={prefs}
@@ -524,7 +536,10 @@ export function App() {
               onUnits={(units: Units | null) => change({ units })}
               onHouseUnits={(houseUnits: Units | null) => changePrefs({ houseUnits })}
               onKeepLoose={(keepLoose) => change({ keepLoose })}
-              onLayerMode={(layerMode: LayerMode) => changePrefs({ layerMode })}
+              onLayerMode={(layerMode: LayerMode) => {
+                setHidden([]); // other layers: nothing is left out any more
+                changePrefs({ layerMode });
+              }}
               onFormat={(format: Format) => changePrefs({ format })}
               onIncludeName={(includeName) => changePrefs({ includeName })}
               onDownload={download}

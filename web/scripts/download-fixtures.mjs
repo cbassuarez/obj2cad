@@ -86,7 +86,7 @@ for (const format of ["dxf", "dxf-binary", "dwg"]) {
   await ctx.close();
 }
 
-// Visible layers: hide one layer of a multi-layer model; Download and the report must then
+// Visible layers: untick one layer of a multi-layer model; Download and the report must then
 // describe the drawing without it.
 const layered = objs.find((o) => basename(o) === "names_layers.obj");
 if (layered) {
@@ -94,9 +94,9 @@ if (layered) {
   mkdirSync(dir, { recursive: true });
   const ctx = await session("dxf");
   const { page } = await open(ctx, withMtl(layered));
-  const hide = page.getByRole("button", { name: /^Hide layer / }).first();
-  const hidden = (await hide.getAttribute("aria-label")).replace(/^Hide layer /, "");
-  await hide.click();
+  const box = page.getByRole("checkbox", { name: / in the drawing$/ }).first();
+  const hidden = (await box.getAttribute("aria-label")).replace(/ in the drawing$/, "");
+  await box.click(); // untick: leave it out of the drawing
   await ready(page);
   manifest.visible = { obj: layered, hidden: [hidden], ...(await saveDrawingAndReport(page, dir)) };
   console.log(`visible\t${basename(layered)} without ${hidden}`);

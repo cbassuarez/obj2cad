@@ -52,6 +52,8 @@ export class Viewer {
   private dims = new THREE.Group();
   private grid: THREE.Group | null = null;
   private layers = new Map<number, THREE.Object3D[]>();
+  /** Each layer's extent in the preview's own space: the dimensions measure what is shown. */
+  private layerBoxes = new Map<number, THREE.Box3>();
   private edgeObjects: THREE.LineSegments[] = [];
   private box = new THREE.Box3();
   private radius = 1;
@@ -69,6 +71,18 @@ export class Viewer {
   private dimLabels: { obj: CSS2DObject; extent: number }[] = [];
   /** Called after each rendered frame with the camera's current axis directions. */
   onAxes: ((axes: AxisDirs) => void) | null = null;
+  /** Called when the model is clicked (not dragged): the layer under the pointer, or null. */
+  onPick: ((layer: number | null) => void) | null = null;
+  /** The layer shown in full while every other one is dimmed; null shows all alike. */
+  private focus: number | null = null;
+  /** Shared stand-ins for the dimmed layers (owned here, disposed with the viewer). */
+  private dimmed = {
+    surface: new THREE.MeshStandardMaterial({ color: 0xd9d5cd, transparent: true, opacity: 0.22, depthWrite: false, side: THREE.DoubleSide, flatShading: true }),
+    line: new THREE.LineBasicMaterial({ color: 0xb9b3a7, transparent: true, opacity: 0.3, depthWrite: false }),
+    point: new THREE.PointsMaterial({ color: 0xb9b3a7, size: 4, sizeAttenuation: false, transparent: true, opacity: 0.3, depthWrite: false }),
+  };
+  private raycaster = new THREE.Raycaster();
+  private pressed: { x: number; y: number } | null = null;
   private inv = new THREE.Quaternion();
   private key = new THREE.DirectionalLight(0xffffff, 1.7);
   private labelSize = new WeakMap<HTMLElement, { w: number; h: number }>();
@@ -103,6 +117,17 @@ export class Viewer {
 
     this.resizeObserver = new ResizeObserver(() => this.resize());
     this.resizeObserver.observe(host);
+
+    // A click picks a layer; a drag (orbit, pan) doesn't.
+    const canvas = this.renderer.domElement;
+    canvas.addEventListener("pointerdown", (e) => {
+      this.pressed = e.button === 0 ? { x: e.clientX, y: e.clientY } : null;
+    });
+    canvas.addEventListener("pointerup", (e) => {
+      const p = this.pressed;
+      this.pressed = null;
+      if (p && e.button === 0 && Math.hypot(e.clientX - p.x, e.clientY - p.y) < 5) this.onPick?.(this.pick(e.clientX, e.clientY));
+    });
   }
 
   setTheme(theme: ViewerTheme): void {
@@ -132,13 +157,22 @@ export class Viewer {
       polygonOffsetUnits: 1,
     });
     const edgeMat = new THREE.LineBasicMaterial({ color: this.theme.edge, transparent: true, opacity: 0.4 });
+    // The layers share one vertex buffer, so their extents come from their own elements.
+    const extend = (layer: number, pos: ArrayLike<number>, at: (k: number) => number, count: number) => {
+      const b = this.layerBoxes.get(layer) ?? new THREE.Box3();
+      const v = new THREE.Vector3();
+      for (let k = 0; k < count; k++) b.expandByPoint(v.fromArray(pos as number[], at(k) * 3));
+      this.layerBoxes.set(layer, b);
+    };
     const add = (layer: number, ...objs: THREE.Object3D[]) => {
+      for (const o of objs) o.userData.layer = layer;
       this.content.add(...objs);
       this.layers.set(layer, [...(this.layers.get(layer) ?? []), ...objs]);
     };
 
     for (let g = 0; g < p.groups.length; g += 5) {
       const [layer, i0, ic, e0, ec] = p.groups.subarray(g, g + 5);
+      extend(layer, p.positions, (k) => p.indices[i0 + k], ic);
       const geo = new THREE.BufferGeometry();
       geo.setAttribute("position", position);
       geo.setAttribute("color", color);
@@ -157,6 +191,7 @@ export class Viewer {
       const mat = new THREE.LineBasicMaterial({ vertexColors: true });
       for (let g = 0; g < p.lineGroups.length; g += 3) {
         const [layer, start, count] = p.lineGroups.subarray(g, g + 3);
+        extend(layer, p.lines, (k) => start + k, count);
         const geo = new THREE.BufferGeometry();
         geo.setAttribute("position", pos);
         geo.setAttribute("color", col);
@@ -170,6 +205,7 @@ export class Viewer {
       const mat = new THREE.PointsMaterial({ vertexColors: true, size: 5, sizeAttenuation: false });
       for (let g = 0; g < p.pointGroups.length; g += 3) {
         const [layer, start, count] = p.pointGroups.subarray(g, g + 3);
+        extend(layer, p.points, (k) => start + k, count);
         const geo = new THREE.BufferGeometry();
         geo.setAttribute("position", pos);
         geo.setAttribute("color", col);
@@ -179,6 +215,7 @@ export class Viewer {
     }
 
     this.applyVisibility();
+    this.applyFocus();
     this.measure();
     const size = this.box.getSize(new THREE.Vector3());
     this.radius = Math.max(size.length() / 2, 1e-6);
@@ -229,10 +266,17 @@ export class Viewer {
     this.applyVisibility();
   }
 
-  setLayerVisible(layer: number, visible: boolean): void {
-    if (visible) this.hidden.delete(layer);
-    else this.hidden.add(layer);
+  /** Hide exactly these layers (and show every other one). */
+  setHidden(layers: Iterable<number>): void {
+    this.hidden = new Set(layers);
     this.applyVisibility();
+  }
+
+  /** Show `layer` in full and dim the others; null shows every layer alike. */
+  highlight(layer: number | null): void {
+    if (layer === this.focus) return;
+    this.focus = layer;
+    this.applyFocus();
   }
 
   /** Perspective or orthographic projection, keeping what is on screen. */
@@ -332,6 +376,7 @@ export class Viewer {
     cancelAnimationFrame(this.frame);
     this.resizeObserver.disconnect();
     this.clear();
+    for (const m of Object.values(this.dimmed)) m.dispose();
     this.controls.dispose();
     this.renderer.dispose();
     this.renderer.domElement.remove();
@@ -378,12 +423,51 @@ export class Viewer {
     if (!this.hasContent) this.box.set(new THREE.Vector3(-1, -1, -1), new THREE.Vector3(1, 1, 1));
   }
 
+  /** The layer under a screen point: the nearest visible face, line or point. */
+  private pick(clientX: number, clientY: number): number | null {
+    const r = this.renderer.domElement.getBoundingClientRect();
+    const ndc = new THREE.Vector2(((clientX - r.left) / r.width) * 2 - 1, -((clientY - r.top) / r.height) * 2 + 1);
+    this.raycaster.setFromCamera(ndc, this.camera);
+    this.raycaster.params.Line.threshold = this.radius / 150;
+    this.raycaster.params.Points.threshold = this.radius / 100;
+    const targets: THREE.Object3D[] = [];
+    for (const objs of this.layers.values()) for (const o of objs) if (o.visible && !o.userData.edges) targets.push(o);
+    const hit = this.raycaster.intersectObjects(targets, false)[0];
+    return hit ? (hit.object.userData.layer as number) : null;
+  }
+
+  /** Dim every layer but the focused one (by swapping in the shared dimmed materials). */
+  private applyFocus(): void {
+    for (const [layer, objs] of this.layers) {
+      for (const o of objs) {
+        const shape = o as THREE.Mesh | THREE.LineSegments | THREE.Points;
+        shape.userData.base ??= shape.material;
+        const dim = this.focus !== null && layer !== this.focus;
+        if (!dim) shape.material = shape.userData.base;
+        else if (shape instanceof THREE.Mesh) shape.material = this.dimmed.surface;
+        else if (shape instanceof THREE.Points) shape.material = this.dimmed.point;
+        else shape.material = this.dimmed.line;
+      }
+    }
+    this.requestRender();
+  }
+
   private applyVisibility(): void {
     for (const [layer, objs] of this.layers) {
       const shown = !this.hidden.has(layer);
       for (const o of objs) o.visible = o.userData.edges ? shown && this.edgesOn : shown;
     }
+    this.rebuildDims();
     this.requestRender();
+  }
+
+  /** The extent of the layers shown (the whole model when none is hidden). */
+  private shownBox(): THREE.Box3 {
+    if (!this.hidden.size) return this.box;
+    this.content.updateMatrixWorld(true);
+    const b = new THREE.Box3();
+    for (const [layer, lb] of this.layerBoxes) if (!this.hidden.has(layer)) b.union(lb);
+    return b.isEmpty() ? b : b.applyMatrix4(this.content.matrixWorld);
   }
 
   private rebuildGrid(): void {
@@ -424,8 +508,9 @@ export class Viewer {
       }
     }
     this.dimLabels = [];
-    if (!this.hasContent) return;
-    const { min, max } = this.box;
+    const shown = this.shownBox();
+    if (!this.hasContent || shown.isEmpty()) return;
+    const { min, max } = shown;
     const off = this.radius * 0.08;
     const tick = this.radius * 0.025;
     const flat = this.radius * 1e-9;
@@ -488,12 +573,13 @@ export class Viewer {
       this.content.remove(c);
       if (c instanceof THREE.Mesh || c instanceof THREE.LineSegments || c instanceof THREE.Points) {
         geometries.add(c.geometry);
-        materials.add(c.material as THREE.Material);
+        materials.add((c.userData.base ?? c.material) as THREE.Material); // never the shared dimmed ones
       }
     }
     for (const g of geometries) g.dispose();
     for (const m of materials) m.dispose();
     this.layers.clear();
+    this.layerBoxes.clear();
     this.hidden.clear();
     this.edgeObjects = [];
     this.box.makeEmpty();

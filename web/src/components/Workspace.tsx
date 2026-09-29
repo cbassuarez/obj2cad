@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
 import { Viewer, type AxisDirs } from "@/viewer/Viewer";
 import { AxisGizmo } from "@/components/AxisGizmo";
@@ -25,6 +25,7 @@ export interface PreviewState {
 export function Workspace({
   result,
   visible,
+  hidden: hiddenNames,
   preview,
   inspection,
   prefs,
@@ -46,6 +47,8 @@ export function Workspace({
   result: Result;
   /** The drawing without the hidden layers (while some are hidden and it is ready). */
   visible: Result | null;
+  /** Names of the layers left out of the drawing. */
+  hidden: string[];
   preview: PreviewState | null;
   inspection: Inspection | null;
   prefs: Prefs;
@@ -59,7 +62,7 @@ export function Workspace({
   onFormat: (f: Format) => void;
   onIncludeName: (on: boolean) => void;
   onDownload: (pick: boolean) => void;
-  /** The layers hidden in the viewer changed (their names): the download changes with them. */
+  /** Layers were left out or put back (their names): the download changes with them. */
   onHidden: (names: string[]) => void;
   onDownloadReport: () => void;
   onAddMtl: () => void;
@@ -71,12 +74,20 @@ export function Workspace({
   const [axes, setAxes] = useState<AxisDirs | null>(null);
   const [edges, setEdges] = useState(false);
   const [ortho, setOrtho] = useState(false);
-  const [hidden, setHidden] = useState<Set<number>>(new Set());
   const { report, decisions } = result;
+  const hidden = useMemo(() => {
+    const names = new Set(hiddenNames);
+    return new Set(report.layers.flatMap((l, i) => (names.has(l.name) ? [i] : [])));
+  }, [hiddenNames, report]);
+  /** The layer lit up in the viewer: the row under the pointer, else the one picked. */
+  const [hovered, setHovered] = useState<number | null>(null);
+  const [selected, setSelected] = useState<number | null>(null);
 
   useEffect(() => {
     const v = new Viewer(host.current!);
     v.onAxes = setAxes;
+    v.onPick = setSelected;
+    shownFile.current = null; // a new viewer has framed nothing yet
     v.setTheme({ grid: cssVar("--grid"), gridMajor: cssVar("--grid-major"), dim: cssVar("--dim"), edge: cssVar("--text") });
     viewer.current = v;
     return () => {
@@ -92,7 +103,8 @@ export function Workspace({
     v.show(preview.buffers, preview.builtUp, shownFile.current !== preview.fileId);
     shownFile.current = preview.fileId;
     v.setEdges(edges);
-    setHidden(new Set());
+    setSelected(null);
+    setHovered(null);
     // `edges` is applied on its own below; new buffers must not re-run on toggles.
   }, [preview]);
 
@@ -100,24 +112,16 @@ export function Workspace({
   useEffect(() => viewer.current?.setOrientation(decisions.up_axis), [decisions.up_axis, preview]);
   useEffect(() => viewer.current?.setUnit(unitSymbol(decisions.units)), [decisions.units]);
   useEffect(() => viewer.current?.setEdges(edges), [edges]);
+  // Layers left out of the drawing are hidden in the viewer (after each rebuild too).
+  useEffect(() => viewer.current?.setHidden(hidden), [hidden, preview]);
+  useEffect(() => viewer.current?.highlight(hovered ?? selected), [hovered, selected, preview]);
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && setSelected(null);
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
 
-  const changeHidden = (next: Set<number>) => {
-    setHidden(next);
-    onHidden(report.layers.filter((_, i) => next.has(i)).map((l) => l.name));
-  };
-
-  const toggleLayer = (layer: number) => {
-    const next = new Set(hidden);
-    if (next.has(layer)) next.delete(layer);
-    else next.add(layer);
-    viewer.current?.setLayerVisible(layer, !next.has(layer));
-    changeHidden(next);
-  };
-
-  const showAll = () => {
-    for (const layer of hidden) viewer.current?.setLayerVisible(layer, true);
-    changeHidden(new Set());
-  };
+  const changeHidden = (next: Set<number>) => onHidden(report.layers.filter((_, i) => next.has(i)).map((l) => l.name));
 
   const available = preview?.buffers.available ?? true;
   const layerCount = report.layers.filter((l) => l.faces + l.polylines + l.points > 0).length;
@@ -226,7 +230,18 @@ export function Workspace({
           transition={{ delay: 0.05 }}
           className="pointer-events-none lg:absolute lg:top-[76px] lg:left-4 lg:flex lg:max-h-[calc(100%-200px)] lg:w-[268px]"
         >
-          <LayersCard report={report} mode={prefs.layerMode} hidden={hidden} busy={busy !== null} onMode={onLayerMode} onToggle={toggleLayer} onShowAll={showAll} />
+          <LayersCard
+            report={report}
+            mode={prefs.layerMode}
+            hidden={hidden}
+            busy={busy !== null}
+            onMode={onLayerMode}
+            onHidden={changeHidden}
+            selected={selected}
+            onSelect={setSelected}
+            onHover={setHovered}
+            inspection={inspection}
+          />
         </motion.div>
       </div>
     </main>
