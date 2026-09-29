@@ -1089,6 +1089,7 @@ ObjectDBX Classes
 0
 281
 1
+@@CLASSES@@
   0
 CLASS
   1
@@ -2942,5 +2943,6 @@ Standard
 9
   0
 ENDSEC
+@@ACDSDATA@@
   0
 EOF

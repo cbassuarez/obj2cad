@@ -16,6 +16,8 @@ export interface Progress {
 }
 
 export interface ParseFailure {
+  /** The file of the drawing that couldn't be read. */
+  file: string;
   kind: string;
   line: number;
   message: string;
@@ -57,9 +59,14 @@ export interface Converted {
   ms: number;
 }
 
+/** One file of a drawing (see `Source` in lib/files.ts). */
+export interface SourceFile {
+  file: File;
+  path: string;
+}
+
 export type Request =
-  | { id: number; type: "open"; file: File; mtl: File | null; dwg: boolean }
-  | { id: number; type: "mtl"; mtl: File }
+  | { id: number; type: "open"; sources: SourceFile[]; name: string; dwg: boolean }
   | { id: number; type: "convert"; settings: EngineSettings; preview: boolean };
 
 export type Reply =
@@ -99,9 +106,8 @@ void engine("core").catch(() => undefined);
 interface Open {
   kind: Kind;
   session: core.Session;
-  file: File;
-  mtl: File | null;
-  sha: string;
+  sources: SourceFile[];
+  name: string;
   /** Parity hash per geometry-changing settings. */
   parity: Map<string, string>;
 }
@@ -133,19 +139,29 @@ async function read(file: File, progress: (done: number) => void): Promise<Uint8
 
 class ReadError extends Error {}
 
-async function load(id: number, file: File, mtl: File | null, kind: Kind): Promise<Open> {
+async function load(id: number, sources: SourceFile[], name: string, kind: Kind): Promise<Open> {
   const mod = await engine(kind).catch((e: unknown) => {
     throw Object.assign(new Error(String(e instanceof Error ? e.message : e)), { engineFailed: true });
   });
-  const bytes = await read(file, (done) => post({ id, type: "progress", progress: { stage: "read", done, total: file.size } }));
-  const sha = await sha256(bytes);
   open?.session.free();
   open = null;
-  const session = new mod.Session(bytes, file.name, sha, (done: number, total: number) =>
-    post({ id, type: "progress", progress: { stage: "parse", done, total } }),
-  );
-  if (mtl) session.set_mtl(new Uint8Array(await mtl.arrayBuffer()));
-  return { kind, session, file, mtl, sha, parity: new Map() };
+  const session = new mod.Session();
+  const total = sources.reduce((n, s) => n + s.file.size, 0);
+  let before = 0;
+  try {
+    for (const s of sources) {
+      const bytes = await read(s.file, (done) => post({ id, type: "progress", progress: { stage: "read", done: before + done, total } }));
+      before += s.file.size;
+      // Whole seconds, like the command-line tool; -1 when the date is unknown.
+      const modified = s.file.lastModified > 0 ? Math.floor(s.file.lastModified / 1000) : -1;
+      session.add_file(s.path, bytes, await sha256(bytes), modified);
+    }
+    session.load(name, (done: number, all: number) => post({ id, type: "progress", progress: { stage: "parse", done, total: all } }));
+  } catch (e) {
+    session.free();
+    throw e;
+  }
+  return { kind, session, sources, name, parity: new Map() };
 }
 
 function convert(o: Open, settings: EngineSettings, wantPreview: boolean): Promise<Converted> {
@@ -211,17 +227,12 @@ self.onmessage = async (e: MessageEvent<Request>) => {
   }
   try {
     if (req.type === "open") {
-      open = await load(req.id, req.file, req.mtl, req.dwg ? "dwg" : "core");
+      open = await load(req.id, req.sources, req.name, req.dwg ? "dwg" : "core");
       post({ id: req.id, type: "ok", result: JSON.parse(open.session.inspect()) });
-    } else if (req.type === "mtl") {
-      if (!open) throw new Error("no file is open");
-      open.session.set_mtl(new Uint8Array(await req.mtl.arrayBuffer()));
-      open.mtl = req.mtl;
-      post({ id: req.id, type: "ok", result: null });
     } else {
       if (!open) throw new Error("no file is open");
       // DWG needs the larger engine: move the open file into it once.
-      if (req.settings.format === "dwg" && open.kind !== "dwg") open = await load(req.id, open.file, open.mtl, "dwg");
+      if (req.settings.format === "dwg" && open.kind !== "dwg") open = await load(req.id, open.sources, open.name, "dwg");
       const r = await convert(open, req.settings, req.preview);
       const p = r.preview;
       const transfer = p

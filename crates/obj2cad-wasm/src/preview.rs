@@ -31,7 +31,10 @@ const MAX_EXTENT: f64 = 1e12;
 
 impl Preview {
     pub fn build(model: &CadModel) -> Self {
-        let origin = model.bounds().map(|(lo, hi)| [0, 1, 2].map(|a| lo[a] / 2.0 + hi[a] / 2.0)).unwrap_or([0.0; 3]);
+        let origin = model
+            .bounds()
+            .map(|(lo, hi)| [0, 1, 2].map(|a| lo[a] / 2.0 + hi[a] / 2.0))
+            .unwrap_or([0.0; 3]);
         let nv: usize = model.meshes.iter().map(|m| m.vertices.len()).sum();
         let refs: usize = model.meshes.iter().map(|m| m.face_indices.len()).sum();
         let mut out = Preview {
@@ -49,8 +52,9 @@ impl Preview {
             origin,
             available: true,
         };
-        let displayable =
-            model.bounds().is_none_or(|(lo, hi)| (0..3).all(|a| (hi[a] - lo[a]).is_finite() && hi[a] - lo[a] < MAX_EXTENT));
+        let displayable = model.bounds().is_none_or(|(lo, hi)| {
+            (0..3).all(|a| (hi[a] - lo[a]).is_finite() && hi[a] - lo[a] < MAX_EXTENT)
+        });
         if !displayable {
             out.available = false;
             return out;
@@ -60,7 +64,8 @@ impl Preview {
             let p = model.position(v);
             [0, 1, 2].map(|a| p[a] - origin[a])
         };
-        let color = |c: Option<[u8; 3]>, layer: u32| c.unwrap_or(model.layers[layer as usize].color);
+        let color =
+            |c: Option<[u8; 3]>, layer: u32| c.unwrap_or(model.layers[layer as usize].color);
 
         let mut tri = Triangulator::default();
         for m in &model.meshes {
@@ -75,11 +80,13 @@ impl Preview {
             for f in m.faces() {
                 tri.triangulate(f, &local, base, &mut out.indices);
                 for k in 0..f.len() {
-                    out.edges.extend_from_slice(&[base + f[k], base + f[(k + 1) % f.len()]]);
+                    out.edges
+                        .extend_from_slice(&[base + f[k], base + f[(k + 1) % f.len()]]);
                 }
             }
             let (i1, e1) = (out.indices.len() as u32, out.edges.len() as u32);
-            out.groups.extend_from_slice(&[m.layer, i0, i1 - i0, e0, e1 - e0]);
+            out.groups
+                .extend_from_slice(&[m.layer, i0, i1 - i0, e0, e1 - e0]);
         }
 
         // Lines and points, grouped by layer so the viewer can hide layers.
@@ -95,7 +102,34 @@ impl Preview {
                     out.line_colors.extend_from_slice(&rgb);
                 }
             }
-            push_group(&mut out.line_groups, l.layer, start, (out.lines.len() / 3) as u32 - start);
+            push_group(
+                &mut out.line_groups,
+                l.layer,
+                start,
+                (out.lines.len() / 3) as u32 - start,
+            );
+        }
+        // Free-form curves, sampled for display (the file keeps them exact).
+        let mut by_layer: Vec<usize> = (0..model.splines.len()).collect();
+        by_layer.sort_by_key(|&i| model.splines[i].layer);
+        for i in by_layer {
+            let c = &model.splines[i];
+            let start = (out.lines.len() / 3) as u32;
+            let rgb = color(c.color, c.layer);
+            let cps: Vec<[f64; 3]> = c.control.iter().map(|&v| rel(v)).collect();
+            let pts = sample_spline(c.degree as usize, &c.knots, &cps, c.weights.as_deref());
+            for w in pts.windows(2) {
+                for p in w {
+                    out.lines.extend(p.map(|x| x as f32));
+                    out.line_colors.extend_from_slice(&rgb);
+                }
+            }
+            push_group(
+                &mut out.line_groups,
+                c.layer,
+                start,
+                (out.lines.len() / 3) as u32 - start,
+            );
         }
         let mut by_layer: Vec<usize> = (0..model.points.len()).collect();
         by_layer.sort_by_key(|&i| model.points[i].layer);
@@ -106,8 +140,152 @@ impl Preview {
             out.point_colors.extend_from_slice(&color(p.color, p.layer));
             push_group(&mut out.point_groups, p.layer, start, 1);
         }
+        // Recognized curved surfaces: their exact edges (closed surfaces, a few circles),
+        // drawn as lines over the mesh on their own layer.
+        let mut by_layer: Vec<usize> = (0..model.surfaces.len()).collect();
+        by_layer.sort_by_key(|&i| model.surfaces[i].layer);
+        for i in by_layer {
+            let s = &model.surfaces[i];
+            let start = (out.lines.len() / 3) as u32;
+            let rgb = color(s.color, s.layer);
+            for poly in outline(&s.body) {
+                for w in poly.windows(2) {
+                    for p in w {
+                        out.lines
+                            .extend([0, 1, 2].map(|a| (p[a] - origin[a]) as f32));
+                        out.line_colors.extend_from_slice(&rgb);
+                    }
+                }
+            }
+            push_group(
+                &mut out.line_groups,
+                s.layer,
+                start,
+                (out.lines.len() / 3) as u32 - start,
+            );
+        }
         out
     }
+}
+
+/// Points along a (rational) B-spline over its knot domain, 16 per knot span.
+fn sample_spline(
+    deg: usize,
+    knots: &[f64],
+    cps: &[[f64; 3]],
+    weights: Option<&[f64]>,
+) -> Vec<[f64; 3]> {
+    let n = cps.len();
+    if n <= deg || knots.len() != n + deg + 1 {
+        return cps.to_vec();
+    }
+    let w = |i: usize| weights.map_or(1.0, |w| w[i]);
+    // de Boor in homogeneous coordinates.
+    let eval = |t: f64| -> [f64; 3] {
+        let mut k = deg;
+        while k + 1 < n && knots[k + 1] <= t {
+            k += 1;
+        }
+        let mut d: Vec<[f64; 4]> = (0..=deg)
+            .map(|j| {
+                let i = k + j - deg;
+                let p = cps[i];
+                [p[0] * w(i), p[1] * w(i), p[2] * w(i), w(i)]
+            })
+            .collect();
+        for r in 1..=deg {
+            for j in (r..=deg).rev() {
+                let i = k + j - deg;
+                let den = knots[i + deg + 1 - r] - knots[i];
+                let a = if den == 0.0 {
+                    0.0
+                } else {
+                    (t - knots[i]) / den
+                };
+                let prev = d[j - 1];
+                for (x, p) in d[j].iter_mut().zip(prev) {
+                    *x = (1.0 - a) * p + a * *x;
+                }
+            }
+        }
+        let h = d[deg];
+        [h[0] / h[3], h[1] / h[3], h[2] / h[3]]
+    };
+    let (lo, hi) = (knots[deg], knots[n]);
+    let spans = knots[deg..=n]
+        .windows(2)
+        .filter(|w| w[1] > w[0])
+        .count()
+        .max(1);
+    let steps = 16 * spans;
+    (0..=steps)
+        .map(|s| eval(lo + (hi - lo) * s as f64 / steps as f64))
+        .collect()
+}
+
+/// Polylines that show an ACIS body: its edges, sampled; for closed faces (no edges), a
+/// few circles on the surface.
+fn outline(body: &obj2cad_acis::Body) -> Vec<Vec<[f64; 3]>> {
+    use obj2cad_acis::{Curve, Surface};
+    let mut out = Vec::new();
+    let circle = |center: [f64; 3], normal: [f64; 3], radius: f64| {
+        let u = obj2cad_acis::perpendicular(normal);
+        let c = Curve::Circle {
+            center,
+            normal,
+            u_dir: u,
+            radius,
+        };
+        (0..=64)
+            .map(|k| c.point(std::f64::consts::TAU * f64::from(k) / 64.0))
+            .collect::<Vec<_>>()
+    };
+    for e in &body.edges {
+        let n = if matches!(e.curve, Curve::Line { .. }) {
+            1
+        } else {
+            48
+        };
+        out.push(
+            (0..=n)
+                .map(|k| {
+                    e.curve
+                        .point(e.t0 + (e.t1 - e.t0) * f64::from(k) / f64::from(n))
+                })
+                .collect(),
+        );
+    }
+    for f in body.faces.iter().filter(|f| f.loops.is_empty()) {
+        match f.surface {
+            Surface::Sphere {
+                center,
+                radius,
+                u_dir,
+                pole,
+            } => {
+                out.push(circle(center, pole, radius));
+                out.push(circle(center, u_dir, radius));
+                out.push(circle(center, obj2cad_acis::cross(pole, u_dir), radius));
+            }
+            Surface::Torus {
+                center,
+                axis,
+                major,
+                minor,
+                u_dir,
+            } => {
+                out.push(circle(center, axis, major + minor));
+                out.push(circle(center, axis, major - minor));
+                let up = obj2cad_acis::scale(axis, minor);
+                out.push(circle(obj2cad_acis::add(center, up), axis, major));
+                out.push(circle(obj2cad_acis::sub(center, up), axis, major));
+                let tube = obj2cad_acis::add(center, obj2cad_acis::scale(u_dir, major));
+                out.push(circle(tube, obj2cad_acis::cross(axis, u_dir), minor));
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Append `count` items at `start` to `layer`'s group, merging with the previous group
@@ -152,7 +330,8 @@ impl Triangulator {
             return fan(out);
         }
         if earcut::utils3d::project3d_to_2d(&self.ring, n, &mut self.flat) {
-            self.earcut.earcut(self.flat.iter().copied(), &[] as &[u32], &mut self.tris);
+            self.earcut
+                .earcut(self.flat.iter().copied(), &[] as &[u32], &mut self.tris);
         } else {
             self.tris.clear();
         }
@@ -187,7 +366,11 @@ fn is_convex(ring: &[[f64; 3]], normal: [f64; 3]) -> bool {
     (0..n).all(|i| {
         let (p, c, q) = (ring[(i + n - 1) % n], ring[i], ring[(i + 1) % n]);
         let (e1, e2) = (sub(c, p), sub(q, c));
-        let cross = [e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]];
+        let cross = [
+            e1[1] * e2[2] - e1[2] * e2[1],
+            e1[2] * e2[0] - e1[0] * e2[2],
+            e1[0] * e2[1] - e1[1] * e2[0],
+        ];
         cross[0] * normal[0] + cross[1] * normal[1] + cross[2] * normal[2] >= -1e-12 * scale * scale
     })
 }
@@ -249,6 +432,21 @@ mod tests {
     fn layer_colors_come_from_the_engine() {
         let p = preview("o a\nv 0 0 0\nv 1 0 0\nv 1 1 0\nf 1 2 3\n");
         assert_eq!(&p.colors[..3], &obj2cad_core::convert::layer_color(1));
+    }
+
+    #[test]
+    fn rational_splines_sample_exactly_onto_their_circle() {
+        let w = std::f64::consts::FRAC_1_SQRT_2;
+        let pts = sample_spline(
+            2,
+            &[0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            &[[10.0, 0.0, 0.0], [10.0, 10.0, 0.0], [0.0, 10.0, 0.0]],
+            Some(&[1.0, w, 1.0]),
+        );
+        assert_eq!(pts.len(), 17);
+        assert!(pts
+            .iter()
+            .all(|p| ((p[0] * p[0] + p[1] * p[1]).sqrt() - 10.0).abs() < 1e-9));
     }
 
     #[test]

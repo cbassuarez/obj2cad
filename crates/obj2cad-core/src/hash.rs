@@ -6,7 +6,9 @@
 //! * each face / polyline is a record of its vertices' IEEE-754 bits (x, y, z, big-endian,
 //!   in element order, so winding and start vertex matter); each point is a one-vertex record;
 //! * records of each kind are sorted bytewise, then hashed as
-//!   `tag, count:u64le, (len:u32le, bytes)*` under a version prefix.
+//!   `tag, count:u64le, (len:u32le, bytes)*` under a version prefix;
+//! * free-form curves (splines), when a file has any, follow as a fourth kind `s`: degree
+//!   and knot count (u32 BE), then the bits of the knots, control points and weights.
 //!
 //! The Python harness (`tests/harness/parity.py`) implements the same definition
 //! independently and computes it from the source OBJ and from the read-back CAD file.
@@ -81,6 +83,33 @@ pub fn parity_stream(model: &CadModel) -> Vec<u8> {
     faces.append_to(&mut out, b'f');
     lines.append_to(&mut out, b'l');
     points.append_to(&mut out, b'p');
+    // Splines (free-form curves), only when there are any, so every other file keeps its
+    // hash: degree (u32 BE), knot count (u32 BE), knots, control points, weights (bits).
+    if !model.splines.is_empty() {
+        let mut splines = Records::with_capacity(model.splines.len(), 0);
+        for c in &model.splines {
+            let start = splines.bytes.len();
+            splines.bytes.extend_from_slice(&c.degree.to_be_bytes());
+            splines
+                .bytes
+                .extend_from_slice(&(c.knots.len() as u32).to_be_bytes());
+            for k in &c.knots {
+                splines.bytes.extend_from_slice(&k.to_bits().to_be_bytes());
+            }
+            for &v in &c.control {
+                for x in model.position(v) {
+                    splines.bytes.extend_from_slice(&x.to_bits().to_be_bytes());
+                }
+            }
+            for w in c.weights.iter().flatten() {
+                splines.bytes.extend_from_slice(&w.to_bits().to_be_bytes());
+            }
+            splines
+                .spans
+                .push((start as u32, (splines.bytes.len() - start) as u32));
+        }
+        splines.append_to(&mut out, b's');
+    }
     out
 }
 

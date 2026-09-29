@@ -5,7 +5,7 @@
 import { useState } from "react";
 import { Menu, Modal } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
-import { Check, ChevronDown, Copy, ExternalLink, FileText, Info, MoreHorizontal, Palette, TriangleAlert } from "lucide-react";
+import { Check, ChevronDown, CircleDot, Copy, ExternalLink, FileText, Info, MoreHorizontal, Palette, TriangleAlert } from "lucide-react";
 import { AnimatePresence, motion } from "motion/react";
 import { Button } from "@/components/ui/button";
 import { DownloadAfter, DownloadButton, Provenance, UnitsMenu, menuStyles, sizeText, unitsChanged, unitsLabel, unitsTag, upChanged, upTag, type ResultProps } from "@/components/controls";
@@ -76,9 +76,31 @@ function Row({ children, tone = "plain" }: { children: React.ReactNode; tone?: "
 
 /** What was left out or can be added: nothing when the conversion is complete. */
 function Notes({ summary: s, onKeepLoose, onAddMtl }: { summary: Summary; onKeepLoose: (keep: boolean) => void; onAddMtl: () => void }) {
-  if (!(s.leftOut.length > 0 || s.loosePoints || s.needsMtl || s.notIncluded.length > 0)) return null;
+  const any =
+    s.leftOut.length > 0 ||
+    s.loosePoints ||
+    s.needsMtl ||
+    s.notIncluded.length > 0 ||
+    s.missing.length > 0 ||
+    s.unreadable.length > 0 ||
+    s.notUsed.length > 0 ||
+    s.textureColors ||
+    s.curves.length > 0;
+  if (!any) return null;
   return (
     <ul className="m-0 flex list-none flex-col gap-1.5 p-0 pt-3">
+      {s.missing.length > 0 && (
+        <Row tone="warn">
+          <TriangleAlert className="size-4 shrink-0 text-warn" />
+          <span className="min-w-0 flex-1">Missing: {s.missing.join(", ")}</span>
+        </Row>
+      )}
+      {s.unreadable.length > 0 && (
+        <Row tone="warn">
+          <TriangleAlert className="size-4 shrink-0 text-warn" />
+          <span className="min-w-0 flex-1">Unreadable: {s.unreadable.join(", ")}</span>
+        </Row>
+      )}
       {s.leftOut.length > 0 && (
         <Row tone="warn">
           <TriangleAlert className="size-4 shrink-0 text-warn" />
@@ -104,7 +126,20 @@ function Notes({ summary: s, onKeepLoose, onAddMtl }: { summary: Summary; onKeep
           </Button>
         </Row>
       )}
+      {s.curves.length > 0 && (
+        <Row>
+          <CircleDot className="size-4 shrink-0 text-accent" />
+          <span className="min-w-0 flex-1">Curved surfaces: {s.curves.join(", ")}</span>
+        </Row>
+      )}
+      {s.textureColors && (
+        <Row>
+          <Palette className="size-4 shrink-0 text-accent" />
+          <span className="min-w-0 flex-1">Texture colors, approximate</span>
+        </Row>
+      )}
       {s.notIncluded.length > 0 && <Row tone="muted">Not included: {s.notIncluded.join(", ")}</Row>}
+      {s.notUsed.length > 0 && <Row tone="muted">Not used: {s.notUsed.join(", ")}</Row>}
     </ul>
   );
 }
@@ -212,12 +247,15 @@ function ValueMenu<T extends string>({
   options,
   onPick,
   disabled,
+  children,
 }: {
   label: string;
   value: T;
   options: { value: T; label: string; beta?: boolean }[];
   onPick: (v: T) => void;
   disabled?: boolean;
+  /** More items, after the options. */
+  children?: React.ReactNode;
 }) {
   return (
     <Menu position="bottom-start" offset={6} width={200} classNames={menuStyles}>
@@ -235,6 +273,7 @@ function ValueMenu<T extends string>({
             {o.beta && <span className="ml-1.5 rounded-[2px] bg-warn-soft px-1 py-px text-[10.5px] font-medium text-warn">beta</span>}
           </Menu.Item>
         ))}
+        {children}
       </Menu.Dropdown>
     </Menu>
   );
@@ -302,7 +341,12 @@ export function ResultCard(p: ResultProps) {
             </Line>
           )}
           <Line label="Format" aside={<span className="num text-[12px] text-fg-3">{bytes(report.output.bytes)}</span>}>
-            <ValueMenu label="Format" value={p.format} options={FORMATS} onPick={p.onFormat} disabled={p.busy !== null} />
+            <ValueMenu label="Format" value={p.format} options={FORMATS} onPick={p.onFormat} disabled={p.busy !== null}>
+              <Menu.Divider />
+              <Menu.Item onClick={() => p.onCurves(!p.curves)} rightSection={p.curves ? <Check className="size-3.5" /> : null}>
+                Curved surfaces
+              </Menu.Item>
+            </ValueMenu>
           </Line>
         </dl>
 

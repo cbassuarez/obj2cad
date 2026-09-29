@@ -10,7 +10,10 @@ use proptest::prelude::*;
 fn coordinate() -> impl Strategy<Value = (f64, String)> {
     prop_oneof![
         // Shortest round-trip form of an arbitrary finite double.
-        any::<u64>().prop_map(f64::from_bits).prop_filter("finite", |v| v.is_finite()).prop_map(|v| (v, format!("{v:?}"))),
+        any::<u64>()
+            .prop_map(f64::from_bits)
+            .prop_filter("finite", |v| v.is_finite())
+            .prop_map(|v| (v, format!("{v:?}"))),
         // Fixed 6 decimals, like most exporters.
         (-1e6f64..1e6).prop_map(|v| {
             let t = format!("{v:.6}");
@@ -32,11 +35,13 @@ struct Model {
 }
 
 fn model() -> impl Strategy<Value = Model> {
-    prop::collection::vec([coordinate(), coordinate(), coordinate()], 3..40).prop_flat_map(|vertices| {
-        let n = vertices.len();
-        let faces = prop::collection::vec(prop::collection::vec(0..n, 3..7), 0..30);
-        (Just(vertices), faces).prop_map(|(vertices, faces)| Model { vertices, faces })
-    })
+    prop::collection::vec([coordinate(), coordinate(), coordinate()], 3..40).prop_flat_map(
+        |vertices| {
+            let n = vertices.len();
+            let faces = prop::collection::vec(prop::collection::vec(0..n, 3..7), 0..30);
+            (Just(vertices), faces).prop_map(|(vertices, faces)| Model { vertices, faces })
+        },
+    )
 }
 
 /// Ways to write the same file that must not change what it means.
@@ -51,16 +56,24 @@ struct Style {
 }
 
 fn style() -> impl Strategy<Value = Style> {
-    (any::<bool>(), any::<bool>(), any::<bool>(), any::<bool>(), any::<bool>(), any::<bool>()).prop_map(
-        |(crlf, bom, negative_indices, faces_first, comments, continuation)| Style {
-            crlf,
-            bom,
-            negative_indices: negative_indices && !faces_first,
-            faces_first,
-            comments,
-            continuation,
-        },
+    (
+        any::<bool>(),
+        any::<bool>(),
+        any::<bool>(),
+        any::<bool>(),
+        any::<bool>(),
+        any::<bool>(),
     )
+        .prop_map(
+            |(crlf, bom, negative_indices, faces_first, comments, continuation)| Style {
+                crlf,
+                bom,
+                negative_indices: negative_indices && !faces_first,
+                faces_first,
+                comments,
+                continuation,
+            },
+        )
 }
 
 fn render(m: &Model, s: Style) -> Vec<u8> {
@@ -76,10 +89,20 @@ fn render(m: &Model, s: Style) -> Vec<u8> {
     for face in &m.faces {
         let refs: Vec<String> = face
             .iter()
-            .map(|&i| if s.negative_indices { format!("-{}", m.vertices.len() - i) } else { (i + 1).to_string() })
+            .map(|&i| {
+                if s.negative_indices {
+                    format!("-{}", m.vertices.len() - i)
+                } else {
+                    (i + 1).to_string()
+                }
+            })
             .collect();
         if s.continuation && refs.len() > 3 {
-            f += &format!("f {} \\{nl} {}{nl}", refs[..2].join(" "), refs[2..].join(" "));
+            f += &format!(
+                "f {} \\{nl} {}{nl}",
+                refs[..2].join(" "),
+                refs[2..].join(" ")
+            );
         } else {
             f += &format!("f {}{nl}", refs.join(" "));
         }
@@ -120,9 +143,9 @@ proptest! {
         let doc = parse(&render(&m, s)).expect("valid file");
         prop_assert_eq!(doc.positions.len(), m.vertices.len());
         for (i, v) in m.vertices.iter().enumerate() {
-            for a in 0..3 {
-                prop_assert_eq!(doc.positions[i][a].to_bits(), v[a].0.to_bits(), "vertex {} axis {}", i, a);
-                prop_assert_eq!(doc.coord_text(i, a), v[a].1.as_str());
+            for (a, (value, text)) in v.iter().enumerate() {
+                prop_assert_eq!(doc.positions[i][a].to_bits(), value.to_bits(), "vertex {} axis {}", i, a);
+                prop_assert_eq!(doc.coord_text(i, a), text.as_str());
             }
         }
         let faces: Vec<Vec<usize>> = doc.faces.iter().map(|f| f.iter().map(|&i| i as usize).collect()).collect();
@@ -135,6 +158,8 @@ proptest! {
         let text = String::from_utf8(render(&m, Style { crlf: false, bom: false, negative_indices: false, faces_first: false, comments: false, continuation: false })).unwrap();
         let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
         let i = line.index(lines.len());
+        // A BOM at the very start of the file is an encoding marker, not content.
+        prop_assume!(!(i == 0 && hidden == "\u{feff}"));
         lines[i] = format!("{hidden}{}", lines[i]);
         let err = parse(lines.join("\n").as_bytes()).expect_err("hidden characters must not parse");
         prop_assert_eq!(err.kind, ErrorKind::HiddenCharacters);

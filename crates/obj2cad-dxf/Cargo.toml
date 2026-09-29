@@ -9,5 +9,6 @@ rust-version.workspace = true
 
 [dependencies]
 obj2cad-core.workspace = true
+obj2cad-acis.workspace = true
 ryu.workspace = true
 itoa = "1"

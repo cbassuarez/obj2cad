@@ -38,6 +38,8 @@ export interface ResultProps {
   unitsStated: boolean;
   houseUnits: Units | null;
   includeName: boolean;
+  /** Also write recognized curved surfaces. */
+  curves: boolean;
   edges: boolean;
   ortho: boolean;
   /** Layers hidden in the viewer, and how many layers have geometry. */
@@ -49,6 +51,7 @@ export interface ResultProps {
   onKeepLoose: (keep: boolean) => void;
   onFormat: (f: Format) => void;
   onIncludeName: (on: boolean) => void;
+  onCurves: (on: boolean) => void;
   onEdges: (on: boolean) => void;
   onView: (v: ViewName) => void;
   onOrtho: (on: boolean) => void;

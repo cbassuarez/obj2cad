@@ -52,6 +52,8 @@ export function explain(f: Failure | { kind: "empty" }): Explained {
           return { ...withLines, title: `${at} has invisible characters`, action: "Export again, or delete them in a text editor." };
         case "encoding":
           return { ...withLines, title: "The file is saved as UTF-16 text", action: "Save or export it as UTF-8." };
+        case "ambiguous_columns":
+          return { ...withLines, title: `${at} has columns that could mean two things`, action: "Export the point cloud as x y z, or x y z r g b." };
         case "too_large":
           return { ...withLines, title: "Too large for the browser version", action: "Use the command-line version.", cli: true };
         default:

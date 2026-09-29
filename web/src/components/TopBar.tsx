@@ -12,7 +12,8 @@ export interface FileInfo {
   name: string;
   size: number;
   exporter: string | null;
-  mtl: string | null;
+  /** Files the drawing was made from. */
+  files: number;
 }
 
 export function TopBar({
@@ -34,7 +35,7 @@ export function TopBar({
   watch: boolean | null;
   onWatch: (on: boolean) => void;
 }) {
-  const meta = file && [bytes(file.size), file.exporter, file.mtl ? "+ mtl" : null].filter(Boolean).join(" · ");
+  const meta = file && [bytes(file.size), file.exporter, file.files > 1 ? `${file.files} files` : null].filter(Boolean).join(" · ");
   return (
     <header className="pointer-events-none absolute inset-x-0 top-0 z-20 flex items-start gap-2 p-4">
       <div className="panel pointer-events-auto flex h-11 shrink-0 items-center gap-2.5 pr-4 pl-3">

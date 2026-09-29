@@ -23,12 +23,71 @@ jobs:
       released: ${{ steps.rp.outputs.release_created }}
       version: ${{ steps.rp.outputs.version }}
       tag: ${{ steps.rp.outputs.tag_name }}
+    env:
+      # Pull requests opened with the default token don't trigger CI. With a GitHub App
+      # (secrets RELEASE_APP_ID and RELEASE_APP_PRIVATE_KEY), the release PR is verified
+      # like any other.
+      HAS_APP: ${{ secrets.RELEASE_APP_ID != '' }}
     steps:
-      - id: rp
-        uses: googleapis/release-please-action@v4
+      - id: app
+        if: env.HAS_APP == 'true'
+        uses: actions/create-github-app-token@v1
         with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+      - id: rp
+        uses: googleapis/release-please-action@v5
+        with:
+          token: ${{ steps.app.outputs.token || github.token }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+
+  cli:
+    name: CLI (${{ matrix.target }})
+    needs: release-please
+    if: needs.release-please.outputs.released == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, exe: obj2cad }
+          - { os: macos-latest, target: aarch64-apple-darwin, exe: obj2cad }
+          - { os: macos-13, target: x86_64-apple-darwin, exe: obj2cad }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, exe: obj2cad.exe }
+    runs-on: ${{ matrix.os }}
+    env:
+      VERSION: ${{ needs.release-please.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: python tools/vendor/fetch_acadrust.py
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p obj2cad-cli
+      - name: Verify (parity harness)
+        run: |
+          pip install -r tests/harness/requirements.txt
+          python tests/harness/parity.py --up auto tests/fixtures
+          python tests/harness/parity.py --up auto --format dwg tests/fixtures
+      - name: Package
+        shell: bash
+        run: |
+          name=obj2cad-cli-$VERSION-${{ matrix.target }}
+          mkdir "$name"
+          cp target/release/${{ matrix.exe }} README.md LICENSE "$name/"
+          if [ "${{ runner.os }}" = "Windows" ]; then 7z a "$name.zip" "$name" > /dev/null; else tar czf "$name.tar.gz" "$name"; fi
+          rm -rf "$name"
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: obj2cad-cli-*
+      - name: Upload
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.release-please.outputs.tag }}
+        run: gh release upload "$TAG" obj2cad-cli-* --clobber
 
   deploy:
     needs: release-please
@@ -37,16 +96,16 @@ jobs:
     env:
       VERSION: ${{ needs.release-please.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
           tool: wasm-bindgen-cli@0.2.129
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
           cache: npm
@@ -54,6 +113,7 @@ jobs:
 
       - name: Verify (tests + parity harness)
         run: |
+          python tools/vendor/fetch_acadrust.py
           cargo test --workspace
           cargo build --release -p obj2cad-cli
           pip install -r tests/harness/requirements.txt
@@ -104,7 +164,7 @@ jobs:
           sha256sum obj2cad-web-$VERSION.tar.gz sbom.spdx.json > SHA256SUMS
           gh release upload "$TAG" obj2cad-web-$VERSION.tar.gz sbom.spdx.json SHA256SUMS --clobber
 
-      - uses: actions/attest-build-provenance@v2
+      - uses: actions/attest-build-provenance@v4
         with:
           subject-path: obj2cad-web-${{ env.VERSION }}.tar.gz
 

@@ -38,6 +38,7 @@ export function Workspace({
   onLayerMode,
   onFormat,
   onIncludeName,
+  onCurves,
   onDownload,
   onHidden,
   onDownloadReport,
@@ -61,6 +62,7 @@ export function Workspace({
   onLayerMode: (m: LayerMode) => void;
   onFormat: (f: Format) => void;
   onIncludeName: (on: boolean) => void;
+  onCurves: (on: boolean) => void;
   onDownload: (pick: boolean) => void;
   /** Layers were left out or put back (their names): the download changes with them. */
   onHidden: (names: string[]) => void;
@@ -124,7 +126,7 @@ export function Workspace({
   const changeHidden = (next: Set<number>) => onHidden(report.layers.filter((_, i) => next.has(i)).map((l) => l.name));
 
   const available = preview?.buffers.available ?? true;
-  const layerCount = report.layers.filter((l) => l.faces + l.polylines + l.points > 0).length;
+  const layerCount = report.layers.filter((l) => l.faces + l.polylines + l.points + l.surfaces > 0).length;
   /** The download, as the button and the keyboard make it: hidden layers left out. */
   const download = (pickLocation: boolean) => {
     if (busy === null && hidden.size < layerCount) onDownload(pickLocation);
@@ -159,6 +161,7 @@ export function Workspace({
     unitsStated: inspection?.hints.units_source === "exporter",
     houseUnits: prefs.houseUnits,
     includeName: prefs.includeName,
+    curves: prefs.curves,
     edges,
     ortho,
     hiddenCount: hidden.size,
@@ -169,6 +172,7 @@ export function Workspace({
     onKeepLoose,
     onFormat,
     onIncludeName,
+    onCurves,
     onEdges: setEdges,
     onView: (v) => viewer.current?.setView(v),
     onOrtho,

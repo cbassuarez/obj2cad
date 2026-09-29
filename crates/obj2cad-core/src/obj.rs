@@ -45,6 +45,8 @@ pub enum ErrorKind {
     Encoding,
     /// More than 4 billion references or 4 GB of coordinate text.
     TooLarge,
+    /// A point cloud's extra columns could mean more than one thing.
+    AmbiguousColumns,
 }
 
 /// One problem found while parsing.
@@ -71,7 +73,11 @@ pub struct ParseError {
 impl ParseError {
     /// Every reported problem, first one included.
     pub fn issues(&self) -> Vec<ParseIssue> {
-        let mut all = vec![ParseIssue { line: self.line, kind: self.kind, message: self.message.clone() }];
+        let mut all = vec![ParseIssue {
+            line: self.line,
+            kind: self.kind,
+            message: self.message.clone(),
+        }];
         all.extend(self.more.iter().cloned());
         all
     }
@@ -105,7 +111,23 @@ pub struct Elements {
 
 impl Elements {
     fn new() -> Self {
-        Self { offsets: vec![0], ..Default::default() }
+        Self::empty()
+    }
+
+    pub(crate) fn empty() -> Self {
+        Self {
+            offsets: vec![0],
+            ..Default::default()
+        }
+    }
+
+    pub(crate) fn push_element(
+        &mut self,
+        indices: &[u32],
+        attr: u32,
+        line: u64,
+    ) -> Result<(), ParseIssue> {
+        self.push(indices, attr, line)
     }
 
     pub fn len(&self) -> usize {
@@ -184,15 +206,42 @@ pub struct ObjDocument {
     pub header_comments: Vec<String>,
     pub counts: SourceCounts,
     pub diagnostics: Vec<Diagnostic>,
-    coord_text: Vec<u8>,
-    coord_offsets: Vec<u32>,
+    /// Texture coordinates (`vt` u, v), kept for coloring faces from textures.
+    pub texcoords: Vec<[f32; 2]>,
+    /// Vertex weights (`v x y z w`) for rational curves; empty when every weight is 1.
+    pub weights: Vec<f64>,
+    /// Free-form curves that convert exactly (see [`FreeformCurve`]).
+    pub curves: Vec<FreeformCurve>,
+    /// Texture coordinate of each face corner, parallel to `faces.indices`
+    /// ([`NO_UV`] where a corner has none). Empty when no face uses texture coordinates.
+    pub face_uvs: Vec<u32>,
+    pub(crate) coord_text: Vec<u8>,
+    pub(crate) coord_offsets: Vec<u32>,
+}
+
+/// A face corner without a texture coordinate.
+pub const NO_UV: u32 = u32::MAX;
+
+/// A free-form curve (`cstype`, `deg`, `curv`, `parm u`, `end`) as a B-spline: Bézier
+/// curves are written as B-splines with their segment breaks as knots (exact).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FreeformCurve {
+    pub degree: u32,
+    pub rational: bool,
+    /// Control vertices (0-based indices into `positions`).
+    pub control: Vec<u32>,
+    pub knots: Vec<f64>,
+    /// Index into [`ObjDocument::attrs`].
+    pub attr: u32,
+    pub line: u64,
 }
 
 impl ObjDocument {
     /// The exact source text of coordinate `axis` (0..3) of vertex `v`.
     pub fn coord_text(&self, v: usize, axis: usize) -> &str {
         let k = v * 3 + axis;
-        let s = &self.coord_text[self.coord_offsets[k] as usize..self.coord_offsets[k + 1] as usize];
+        let s =
+            &self.coord_text[self.coord_offsets[k] as usize..self.coord_offsets[k + 1] as usize];
         // Only ASCII number tokens that parsed successfully are stored.
         std::str::from_utf8(s).expect("coordinate text is ASCII")
     }
@@ -203,16 +252,46 @@ impl ObjDocument {
 }
 
 const FREEFORM: &[&str] = &[
-    "cstype", "deg", "bmat", "step", "curv", "curv2", "surf", "parm", "trim", "hole", "scrv", "sp", "end", "con",
-    "mg",
+    "cstype", "deg", "bmat", "step", "curv", "curv2", "surf", "parm", "trim", "hole", "scrv", "sp",
+    "end", "con", "mg",
 ];
 const RENDER: &[&str] = &[
-    "usemap", "maplib", "lod", "bevel", "c_interp", "d_interp", "shadow_obj", "trace_obj", "ctech", "stech",
+    "usemap",
+    "maplib",
+    "lod",
+    "bevel",
+    "c_interp",
+    "d_interp",
+    "shadow_obj",
+    "trace_obj",
+    "ctech",
+    "stech",
 ];
-const CORE: &[&str] = &["v", "vt", "vn", "vp", "f", "fo", "l", "p", "o", "g", "s", "usemtl", "mtllib"];
+const CORE: &[&str] = &[
+    "v", "vt", "vn", "vp", "f", "fo", "l", "p", "o", "g", "s", "usemtl", "mtllib",
+];
 
 fn is_keyword(kw: &[u8]) -> bool {
-    CORE.iter().chain(FREEFORM).chain(RENDER).any(|k| k.as_bytes() == kw)
+    CORE.iter()
+        .chain(FREEFORM)
+        .chain(RENDER)
+        .any(|k| k.as_bytes() == kw)
+}
+
+/// Free-form state: the current `cstype` and `deg`, and a `curv` waiting for its `end`.
+#[derive(Default)]
+struct Freeform {
+    /// (rational, kind): kind is `bspline`, `bezier`, or another (unsupported) type.
+    cstype: Option<(bool, Vec<u8>)>,
+    degree: Option<u32>,
+    pending: Option<PendingCurve>,
+}
+
+struct PendingCurve {
+    range: (f64, f64),
+    control: Vec<u32>,
+    parm: Option<Vec<f64>>,
+    line: u64,
 }
 
 /// Deferred check for an index that pointed past the elements defined so far. The OBJ
@@ -251,6 +330,8 @@ struct Parser {
     current_attr_id: Option<u32>,
     in_header: bool,
     scratch: Vec<u32>,
+    scratch_uv: Vec<u32>,
+    freeform: Freeform,
     objects: Names,
     groups: Names,
     materials: Names,
@@ -263,7 +344,10 @@ pub fn parse(src: &[u8]) -> Result<ObjDocument, ParseError> {
 }
 
 /// [`parse`], calling `progress(bytes_done, bytes_total)` about every 8 MiB.
-pub fn parse_with_progress(src: &[u8], mut progress: impl FnMut(usize, usize)) -> Result<ObjDocument, ParseError> {
+pub fn parse_with_progress(
+    src: &[u8],
+    mut progress: impl FnMut(usize, usize),
+) -> Result<ObjDocument, ParseError> {
     if src.starts_with(b"\xFF\xFE") || src.starts_with(b"\xFE\xFF") {
         return Err(ParseError {
             line: 1,
@@ -277,14 +361,25 @@ pub fn parse_with_progress(src: &[u8], mut progress: impl FnMut(usize, usize)) -
     let src = src.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(src);
 
     let mut p = Parser {
-        doc: ObjDocument { faces: Elements::new(), lines: Elements::new(), points: Elements::new(), ..Default::default() },
+        doc: ObjDocument {
+            faces: Elements::new(),
+            lines: Elements::new(),
+            points: Elements::new(),
+            ..Default::default()
+        },
         diags: Diagnostics::default(),
         line: 0,
         attrs_lookup: HashMap::new(),
-        current: ElementAttrs { object: None, group: None, material: None },
+        current: ElementAttrs {
+            object: None,
+            group: None,
+            material: None,
+        },
         current_attr_id: None,
         in_header: true,
         scratch: Vec::new(),
+        scratch_uv: Vec::new(),
+        freeform: Freeform::default(),
         objects: Names::default(),
         groups: Names::default(),
         materials: Names::default(),
@@ -295,7 +390,11 @@ pub fn parse_with_progress(src: &[u8], mut progress: impl FnMut(usize, usize)) -
     let mut issues: Vec<ParseIssue> = Vec::new();
     let mut truncated = false;
     // Old Mac files end lines with CR alone.
-    let sep = if memchr::memchr(b'\n', src).is_none() && memchr::memchr(b'\r', src).is_some() { b'\r' } else { b'\n' };
+    let sep = if memchr::memchr(b'\n', src).is_none() && memchr::memchr(b'\r', src).is_some() {
+        b'\r'
+    } else {
+        b'\n'
+    };
     const STEP: usize = 8 << 20;
     let mut next_report = STEP;
     let mut logical: Vec<u8> = Vec::new();
@@ -349,14 +448,22 @@ pub fn parse_with_progress(src: &[u8], mut progress: impl FnMut(usize, usize)) -
     progress(src.len(), src.len());
 
     // Forward references must exist by the end of the file.
-    let totals = [p.doc.positions.len() as u64, p.doc.counts.texcoords, p.doc.counts.normals];
+    let totals = [
+        p.doc.positions.len() as u64,
+        p.doc.counts.texcoords,
+        p.doc.counts.normals,
+    ];
     for f in &p.forward {
         if u64::from(f.index) >= totals[f.slot] && issues.len() < MAX_ISSUES {
             let what = ["vertex", "texture", "normal"][f.slot];
             issues.push(ParseIssue {
                 line: f.line,
                 kind: ErrorKind::IndexOutOfRange,
-                message: format!("{what} index {} is out of range (the file defines {})", f.index + 1, totals[f.slot]),
+                message: format!(
+                    "{what} index {} is out of range (the file defines {})",
+                    f.index + 1,
+                    totals[f.slot]
+                ),
             });
         }
     }
@@ -364,13 +471,32 @@ pub fn parse_with_progress(src: &[u8], mut progress: impl FnMut(usize, usize)) -
     if !issues.is_empty() {
         issues.sort_by_key(|i| i.line);
         let first = issues.remove(0);
-        return Err(ParseError { line: first.line, kind: first.kind, message: first.message, more: issues, truncated });
+        return Err(ParseError {
+            line: first.line,
+            kind: first.kind,
+            message: first.message,
+            more: issues,
+            truncated,
+        });
+    }
+
+    // A curve still waiting for its `end` is left out, never silently.
+    if let Some(c) = p.freeform.pending.take() {
+        p.diags.push(
+            Severity::Warning,
+            Code::FreeformNotConverted,
+            c.line,
+            || "free-form curve left out: no `end`".into(),
+        );
     }
 
     let has_color = p.doc.counts.vertices_with_color;
     if has_color > 0 && has_color < p.doc.positions.len() as u64 {
         let total = p.doc.positions.len();
-        p.diags.push(Severity::Warning, Code::PartialVertexColors, 0, || format!("{has_color} of {total} vertices have colors"));
+        p.diags
+            .push(Severity::Warning, Code::PartialVertexColors, 0, || {
+                format!("{has_color} of {total} vertices have colors")
+            });
     }
     p.doc.objects = std::mem::take(&mut p.objects.list);
     p.doc.groups = std::mem::take(&mut p.groups.list);
@@ -389,7 +515,11 @@ fn tokens(text: &[u8]) -> impl Iterator<Item = &[u8]> {
 
 impl Parser {
     fn issue<T>(&self, kind: ErrorKind, message: impl Into<String>) -> Result<T, ParseIssue> {
-        Err(ParseIssue { line: self.line, kind, message: message.into() })
+        Err(ParseIssue {
+            line: self.line,
+            kind,
+            message: message.into(),
+        })
     }
 
     fn text(&mut self, bytes: &[u8]) -> String {
@@ -397,9 +527,10 @@ impl Parser {
             Ok(s) => s.to_owned(),
             Err(_) => {
                 let line = self.line;
-                self.diags.push(Severity::Warning, Code::NonUtf8Text, line, || {
-                    "names are not valid UTF-8; invalid bytes were replaced with U+FFFD".into()
-                });
+                self.diags
+                    .push(Severity::Warning, Code::NonUtf8Text, line, || {
+                        "names are not valid UTF-8; invalid bytes were replaced with U+FFFD".into()
+                    });
                 String::from_utf8_lossy(bytes).into_owned()
             }
         }
@@ -420,10 +551,11 @@ impl Parser {
         }
         self.in_header = false;
         // Strip a trailing comment that starts at a token boundary.
-        let body = match memchr::memchr_iter(b'#', trimmed).find(|&i| i > 0 && is_space(trimmed[i - 1])) {
-            Some(i) => trim(&trimmed[..i]),
-            None => trimmed,
-        };
+        let body =
+            match memchr::memchr_iter(b'#', trimmed).find(|&i| i > 0 && is_space(trimmed[i - 1])) {
+                Some(i) => trim(&trimmed[..i]),
+                None => trimmed,
+            };
         let kw_end = body.iter().position(|&b| is_space(b)).unwrap_or(body.len());
         let kw = &body[..kw_end];
         let rest = trim(&body[kw_end..]);
@@ -432,7 +564,24 @@ impl Parser {
             b"v" => self.vertex(rest),
             b"vt" => {
                 self.doc.counts.texcoords += 1;
-                self.numbers(rest, 1, 3, "vt")
+                let mut uv = [0f32; 2];
+                let mut n = 0;
+                for t in tokens(rest) {
+                    let v = self.number(t)?;
+                    if n < 2 {
+                        uv[n] = v as f32;
+                    }
+                    n += 1;
+                }
+                // Keep indices aligned even when the line is rejected below.
+                self.doc.texcoords.push(uv);
+                if !(1..=3).contains(&n) {
+                    return self.issue(
+                        ErrorKind::WrongArity,
+                        format!("`vt` needs 1..=3 numbers, found {n}"),
+                    );
+                }
+                Ok(())
             }
             b"vn" => {
                 self.doc.counts.normals += 1;
@@ -457,9 +606,11 @@ impl Parser {
                 let first = names.next().map(|n| n.to_vec());
                 if names.next().is_some() {
                     let line = self.line;
-                    self.diags.push(Severity::Info, Code::MultipleGroups, line, || {
-                        "elements belong to several groups; the first group names the layer".into()
-                    });
+                    self.diags
+                        .push(Severity::Info, Code::MultipleGroups, line, || {
+                            "elements belong to several groups; the first group names the layer"
+                                .into()
+                        });
                 }
                 let name = match first {
                     Some(n) => self.text(&n),
@@ -477,7 +628,11 @@ impl Parser {
             }
             b"mtllib" => {
                 let all: Vec<&[u8]> = tokens(rest).collect();
-                if !all.is_empty() && all.iter().all(|t| t.to_ascii_lowercase().ends_with(b".mtl")) {
+                if !all.is_empty()
+                    && all
+                        .iter()
+                        .all(|t| t.to_ascii_lowercase().ends_with(b".mtl"))
+                {
                     for t in all {
                         let n = self.text(t);
                         self.doc.mtllibs.push(n);
@@ -493,14 +648,22 @@ impl Parser {
                 self.doc.counts.smoothing_statements += 1;
                 Ok(())
             }
+            b"cstype" | b"deg" | b"curv" | b"parm" | b"end" => {
+                self.doc.counts.freeform_statements += 1;
+                self.freeform_statement(kw, rest)
+            }
             _ => {
                 // A keyword behind invisible bytes (zero-width space, a stray BOM, UTF-16)
                 // must not be skipped: dropping a `v` line would shift every later index.
                 if !kw.iter().all(u8::is_ascii_graphic) {
-                    let visible: Vec<u8> = kw.iter().copied().filter(u8::is_ascii_graphic).collect();
+                    let visible: Vec<u8> =
+                        kw.iter().copied().filter(u8::is_ascii_graphic).collect();
                     if is_keyword(&visible) {
                         let k = String::from_utf8_lossy(&visible).into_owned();
-                        return self.issue(ErrorKind::HiddenCharacters, format!("invisible characters before `{k}`"));
+                        return self.issue(
+                            ErrorKind::HiddenCharacters,
+                            format!("invisible characters before `{k}`"),
+                        );
                     }
                 }
                 let line = self.line;
@@ -517,14 +680,16 @@ impl Parser {
                     });
                 } else if RENDER.iter().any(|k| k.as_bytes() == kw) {
                     self.doc.counts.render_statements += 1;
-                    self.diags.push(Severity::Info, Code::RenderAttributeIgnored, line, || {
-                        format!("render-only statement `{name}` has no CAD equivalent")
-                    });
+                    self.diags
+                        .push(Severity::Info, Code::RenderAttributeIgnored, line, || {
+                            format!("render-only statement `{name}` has no CAD equivalent")
+                        });
                 } else {
                     self.doc.counts.unknown_statements += 1;
-                    self.diags.push(Severity::Warning, Code::UnknownStatement, line, || {
-                        format!("unknown statement `{name}` was skipped")
-                    });
+                    self.diags
+                        .push(Severity::Warning, Code::UnknownStatement, line, || {
+                            format!("unknown statement `{name}` was skipped")
+                        });
                 }
                 Ok(())
             }
@@ -534,14 +699,23 @@ impl Parser {
     fn number(&self, tok: &[u8]) -> Result<f64, ParseIssue> {
         let s = match std::str::from_utf8(tok) {
             Ok(s) => s,
-            Err(_) => return self.issue(ErrorKind::InvalidNumber, "a number contains non-ASCII bytes"),
+            Err(_) => {
+                return self.issue(
+                    ErrorKind::InvalidNumber,
+                    "a number contains non-ASCII bytes",
+                )
+            }
         };
         match s.parse::<f64>() {
             Ok(v) if v.is_finite() => Ok(v),
-            Ok(_) => self.issue(ErrorKind::NonFinite, format!("`{s}` is not a finite number")),
-            Err(_) if s.contains(',') && s.replace(',', ".").parse::<f64>().is_ok() => {
-                self.issue(ErrorKind::CommaDecimal, format!("`{s}` uses a decimal comma"))
-            }
+            Ok(_) => self.issue(
+                ErrorKind::NonFinite,
+                format!("`{s}` is not a finite number"),
+            ),
+            Err(_) if s.contains(',') && s.replace(',', ".").parse::<f64>().is_ok() => self.issue(
+                ErrorKind::CommaDecimal,
+                format!("`{s}` uses a decimal comma"),
+            ),
             Err(_) => self.issue(ErrorKind::InvalidNumber, format!("`{s}` is not a number")),
         }
     }
@@ -553,14 +727,17 @@ impl Parser {
             n += 1;
         }
         if n < min || n > max {
-            return self.issue(ErrorKind::WrongArity, format!("`{what}` needs {min}..={max} numbers, found {n}"));
+            return self.issue(
+                ErrorKind::WrongArity,
+                format!("`{what}` needs {min}..={max} numbers, found {n}"),
+            );
         }
         Ok(())
     }
 
     fn vertex(&mut self, rest: &[u8]) -> Result<(), ParseIssue> {
         match self.read_vertex(rest) {
-            Ok((p, text, color, weighted)) => {
+            Ok((p, text, color, weight)) => {
                 for t in text {
                     self.doc.coord_text.extend_from_slice(t);
                     let end = u32::try_from(self.doc.coord_text.len()).map_err(|_| ParseIssue {
@@ -570,8 +747,14 @@ impl Parser {
                     })?;
                     self.doc.coord_offsets.push(end);
                 }
-                if weighted {
+                if let Some(w) = weight {
                     self.doc.counts.weighted_vertices += 1;
+                    if self.doc.weights.is_empty() {
+                        self.doc.weights.resize(self.doc.positions.len(), 1.0);
+                    }
+                    self.doc.weights.push(w);
+                } else if !self.doc.weights.is_empty() {
+                    self.doc.weights.push(1.0);
                 }
                 if color.is_some() {
                     self.doc.counts.vertices_with_color += 1;
@@ -593,7 +776,10 @@ impl Parser {
     }
 
     #[allow(clippy::type_complexity)]
-    fn read_vertex<'b>(&mut self, rest: &'b [u8]) -> Result<([f64; 3], [&'b [u8]; 3], Option<[f32; 3]>, bool), ParseIssue> {
+    fn read_vertex<'b>(
+        &mut self,
+        rest: &'b [u8],
+    ) -> Result<([f64; 3], [&'b [u8]; 3], Option<[f32; 3]>, Option<f64>), ParseIssue> {
         // No allocation: keep the first 7 tokens, validate any beyond that immediately.
         let mut toks: [&[u8]; 7] = [&[]; 7];
         let mut count = 0usize;
@@ -606,16 +792,19 @@ impl Parser {
             count += 1;
         }
         if count < 3 {
-            return self.issue(ErrorKind::WrongArity, format!("vertex needs at least 3 coordinates, found {count}"));
+            return self.issue(
+                ErrorKind::WrongArity,
+                format!("vertex needs at least 3 coordinates, found {count}"),
+            );
         }
         let mut p = [0.0f64; 3];
         for axis in 0..3 {
             p[axis] = self.number(toks[axis])?;
         }
-        let (mut color, mut weighted) = (None, false);
+        let (mut color, mut weight) = (None, None);
         match count {
             3 => {}
-            4 => weighted = self.number(toks[3])? != 1.0,
+            4 => weight = Some(self.number(toks[3])?).filter(|&w| w != 1.0),
             6 => {
                 let mut c = [0f32; 3];
                 for i in 0..3 {
@@ -628,12 +817,142 @@ impl Parser {
                     self.number(t)?;
                 }
                 let line = self.line;
-                self.diags.push(Severity::Warning, Code::UnusualVertexArity, line, || {
-                    format!("vertex has {n} components; only x y z were used")
-                });
+                self.diags
+                    .push(Severity::Warning, Code::UnusualVertexArity, line, || {
+                        format!("vertex has {n} components; only x y z were used")
+                    });
             }
         }
-        Ok((p, [toks[0], toks[1], toks[2]], color, weighted))
+        Ok((p, [toks[0], toks[1], toks[2]], color, weight))
+    }
+
+    /// `cstype`, `deg`, `curv`, `parm` and `end`. A curve that can't be written exactly
+    /// is left out with a warning; it never fails the file.
+    fn freeform_statement(&mut self, kw: &[u8], rest: &[u8]) -> Result<(), ParseIssue> {
+        let line = self.line;
+        match kw {
+            b"cstype" => {
+                let t: Vec<&[u8]> = tokens(rest).collect();
+                self.freeform.cstype = match t.as_slice() {
+                    [b"rat", k] => Some((true, k.to_vec())),
+                    [k] => Some((false, k.to_vec())),
+                    _ => None,
+                };
+            }
+            b"deg" => {
+                let d: Vec<u32> = tokens(rest)
+                    .filter_map(|t| std::str::from_utf8(t).ok()?.parse().ok())
+                    .collect();
+                self.freeform.degree = d.first().copied();
+            }
+            b"curv" => {
+                self.doc.counts.freeform_curves += 1;
+                let mut t = tokens(rest);
+                let (Some(a), Some(b)) = (t.next(), t.next()) else {
+                    return self.issue(
+                        ErrorKind::WrongArity,
+                        "`curv` needs a parameter range and control vertices",
+                    );
+                };
+                let range = (self.number(a)?, self.number(b)?);
+                let count = self.doc.positions.len() as i64;
+                let mut control = Vec::new();
+                for tok in t {
+                    control.push(self.index(tok, count, 0)?);
+                }
+                self.freeform.pending = Some(PendingCurve {
+                    range,
+                    control,
+                    parm: None,
+                    line,
+                });
+            }
+            b"parm" => {
+                let mut t = tokens(rest);
+                let dir = t.next();
+                let mut values = Vec::new();
+                for tok in t {
+                    values.push(self.number(tok)?);
+                }
+                if let (Some(b"u"), Some(p)) = (dir, self.freeform.pending.as_mut()) {
+                    p.parm = Some(values);
+                }
+            }
+            _ => {
+                // `end`
+                if let Some(p) = self.freeform.pending.take() {
+                    match self.finish_curve(p) {
+                        Ok(c) => self.doc.curves.push(c),
+                        Err(why) => self.diags.push(
+                            Severity::Warning,
+                            Code::FreeformNotConverted,
+                            line,
+                            || format!("free-form curve left out: {why}"),
+                        ),
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Check a finished `curv` and express it as a B-spline, exactly.
+    fn finish_curve(&mut self, p: PendingCurve) -> Result<FreeformCurve, String> {
+        let (rational, kind) = self.freeform.cstype.clone().ok_or("no `cstype`")?;
+        let deg = self.freeform.degree.ok_or("no `deg`")?;
+        let n = p.control.len();
+        if deg == 0 || n < deg as usize + 1 {
+            return Err(format!("degree {deg} needs more than {n} control vertices"));
+        }
+        let parm = p.parm.ok_or("no `parm u`")?;
+        let knots = match kind.as_slice() {
+            b"bspline" => {
+                if parm.len() != n + deg as usize + 1 {
+                    return Err(format!(
+                        "{} knots for {n} control vertices of degree {deg}",
+                        parm.len()
+                    ));
+                }
+                parm
+            }
+            b"bezier" => {
+                // n = segments × deg + 1; `parm` gives the segment breaks.
+                if (n - 1) % deg as usize != 0 || parm.len() != (n - 1) / deg as usize + 1 {
+                    return Err(format!("{n} control vertices and {} breaks don't make Bézier segments of degree {deg}", parm.len()));
+                }
+                let mut k = vec![parm[0]; deg as usize + 1];
+                for &b in &parm[1..parm.len() - 1] {
+                    k.extend(std::iter::repeat_n(b, deg as usize));
+                }
+                k.extend(std::iter::repeat_n(parm[parm.len() - 1], deg as usize + 1));
+                k
+            }
+            other => {
+                return Err(format!(
+                    "`{}` curves aren't supported",
+                    String::from_utf8_lossy(other)
+                ))
+            }
+        };
+        if knots.windows(2).any(|w| w[1] < w[0]) {
+            return Err("knots decrease".into());
+        }
+        // The curve must cover its whole knot domain (trimming would move control points).
+        let (lo, hi) = (knots[deg as usize], knots[n]);
+        if p.range != (lo, hi) {
+            return Err(format!(
+                "the range {}..{} isn't the knot domain {lo}..{hi}",
+                p.range.0, p.range.1
+            ));
+        }
+        Ok(FreeformCurve {
+            degree: deg,
+            rational,
+            control: p.control,
+            knots,
+            attr: self.attr_id(),
+            line: p.line,
+        })
     }
 
     fn attr_id(&mut self) -> u32 {
@@ -650,10 +969,16 @@ impl Parser {
     }
 
     fn element(&mut self, rest: &[u8], kind: Kind) -> Result<(), ParseIssue> {
-        let counts = [self.doc.positions.len() as i64, self.doc.counts.texcoords as i64, self.doc.counts.normals as i64];
+        let counts = [
+            self.doc.positions.len() as i64,
+            self.doc.counts.texcoords as i64,
+            self.doc.counts.normals as i64,
+        ];
         let mut idx = std::mem::take(&mut self.scratch);
         idx.clear();
-        let result = self.references(rest, counts, &mut idx);
+        let mut uvs = std::mem::take(&mut self.scratch_uv);
+        uvs.clear();
+        let result = self.references(rest, counts, &mut idx, &mut uvs);
         let line = self.line;
         let outcome = result.and_then(|()| {
             let attr = self.attr_id();
@@ -661,53 +986,82 @@ impl Parser {
                 Kind::Face => {
                     if idx.len() < 3 {
                         self.doc.counts.faces_skipped += 1;
-                        self.diags.push(Severity::Warning, Code::FaceTooSmall, line, || {
-                            "face with fewer than 3 vertices was skipped".into()
-                        });
+                        self.diags
+                            .push(Severity::Warning, Code::FaceTooSmall, line, || {
+                                "face with fewer than 3 vertices was skipped".into()
+                            });
                         Ok(())
                     } else {
                         if has_repeat(&idx) {
-                            self.diags.push(Severity::Warning, Code::FaceRepeatedVertex, line, || {
-                                "face uses the same vertex more than once (kept as-is)".into()
-                            });
+                            self.diags.push(
+                                Severity::Warning,
+                                Code::FaceRepeatedVertex,
+                                line,
+                                || "face uses the same vertex more than once (kept as-is)".into(),
+                            );
+                        }
+                        let before = self.doc.faces.indices.len();
+                        if uvs.iter().any(|&u| u != NO_UV) && self.doc.face_uvs.is_empty() {
+                            self.doc.face_uvs.resize(before, NO_UV);
+                        }
+                        if !self.doc.face_uvs.is_empty() {
+                            self.doc.face_uvs.extend_from_slice(&uvs);
                         }
                         self.doc.faces.push(&idx, attr, line)
                     }
                 }
-                Kind::Line if idx.len() < 2 => {
-                    self.issue(ErrorKind::ElementTooShort, "line element needs at least 2 vertices")
-                }
+                Kind::Line if idx.len() < 2 => self.issue(
+                    ErrorKind::ElementTooShort,
+                    "line element needs at least 2 vertices",
+                ),
                 Kind::Line => self.doc.lines.push(&idx, attr, line),
-                Kind::Point if idx.is_empty() => {
-                    self.issue(ErrorKind::ElementTooShort, "point element needs at least 1 vertex")
-                }
+                Kind::Point if idx.is_empty() => self.issue(
+                    ErrorKind::ElementTooShort,
+                    "point element needs at least 1 vertex",
+                ),
                 Kind::Point => self.doc.points.push(&idx, attr, line),
             }
         });
         self.scratch = idx;
+        self.scratch_uv = uvs;
         outcome
     }
 
-    fn references(&mut self, rest: &[u8], counts: [i64; 3], idx: &mut Vec<u32>) -> Result<(), ParseIssue> {
+    fn references(
+        &mut self,
+        rest: &[u8],
+        counts: [i64; 3],
+        idx: &mut Vec<u32>,
+        uvs: &mut Vec<u32>,
+    ) -> Result<(), ParseIssue> {
         for tok in tokens(rest) {
+            uvs.push(NO_UV);
             let mut parts = tok.split(|&b| b == b'/');
             for (slot, &count) in counts.iter().enumerate() {
                 let Some(part) = parts.next() else { break };
                 if part.is_empty() {
                     if slot == 0 {
                         let t = String::from_utf8_lossy(tok);
-                        return self.issue(ErrorKind::MalformedReference, format!("`{t}` has no vertex index"));
+                        return self.issue(
+                            ErrorKind::MalformedReference,
+                            format!("`{t}` has no vertex index"),
+                        );
                     }
                     continue;
                 }
                 let resolved = self.index(part, count, slot)?;
-                if slot == 0 {
-                    idx.push(resolved);
+                match slot {
+                    0 => idx.push(resolved),
+                    1 => *uvs.last_mut().expect("pushed above") = resolved,
+                    _ => {}
                 }
             }
             if parts.next().is_some() {
                 let t = String::from_utf8_lossy(tok);
-                return self.issue(ErrorKind::MalformedReference, format!("`{t}` has too many `/` parts"));
+                return self.issue(
+                    ErrorKind::MalformedReference,
+                    format!("`{t}` has too many `/` parts"),
+                );
             }
         }
         Ok(())
@@ -719,23 +1073,39 @@ impl Parser {
         let what = ["vertex", "texture", "normal"][slot];
         let Some(i) = parse_index(tok) else {
             let t = String::from_utf8_lossy(tok);
-            return self.issue(ErrorKind::InvalidIndex, format!("`{t}` is not a valid {what} index"));
+            return self.issue(
+                ErrorKind::InvalidIndex,
+                format!("`{t}` is not a valid {what} index"),
+            );
         };
         if i == 0 {
-            return self.issue(ErrorKind::IndexZero, format!("{what} index 0 is invalid (OBJ indices start at 1)"));
+            return self.issue(
+                ErrorKind::IndexZero,
+                format!("{what} index 0 is invalid (OBJ indices start at 1)"),
+            );
         }
         if i < 0 {
             let resolved = count + i;
             if resolved < 0 {
-                return self.issue(ErrorKind::IndexOutOfRange, format!("{what} index {i} is out of range ({count} defined so far)"));
+                return self.issue(
+                    ErrorKind::IndexOutOfRange,
+                    format!("{what} index {i} is out of range ({count} defined so far)"),
+                );
             }
             return Ok(resolved as u32);
         }
         let Ok(resolved) = u32::try_from(i - 1) else {
-            return self.issue(ErrorKind::IndexOutOfRange, format!("{what} index {i} is out of range"));
+            return self.issue(
+                ErrorKind::IndexOutOfRange,
+                format!("{what} index {i} is out of range"),
+            );
         };
         if i > count {
-            self.forward.push(Forward { line: self.line, index: resolved, slot });
+            self.forward.push(Forward {
+                line: self.line,
+                index: resolved,
+                slot,
+            });
         }
         Ok(resolved)
     }
@@ -783,7 +1153,10 @@ fn has_repeat(idx: &[u32]) -> bool {
 
 fn trim(b: &[u8]) -> &[u8] {
     let start = b.iter().position(|&c| !is_space(c)).unwrap_or(b.len());
-    let end = b.iter().rposition(|&c| !is_space(c)).map_or(start, |e| e + 1);
+    let end = b
+        .iter()
+        .rposition(|&c| !is_space(c))
+        .map_or(start, |e| e + 1);
     &b[start..end]
 }
 
@@ -800,7 +1173,10 @@ mod tests {
         let d = ok("v 0.1 -0.000000 1e-5\nv 1.000000 2 3\nf 1 2 1\n");
         assert_eq!(d.coord_text(0, 0), "0.1");
         assert_eq!(d.coord_text(0, 1), "-0.000000");
-        assert!(d.positions[0][1].is_sign_negative(), "sign of zero is preserved");
+        assert!(
+            d.positions[0][1].is_sign_negative(),
+            "sign of zero is preserved"
+        );
         assert_eq!(d.coord_text(1, 0), "1.000000");
         assert_eq!(d.positions[0][2].to_bits(), 1e-5f64.to_bits());
     }
@@ -819,12 +1195,27 @@ mod tests {
 
     #[test]
     fn rejects_ambiguity() {
-        assert_eq!(parse(b"v 0 0 0\nf 1 2 3\n").unwrap_err().kind, ErrorKind::IndexOutOfRange);
-        assert_eq!(parse(b"v 0 0 0\nf 0 1 1\n").unwrap_err().kind, ErrorKind::IndexZero);
-        assert_eq!(parse(b"v nan 0 0\n").unwrap_err().kind, ErrorKind::NonFinite);
-        assert_eq!(parse(b"v 1e999 0 0\n").unwrap_err().kind, ErrorKind::NonFinite);
+        assert_eq!(
+            parse(b"v 0 0 0\nf 1 2 3\n").unwrap_err().kind,
+            ErrorKind::IndexOutOfRange
+        );
+        assert_eq!(
+            parse(b"v 0 0 0\nf 0 1 1\n").unwrap_err().kind,
+            ErrorKind::IndexZero
+        );
+        assert_eq!(
+            parse(b"v nan 0 0\n").unwrap_err().kind,
+            ErrorKind::NonFinite
+        );
+        assert_eq!(
+            parse(b"v 1e999 0 0\n").unwrap_err().kind,
+            ErrorKind::NonFinite
+        );
         assert_eq!(parse(b"v 1 2\n").unwrap_err().kind, ErrorKind::WrongArity);
-        assert_eq!(parse(b"v 1,5 0 0\n").unwrap_err().kind, ErrorKind::CommaDecimal);
+        assert_eq!(
+            parse(b"v 1,5 0 0\n").unwrap_err().kind,
+            ErrorKind::CommaDecimal
+        );
         let e = parse(b"v 0 0 0\nv 0 0 0\n\nf 1 2 x\n").unwrap_err();
         assert_eq!((e.line, e.kind), (4, ErrorKind::InvalidIndex));
     }
@@ -847,7 +1238,10 @@ mod tests {
         let e = parse("v 0 0 0\n\u{feff}v 1 0 0\n".as_bytes()).unwrap_err();
         assert_eq!(e.kind, ErrorKind::HiddenCharacters);
         // UTF-16 files are rejected up front.
-        assert_eq!(parse(b"\xFF\xFEv\x00 \x000\x00").unwrap_err().kind, ErrorKind::Encoding);
+        assert_eq!(
+            parse(b"\xFF\xFEv\x00 \x000\x00").unwrap_err().kind,
+            ErrorKind::Encoding
+        );
         // Genuinely unknown keywords still only warn.
         assert!(parse(b"frobnicate 1 2\nv 0 0 0\n").is_ok());
     }
@@ -857,7 +1251,14 @@ mod tests {
         let e = parse(b"v 0 0 0\nv 1,5 0 0\nv 0 1 0\nf 1 2 3\nv x 0 0\nf 1 2 9\n").unwrap_err();
         let kinds: Vec<_> = e.issues().iter().map(|i| (i.line, i.kind)).collect();
         // The bad vertex on line 2 doesn't make `f 1 2 3` an index error.
-        assert_eq!(kinds, [(2, ErrorKind::CommaDecimal), (5, ErrorKind::InvalidNumber), (6, ErrorKind::IndexOutOfRange)]);
+        assert_eq!(
+            kinds,
+            [
+                (2, ErrorKind::CommaDecimal),
+                (5, ErrorKind::InvalidNumber),
+                (6, ErrorKind::IndexOutOfRange)
+            ]
+        );
         let many: String = (0..40).map(|_| "v a 0 0\n").collect();
         let e = parse(many.as_bytes()).unwrap_err();
         assert_eq!(e.issues().len(), MAX_ISSUES);
@@ -883,7 +1284,9 @@ mod tests {
 
     #[test]
     fn structure_is_tracked() {
-        let d = ok("mtllib a.mtl\no Chair\nv 0 0 0\nv 1 0 0\nv 0 1 0\ng seat back\nusemtl wood\nf 1 2 3\n");
+        let d = ok(
+            "mtllib a.mtl\no Chair\nv 0 0 0\nv 1 0 0\nv 0 1 0\ng seat back\nusemtl wood\nf 1 2 3\n",
+        );
         let a = d.attrs[d.faces.attr[0] as usize];
         assert_eq!(d.objects[a.object.unwrap() as usize], "Chair");
         assert_eq!(d.groups[a.group.unwrap() as usize], "seat");
@@ -893,33 +1296,64 @@ mod tests {
 
     #[test]
     fn many_objects_intern_quickly() {
-        let src: String = (0..50_000).map(|i| format!("o part{i}\nv 0 0 0\np -1\n")).collect();
+        let src: String = (0..50_000)
+            .map(|i| format!("o part{i}\nv 0 0 0\np -1\n"))
+            .collect();
         let t = std::time::Instant::now();
         let d = ok(&src);
         assert_eq!(d.objects.len(), 50_000);
-        assert!(t.elapsed().as_secs_f64() < 2.0, "interning is not quadratic");
+        assert!(
+            t.elapsed().as_secs_f64() < 2.0,
+            "interning is not quadratic"
+        );
     }
 
     #[test]
     fn freeform_is_reported_not_dropped_silently() {
         let d = ok("v 0 0 0\ncstype bspline\ndeg 3\nsurf 0 1 0 1 1\ncurv 0 1 1\n");
         assert_eq!(d.counts.freeform_statements, 4);
-        assert_eq!((d.counts.freeform_surfaces, d.counts.freeform_curves), (1, 1));
-        let diag = d.diagnostics.iter().find(|x| x.code == Code::FreeformNotConverted).unwrap();
-        assert_eq!((diag.line, diag.count), (2, 4));
+        assert_eq!(
+            (d.counts.freeform_surfaces, d.counts.freeform_curves),
+            (1, 1)
+        );
+        assert!(d.curves.is_empty());
+        let diag = d
+            .diagnostics
+            .iter()
+            .find(|x| x.code == Code::FreeformNotConverted)
+            .unwrap();
+        // The surface, and the curve that never ends.
+        assert_eq!((diag.line, diag.count), (4, 2));
+    }
+
+    #[test]
+    fn freeform_curves_become_exact_b_splines() {
+        let d = ok("v 0 0 0\nv 1 1 0 0.5\nv 2 0 0\nv 3 1 0\nv 4 0 0\n\
+                    cstype rat bspline\ndeg 2\ncurv 0 1 1 2 3\nparm u 0 0 0 1 1 1\nend\n\
+                    cstype bezier\ndeg 2\ncurv 0 2 1 2 3 4 5\nparm u 0 1 2\nend\n");
+        assert_eq!(d.curves.len(), 2);
+        assert_eq!(d.weights, [1.0, 0.5, 1.0, 1.0, 1.0]);
+        assert!(d.curves[0].rational);
+        assert_eq!(d.curves[1].knots, [0.0, 0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 2.0]);
+        assert_eq!(d.curves[1].control, [0, 1, 2, 3, 4]);
     }
 
     #[test]
     fn vertex_colors() {
         let d = ok("v 0 0 0 1 0 0\nv 0 0 0\n");
         assert_eq!(d.colors[0], Some([1.0, 0.0, 0.0]));
-        assert!(d.diagnostics.iter().any(|x| x.code == Code::PartialVertexColors));
+        assert!(d
+            .diagnostics
+            .iter()
+            .any(|x| x.code == Code::PartialVertexColors));
     }
 
     #[test]
     fn progress_is_reported() {
         // ~24 MB, so at least two progress steps (every 8 MiB) plus the final call.
-        let src: String = (0..800_000).map(|i| format!("v {i}.000000 0.000000 0.000000\n")).collect();
+        let src: String = (0..800_000)
+            .map(|i| format!("v {i}.000000 0.000000 0.000000\n"))
+            .collect();
         let mut calls = Vec::new();
         parse_with_progress(src.as_bytes(), |done, total| calls.push((done, total))).unwrap();
         assert!(calls.len() >= 2);

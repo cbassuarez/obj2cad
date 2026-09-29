@@ -19,8 +19,10 @@ const NOUN: Record<LayerMode, string> = { objects: "object", groups: "group", ma
 const plural = (n: number, one: string) => `${fmt(n)} ${one}${n === 1 ? "" : "s"}`;
 
 /** "6 faces · 2 lines": what a layer holds, for its tooltip. */
-const contents = (l: { faces: number; polylines: number; points: number }) =>
-  [l.faces && plural(l.faces, "face"), l.polylines && plural(l.polylines, "line"), l.points && plural(l.points, "point")].filter(Boolean).join(" · ");
+const contents = (l: { faces: number; polylines: number; points: number; surfaces: number }) =>
+  [l.faces && plural(l.faces, "face"), l.surfaces && plural(l.surfaces, "curved surface"), l.polylines && plural(l.polylines, "line"), l.points && plural(l.points, "point")]
+    .filter(Boolean)
+    .join(" · ");
 
 /**
  * The drawing's layers. A ticked layer is in the drawing; an unticked one is left out of
@@ -52,13 +54,13 @@ export function LayersCard({
   onSelect: (layer: number | null) => void;
   onHover: (layer: number | null) => void;
 }) {
-  const rows = report.layers.map((l, i) => ({ ...l, i, total: l.faces + l.polylines + l.points })).filter((l) => l.total > 0);
+  const rows = report.layers.map((l, i) => ({ ...l, i, total: l.faces + l.polylines + l.points + l.surfaces })).filter((l) => l.total > 0);
   const [query, setQuery] = useState("");
   const q = query.trim().toLowerCase();
   const shownRows = q ? rows.filter((l) => l.name.toLowerCase().includes(q) || l.source.toLowerCase().includes(q)) : rows;
   const included = rows.filter((l) => !hidden.has(l.i)).length;
   const single = rows.length === 1;
-  const onlyFaces = report.output.polylines + report.output.points === 0;
+  const onlyFaces = report.output.polylines + report.output.points + (report.curves?.length ?? 0) === 0;
   const list = useRef<HTMLUListElement>(null);
   const [scroll, setScroll] = useState({ top: 0, height: 400 });
   const virtual = shownRows.length > VIRTUAL;

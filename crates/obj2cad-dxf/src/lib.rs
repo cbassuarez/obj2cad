@@ -20,6 +20,8 @@ use std::borrow::Cow;
 use std::io::{self, Write};
 
 const TEMPLATE: &str = include_str!("../templates/r2018.dxf");
+/// The ACDSDATA section's schemas (ACIS data storage, DXF R2013+).
+const ACDSDATA: &str = include_str!("../templates/acdsdata.dxf");
 /// Handles used by the template that new records refer to.
 const MODEL_SPACE_RECORD: &str = "17";
 const LAYER_TABLE: &str = "1";
@@ -102,7 +104,10 @@ pub fn exact_real<'a>(value: f64, source: Option<&'a str>) -> Cow<'a, str> {
             return Cow::Borrowed(t);
         }
     }
-    assert!(value.is_finite(), "non-finite values are rejected by the parser");
+    assert!(
+        value.is_finite(),
+        "non-finite values are rejected by the parser"
+    );
     let mut buf = ryu::Buffer::new();
     Cow::Owned(buf.format_finite(value).to_owned())
 }
@@ -133,6 +138,8 @@ fn kind(code: i32) -> Kind {
 
 struct Out<'w> {
     format: Format,
+    /// ACIS data per surface entity handle, for the ACDSDATA section.
+    acds: Vec<(String, Vec<u8>)>,
     buf: Vec<u8>,
     sink: &'w mut dyn Write,
     written: u64,
@@ -213,17 +220,40 @@ impl Out<'_> {
         }
     }
 
+    /// Binary data (at most 127 bytes per group, as DXF readers expect).
+    fn bytes(&mut self, code: i32, data: &[u8]) {
+        debug_assert!(data.len() <= 127);
+        self.code(code);
+        match self.format {
+            Format::Ascii => {
+                for b in data {
+                    let _ = write!(self.buf, "{b:02X}");
+                }
+                self.buf.extend_from_slice(b"\r\n");
+            }
+            Format::Binary => {
+                self.buf.push(data.len() as u8);
+                self.buf.extend_from_slice(data);
+            }
+        }
+    }
+
     /// A pair from the template, whose values are text.
     fn template_pair(&mut self, code: i32, value: &str) {
         match (self.format, kind(code)) {
             (Format::Ascii, _) | (_, Kind::Str) => self.str(code, value),
             (Format::Binary, Kind::Double) => {
-                let v: f64 = value.trim().parse().unwrap_or_else(|_| panic!("template: bad real {value:?} for {code}"));
+                let v: f64 = value
+                    .trim()
+                    .parse()
+                    .unwrap_or_else(|_| panic!("template: bad real {value:?} for {code}"));
                 self.real(code, v);
             }
             (Format::Binary, Kind::Bytes) => {
                 let bytes: Vec<u8> = (0..value.len() / 2)
-                    .map(|i| u8::from_str_radix(&value[2 * i..2 * i + 2], 16).expect("template: bad hex"))
+                    .map(|i| {
+                        u8::from_str_radix(&value[2 * i..2 * i + 2], 16).expect("template: bad hex")
+                    })
                     .collect();
                 for chunk in bytes.chunks(127) {
                     self.code(code);
@@ -232,7 +262,10 @@ impl Out<'_> {
                 }
             }
             (Format::Binary, _) => {
-                let v: i64 = value.trim().parse().unwrap_or_else(|_| panic!("template: bad int {value:?} for {code}"));
+                let v: i64 = value
+                    .trim()
+                    .parse()
+                    .unwrap_or_else(|_| panic!("template: bad int {value:?} for {code}"));
                 self.int(code, v);
             }
         }
@@ -250,7 +283,9 @@ impl Out<'_> {
                     self.buf.extend_from_slice(value.as_bytes());
                     self.buf.extend_from_slice(b"\r\n");
                 }
-                Format::Binary => self.template_pair(code.trim().parse().expect("template code"), value),
+                Format::Binary => {
+                    self.template_pair(code.trim().parse().expect("template code"), value)
+                }
             }
         }
     }
@@ -261,7 +296,13 @@ impl Out<'_> {
         h
     }
 
-    fn entity_head(&mut self, kind: &str, owner: &str, layer: &str, color: Option<[u8; 3]>) -> String {
+    fn entity_head(
+        &mut self,
+        kind: &str,
+        owner: &str,
+        layer: &str,
+        color: Option<[u8; 3]>,
+    ) -> String {
         let h = self.handle();
         self.str(0, kind);
         self.str(5, &h);
@@ -288,7 +329,11 @@ impl Out<'_> {
             self.code(code);
             let (t, negate) = model.coord_source(v, axis);
             if is_plain_decimal(t) {
-                debug_assert_eq!(t.parse::<f64>().map(|x| if negate { -x } else { x }.to_bits()), Ok(p[axis].to_bits()));
+                debug_assert_eq!(
+                    t.parse::<f64>()
+                        .map(|x| if negate { -x } else { x }.to_bits()),
+                    Ok(p[axis].to_bits())
+                );
                 match (negate, t.strip_prefix('-')) {
                     (false, _) => self.buf.extend_from_slice(t.as_bytes()),
                     (true, Some(rest)) => self.buf.extend_from_slice(rest.as_bytes()),
@@ -315,13 +360,33 @@ fn rgb_int([r, g, b]: [u8; 3]) -> i64 {
 fn handles_needed(model: &CadModel) -> u64 {
     (model.layers.len() as u64 - 1)
         + model.meshes.len() as u64
-        + model.polylines.iter().map(|l| 2 + l.vertices.len() as u64).sum::<u64>()
+        + model
+            .polylines
+            .iter()
+            .map(|l| 2 + l.vertices.len() as u64)
+            .sum::<u64>()
         + model.points.len() as u64
+        + model.splines.len() as u64
+        + model.surfaces.len() as u64
 }
 
 /// Write `model` as DXF R2018 to `sink`. Returns the number of bytes written.
-pub fn write_to(model: &CadModel, meta: &Meta, format: Format, sink: &mut dyn Write) -> io::Result<u64> {
-    let mut out = Out { format, buf: Vec::with_capacity(CHUNK + 4096), sink, written: 0, next_handle: FIRST_HANDLE, ryu: ryu::Buffer::new(), itoa: itoa::Buffer::new() };
+pub fn write_to(
+    model: &CadModel,
+    meta: &Meta,
+    format: Format,
+    sink: &mut dyn Write,
+) -> io::Result<u64> {
+    let mut out = Out {
+        format,
+        acds: Vec::new(),
+        buf: Vec::with_capacity(CHUNK + 4096),
+        sink,
+        written: 0,
+        next_handle: FIRST_HANDLE,
+        ryu: ryu::Buffer::new(),
+        itoa: itoa::Buffer::new(),
+    };
     if format == Format::Binary {
         out.buf.extend_from_slice(b"AutoCAD Binary DXF\r\n\x1a\x00");
     }
@@ -384,7 +449,11 @@ pub fn write_to(model: &CadModel, meta: &Meta, format: Format, sink: &mut dyn Wr
                 out.real(22, 0.0);
             }
             Chunk::Marker("VPORT_DIRECTION") => {
-                let d = if view.is_some() { VIEW_DIRECTION } else { [0.0, 0.0, 1.0] };
+                let d = if view.is_some() {
+                    VIEW_DIRECTION
+                } else {
+                    [0.0, 0.0, 1.0]
+                };
                 out.real(16, d[0]);
                 out.real(26, d[1]);
                 out.real(36, d[2]);
@@ -395,7 +464,9 @@ pub fn write_to(model: &CadModel, meta: &Meta, format: Format, sink: &mut dyn Wr
                 out.real(27, t[1]);
                 out.real(37, t[2]);
             }
-            Chunk::Marker("VPORT_HEIGHT") => out.real(40, view.as_ref().map_or(1000.0, |v| v.height)),
+            Chunk::Marker("VPORT_HEIGHT") => {
+                out.real(40, view.as_ref().map_or(1000.0, |v| v.height))
+            }
             Chunk::Marker("LAYERCOUNT") => out.int(70, model.layers.len() as i64 + 1),
             Chunk::Marker("LAYERS") => {
                 for layer in model.layers.iter().skip(1) {
@@ -415,17 +486,48 @@ pub fn write_to(model: &CadModel, meta: &Meta, format: Format, sink: &mut dyn Wr
                     out.str(347, GLOBAL_MATERIAL);
                 }
             }
-            Chunk::Marker("ENTITIES") => entities(&mut out, model)?,
+            Chunk::Marker("ENTITIES") => entities(&mut out, model, meta)?,
+            Chunk::Marker("CLASSES") => {
+                if model.surfaces.iter().any(|s| !s.body.solid) {
+                    out.template(
+                        "  0\nCLASS\n  1\nSURFACE\n  2\nAcDbSurface\n  3\nObjectDBX Classes\n 90\n4095\n 91\n0\n280\n0\n281\n1\n",
+                    );
+                }
+            }
+            Chunk::Marker("ACDSDATA") => {
+                if !out.acds.is_empty() {
+                    out.template(ACDSDATA);
+                    for (handle, sab) in std::mem::take(&mut out.acds) {
+                        out.str(0, "ACDSRECORD");
+                        out.int(90, 1);
+                        out.str(2, "AcDbDs::ID");
+                        out.int(280, 10);
+                        out.str(320, &handle);
+                        out.str(2, "ASM_Data");
+                        out.int(280, 15);
+                        out.int(94, sab.len() as i64);
+                        for chunk in sab.chunks(127) {
+                            out.bytes(310, chunk);
+                        }
+                        out.maybe_flush()?;
+                    }
+                    out.str(0, "ENDSEC");
+                }
+            }
             Chunk::Marker(other) => unreachable!("unknown template marker {other}"),
         }
         out.maybe_flush()?;
     }
     out.flush()?;
-    debug_assert_eq!(out.next_handle, FIRST_HANDLE + handles_needed(model), "handle count");
+    debug_assert_eq!(
+        out.next_handle,
+        FIRST_HANDLE + handles_needed(model),
+        "handle count"
+    );
     Ok(out.written)
 }
 
-fn entities(out: &mut Out, model: &CadModel) -> io::Result<()> {
+fn entities(out: &mut Out, model: &CadModel, meta: &Meta) -> io::Result<()> {
     for m in &model.meshes {
         let layer = &model.layers[m.layer as usize].name;
         out.entity_head("MESH", MODEL_SPACE_RECORD, layer, m.color);
@@ -470,11 +572,55 @@ fn entities(out: &mut Out, model: &CadModel) -> io::Result<()> {
         out.entity_head("SEQEND", &h, layer, None);
         out.maybe_flush()?;
     }
+    for c in &model.splines {
+        let layer = &model.layers[c.layer as usize].name;
+        out.entity_head("SPLINE", MODEL_SPACE_RECORD, layer, c.color);
+        out.str(100, "AcDbSpline");
+        out.int(70, if c.weights.is_some() { 4 } else { 0 });
+        out.int(71, i64::from(c.degree));
+        out.int(72, c.knots.len() as i64);
+        out.int(73, c.control.len() as i64);
+        out.int(74, 0);
+        for &k in &c.knots {
+            out.real(40, k);
+        }
+        for &w in c.weights.iter().flatten() {
+            out.real(41, w);
+        }
+        for &v in &c.control {
+            out.xyz(model, v);
+        }
+        out.maybe_flush()?;
+    }
     for p in &model.points {
         let layer = &model.layers[p.layer as usize].name;
         out.entity_head("POINT", MODEL_SPACE_RECORD, layer, p.color);
         out.str(100, "AcDbPoint");
         out.xyz(model, p.vertex);
+        out.maybe_flush()?;
+    }
+    // Curved surfaces: the ACIS data goes to the ACDSDATA section, keyed by handle.
+    let product = format!("obj2cad {}", obj2cad_core::VERSION);
+    for s in &model.surfaces {
+        let layer = &model.layers[s.layer as usize].name;
+        let kind = if s.body.solid { "3DSOLID" } else { "SURFACE" };
+        let h = out.entity_head(kind, MODEL_SPACE_RECORD, layer, s.color);
+        out.str(100, "AcDbModelerGeometry");
+        out.int(290, 1);
+        out.str(
+            2,
+            &obj2cad_core::output::guid(&format!("acis:{}:{h}", meta.fingerprint_seed)),
+        );
+        if s.body.solid {
+            out.str(100, "AcDb3dSolid");
+            out.str(350, "0");
+        } else {
+            out.str(100, "AcDbSurface");
+            out.int(71, 6);
+            out.int(72, 6);
+        }
+        let sab = obj2cad_acis::sab::write(&s.body, &product, meta.created_unix.unwrap_or(0.0));
+        out.acds.push((h, sab));
         out.maybe_flush()?;
     }
     Ok(())
@@ -500,7 +646,9 @@ fn split_markers(t: &str) -> Vec<Chunk<'_>> {
         out.push(Chunk::Text(&rest[..start]));
         out.push(Chunk::Marker(&rest[start + 2..end]));
         // skip marker and its line break
-        rest = rest[end + 2..].strip_prefix('\n').unwrap_or(&rest[end + 2..]);
+        rest = rest[end + 2..]
+            .strip_prefix('\n')
+            .unwrap_or(&rest[end + 2..]);
     }
     out.push(Chunk::Text(rest));
     out
@@ -511,7 +659,11 @@ mod tests {
     use super::*;
     use obj2cad_core::{convert, parse, Options};
 
-    const META: Meta = Meta { properties: &[("obj2cad.version", "test")], fingerprint_seed: "seed", created_unix: None };
+    const META: Meta = Meta {
+        properties: &[("obj2cad.version", "test")],
+        fingerprint_seed: "seed",
+        created_unix: None,
+    };
 
     #[test]
     fn exact_real_keeps_plain_tokens_and_round_trips_everything() {
@@ -520,7 +672,10 @@ mod tests {
         // too many digits → shortest form instead
         let long = "0.12345678901234567890";
         let v: f64 = long.parse().unwrap();
-        assert_eq!(exact_real(v, Some(long)).parse::<f64>().unwrap().to_bits(), v.to_bits());
+        assert_eq!(
+            exact_real(v, Some(long)).parse::<f64>().unwrap().to_bits(),
+            v.to_bits()
+        );
         assert_ne!(exact_real(v, Some(long)), long);
         // non-plain syntaxes are never copied
         assert_ne!(exact_real(0.5, Some(".5")), ".5");
@@ -533,7 +688,10 @@ mod tests {
             x ^= x << 17;
             let v = f64::from_bits(x);
             if v.is_finite() {
-                assert_eq!(exact_real(v, None).parse::<f64>().unwrap().to_bits(), v.to_bits());
+                assert_eq!(
+                    exact_real(v, None).parse::<f64>().unwrap().to_bits(),
+                    v.to_bits()
+                );
             }
         }
     }
@@ -543,7 +701,20 @@ mod tests {
         for ok in ["0", "-1", "1.5", "1e-5", "1.25E+03", "00012.5000"] {
             assert!(is_plain_decimal(ok), "{ok}");
         }
-        for bad in ["", "-", ".5", "5.", "+5", "1e", "nan", "inf", "1.2.3", "0x10", "1_000", "123456789012345678"] {
+        for bad in [
+            "",
+            "-",
+            ".5",
+            "5.",
+            "+5",
+            "1e",
+            "nan",
+            "inf",
+            "1.2.3",
+            "0x10",
+            "1_000",
+            "123456789012345678",
+        ] {
             assert!(!is_plain_decimal(bad), "{bad}");
         }
     }
@@ -560,7 +731,9 @@ mod tests {
         assert_eq!(a, write(&model, &META, Format::Ascii));
         let s = String::from_utf8(a).unwrap();
         assert!(!s.contains("@@"));
-        assert!(s.contains("AcDbSubDMesh") && s.contains("AcDb3dPolyline") && s.contains("AcDbPoint"));
+        assert!(
+            s.contains("AcDbSubDMesh") && s.contains("AcDb3dPolyline") && s.contains("AcDbPoint")
+        );
         assert!(s.contains("\r\nPart A\r\n"));
         assert!(s.ends_with("EOF\r\n"));
     }
@@ -571,10 +744,19 @@ mod tests {
         let model = convert(&doc, None, Options::default());
         let s = String::from_utf8(write(&model, &META, Format::Ascii)).unwrap();
         let [r, g, b] = model.layers[1].color;
-        let rgb = format!("{}", (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b));
+        let rgb = format!(
+            "{}",
+            (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b)
+        );
         let at = s.find("\r\nPart A\r\n").unwrap();
-        assert!(s[at..at + 200].contains(&format!("420\r\n{rgb}\r\n")), "layer true color");
-        assert!(!s[at..at + 200].contains(" 62\r\n7\r\n"), "not the default white");
+        assert!(
+            s[at..at + 200].contains(&format!("420\r\n{rgb}\r\n")),
+            "layer true color"
+        );
+        assert!(
+            !s[at..at + 200].contains(" 62\r\n7\r\n"),
+            "not the default white"
+        );
     }
 
     #[test]
@@ -584,10 +766,26 @@ mod tests {
         let s = String::from_utf8(write(&model, &META, Format::Ascii)).unwrap();
         let at = s.find("*Active").unwrap();
         let vport = &s[at..at + 900];
-        let value = |code: &str| -> f64 { vport.split(&format!("{code}\r\n")).nth(1).unwrap().split("\r\n").next().unwrap().parse().unwrap() };
-        assert!((value(" 17") - 500_123.956).abs() < 1e-6, "target at the model center: {vport}");
+        let value = |code: &str| -> f64 {
+            vport
+                .split(&format!("{code}\r\n"))
+                .nth(1)
+                .unwrap()
+                .split("\r\n")
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap()
+        };
+        assert!(
+            (value(" 17") - 500_123.956).abs() < 1e-6,
+            "target at the model center: {vport}"
+        );
         assert!((value(" 27") - 4_649_877.043).abs() < 1e-6);
-        assert!(vport.contains(" 16\r\n1.0\r\n 26\r\n-1.0\r\n 36\r\n1.0\r\n"), "SE isometric");
+        assert!(
+            vport.contains(" 16\r\n1.0\r\n 26\r\n-1.0\r\n 36\r\n1.0\r\n"),
+            "SE isometric"
+        );
         let h = value(" 40");
         assert!(h > 1.0 && h < 3.0, "height fits a ~1.4-unit model, got {h}");
     }
@@ -596,10 +794,16 @@ mod tests {
     fn dates_come_from_the_source() {
         let doc = sample();
         let model = convert(&doc, None, Options::default());
-        let meta = Meta { created_unix: Some(1_790_000_000.0), ..META };
+        let meta = Meta {
+            created_unix: Some(1_790_000_000.0),
+            ..META
+        };
         let s = String::from_utf8(write(&model, &meta, Format::Ascii)).unwrap();
         let jd = 1_790_000_000.0 / 86_400.0 + 2_440_587.5;
-        assert!(s.contains(&format!("$TDCREATE\r\n 40\r\n{}\r\n", ryu::Buffer::new().format(jd))));
+        assert!(s.contains(&format!(
+            "$TDCREATE\r\n 40\r\n{}\r\n",
+            ryu::Buffer::new().format(jd)
+        )));
     }
 
     #[test]
@@ -639,7 +843,9 @@ mod tests {
                 s
             };
             let value = match kind(code) {
-                Kind::Double => f64::from_le_bytes(take(&mut i, 8).try_into().unwrap()).to_bits().to_string(),
+                Kind::Double => f64::from_le_bytes(take(&mut i, 8).try_into().unwrap())
+                    .to_bits()
+                    .to_string(),
                 Kind::Bool => take(&mut i, 1)[0].to_string(),
                 Kind::I16 => i16::from_le_bytes(take(&mut i, 2).try_into().unwrap()).to_string(),
                 Kind::I32 => i32::from_le_bytes(take(&mut i, 4).try_into().unwrap()).to_string(),
@@ -667,37 +873,76 @@ mod tests {
         let bin = write(&model, &META, Format::Binary);
         let pairs = read_binary(&bin);
         assert_eq!(pairs.last().unwrap(), &(0, "EOF".to_owned()));
-        assert!(!pairs.iter().any(|(c, _)| *c == 999), "no comments in binary DXF");
+        assert!(
+            !pairs.iter().any(|(c, _)| *c == 999),
+            "no comments in binary DXF"
+        );
         // Same tags as the ASCII file, minus the comment.
         let ascii = String::from_utf8(write(&model, &META, Format::Ascii)).unwrap();
-        let ascii_codes: Vec<i32> = ascii.split("\r\n").step_by(2).filter(|l| !l.is_empty()).map(|c| c.trim().parse().unwrap()).filter(|&c| c != 999).collect();
+        let ascii_codes: Vec<i32> = ascii
+            .split("\r\n")
+            .step_by(2)
+            .filter(|l| !l.is_empty())
+            .map(|c| c.trim().parse().unwrap())
+            .filter(|&c| c != 999)
+            .collect();
         let bin_codes: Vec<i32> = pairs.iter().map(|(c, _)| *c).collect();
         assert_eq!(bin_codes, ascii_codes);
         // The MESH vertices are the exact doubles.
-        let mesh = pairs.iter().position(|(c, v)| *c == 0 && v == "MESH").unwrap();
-        let xs: Vec<u64> = pairs[mesh..].iter().filter(|(c, _)| *c == 10).take(3).map(|(_, v)| v.parse().unwrap()).collect();
-        assert_eq!(xs, [0.1f64.to_bits(), 5e-324f64.to_bits(), 0.0f64.to_bits()]);
-        let ys: Vec<u64> = pairs[mesh..].iter().filter(|(c, _)| *c == 20).take(1).map(|(_, v)| v.parse().unwrap()).collect();
+        let mesh = pairs
+            .iter()
+            .position(|(c, v)| *c == 0 && v == "MESH")
+            .unwrap();
+        let xs: Vec<u64> = pairs[mesh..]
+            .iter()
+            .filter(|(c, _)| *c == 10)
+            .take(3)
+            .map(|(_, v)| v.parse().unwrap())
+            .collect();
+        assert_eq!(
+            xs,
+            [0.1f64.to_bits(), 5e-324f64.to_bits(), 0.0f64.to_bits()]
+        );
+        let ys: Vec<u64> = pairs[mesh..]
+            .iter()
+            .filter(|(c, _)| *c == 20)
+            .take(1)
+            .map(|(_, v)| v.parse().unwrap())
+            .collect();
         assert_eq!(ys, [(-0.0f64).to_bits()], "signed zero survives");
     }
 
     #[test]
     fn template_references_exist() {
-        for h in [MODEL_SPACE_RECORD, LAYER_TABLE, PLOTSTYLE_PLACEHOLDER, GLOBAL_MATERIAL] {
-            assert!(TEMPLATE.contains(&format!("  5\n{h}\n")), "handle {h} missing from template");
+        for h in [
+            MODEL_SPACE_RECORD,
+            LAYER_TABLE,
+            PLOTSTYLE_PLACEHOLDER,
+            GLOBAL_MATERIAL,
+        ] {
+            assert!(
+                TEMPLATE.contains(&format!("  5\n{h}\n")),
+                "handle {h} missing from template"
+            );
         }
         let mut max = 0;
         for chunk in split_markers(TEMPLATE) {
             let Chunk::Text(t) = chunk else { continue };
             let lines: Vec<_> = t.lines().collect();
-            assert!(lines.len() % 2 == 0, "template chunk is not made of code/value pairs");
+            assert!(
+                lines.len() % 2 == 0,
+                "template chunk is not made of code/value pairs"
+            );
             for pair in lines.chunks(2) {
                 if matches!(pair[0].trim(), "5" | "105") {
                     max = max.max(u64::from_str_radix(pair[1].trim(), 16).unwrap());
                 }
             }
         }
-        assert!(max < FIRST_HANDLE, "template handle {max:X} collides with writer handles");
+        assert!(
+            max < FIRST_HANDLE,
+            "template handle {max:X} collides with writer handles"
+        );
     }
 
     #[test]

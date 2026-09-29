@@ -1,0 +1,51 @@
+# free-form curves: three convert exactly, three are left out
+o Curves
+v 0.000000 0.000000 0.000000
+v 1.000000 2.000000 0.000000
+v 3.000000 2.500000 1.000000
+v 4.000000 0.000000 0.500000
+v 5.500000 -1.000000 0.250000
+# quarter circle as a rational quadratic (weights 1, sqrt(2)/2, 1)
+v 10.000000 0.000000 0.000000
+v 10.000000 10.000000 0.000000 0.7071067811865476
+v 0.000000 10.000000 0.000000
+# two cubic Bezier segments
+v 0 0 5
+v 1 1 5
+v 2 1 5
+v 3 0 5
+v 4 -1 5
+v 5 -1 5
+v 6 0 5
+cstype bspline
+deg 3
+curv 0.0 2.0 1 2 3 4 5
+parm u 0.0 0.0 0.0 0.0 1.0 2.0 2.0 2.0 2.0
+end
+cstype rat bspline
+deg 2
+curv 0 1 6 7 8
+parm u 0 0 0 1 1 1
+end
+cstype bezier
+deg 3
+curv 0 2 9 10 11 12 \
+     13 14 15
+parm u 0 1 2
+end
+cstype cardinal
+deg 3
+curv 0 1 1 2 3 4
+parm u 0 1
+end
+cstype bspline
+deg 1
+curv 0.25 1 1 2
+parm u 0 0 1 1
+end
+cstype bspline
+deg 1 1
+surf 0 1 0 1 1 2 3 4
+parm u 0 0 1 1
+parm v 0 0 1 1
+end

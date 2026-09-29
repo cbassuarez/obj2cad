@@ -16,6 +16,15 @@ export interface Summary {
   notIncluded: string[];
   /** Materials are used but no .mtl was given. */
   needsMtl: boolean;
+  /** Files the drawing's files name that weren't there (a texture, a library). */
+  missing: string[];
+  /** Files that came along but weren't needed, or couldn't be read. */
+  notUsed: string[];
+  unreadable: string[];
+  /** Some faces are colored from textures (approximate colors). */
+  textureColors: boolean;
+  /** Curved surfaces written next to the mesh, by kind ("2 cylinders", "1 sphere"). */
+  curves: string[];
   /** Count and noun for the main stat. */
   shapes: { count: number; noun: string };
 }
@@ -42,12 +51,30 @@ export function summarize(r: Report): Summary {
         : null;
 
   const notIncluded = [
-    has("texcoords_dropped") && "textures",
+    has("texcoords_dropped") && !(r.texture_colored_faces > 0) && "textures",
     (has("normals_dropped") || has("smoothing_groups_ignored")) && "smooth shading",
     has("vertex_colors_dropped") && "vertex colors",
   ].filter((x): x is string => Boolean(x));
 
-  const other = r.output.polylines + r.output.points;
+  const other = r.output.polylines + r.output.points + (r.output.splines ?? 0);
   const shapes = { count: r.output.faces + other, noun: other ? "shapes" : "faces" };
-  return { status, title, leftOut, loosePoints, notIncluded, needsMtl: has("material_colors_unavailable"), shapes };
+  const files = r.files ?? [];
+  const named = (role: string) => files.filter((f) => f.role === role).map((f) => f.name);
+  return {
+    status,
+    title,
+    leftOut,
+    loosePoints,
+    notIncluded,
+    needsMtl: has("material_colors_unavailable"),
+    missing: named("missing"),
+    notUsed: named("not_used"),
+    unreadable: named("unreadable"),
+    textureColors: (r.texture_colored_faces ?? 0) > 0,
+    curves: (["cylinder", "cone", "sphere", "torus"] as const)
+      .map((k) => [k, (r.curves ?? []).filter((c) => c.kind === k).length] as const)
+      .filter(([, n]) => n > 0)
+      .map(([k, n]) => plural(n, k, k === "torus" ? "tori" : `${k}s`)),
+    shapes,
+  };
 }

@@ -2,17 +2,29 @@
 // the parsed file; the UI sends small commands and receives the file as a Blob plus
 // transferable preview buffers. If the engine crashes, the worker is replaced.
 //
-// The worker holds one file at a time and the viewer and the file list both use it, so
-// every call here runs alone, in order, and a conversion names the file it is for: when
-// the worker holds another one, that file is opened again first. Without this, opening a
-// file from the list while the list was still converting could show (and download)
+// The worker holds one drawing at a time and the viewer and the file list both use it, so
+// every call here runs alone, in order, and a conversion names the drawing it is for: when
+// the worker holds another one, that drawing is opened again first. Without this, opening
+// a file from the list while the list was still converting could show (and download)
 // another file's drawing under its name.
-import type { Converted, Failure, ParseFailure, PreviewBuffers, Progress, Reply, Request } from "@/worker";
+import type { Converted, Failure, ParseFailure, PreviewBuffers, Progress, Reply, Request, SourceFile } from "@/worker";
 import type { EngineSettings, LayerMode, UpAxis, Units } from "@/lib/settings";
 
 export type { Failure, ParseFailure, PreviewBuffers, Progress };
 
+/** A file of the drawing and what it was used for (crates/obj2cad-core/src/bundle.rs). */
+export interface BundleFile {
+  name: string;
+  role: "model" | "point_cloud" | "materials" | "texture" | "not_used" | "missing" | "unreadable";
+  bytes: number;
+  sha256: string | null;
+  note?: string;
+}
+
 export interface Inspection {
+  /** The drawing's name: the model's file name, or the zip's or folder's. */
+  name: string;
+  files: BundleFile[];
   vertices: number;
   faces: number;
   lines: number;
@@ -57,11 +69,17 @@ export interface Report {
     faces: number;
     polylines: number;
     points: number;
+    /** Free-form curves, as B-splines. */
+    splines: number;
     vertices_written: number;
     unreferenced_vertices_skipped: number;
     bounds: [[number, number, number], [number, number, number]] | null;
   };
   options: { units: Units; up_axis: UpAxis; layer_mode: LayerMode; keep_loose_points: boolean; exclude_layers: string[] };
+  texture_colored_faces: number;
+  files: BundleFile[];
+  /** Curved surfaces written next to the mesh (crates/obj2cad-curves). */
+  curves: { kind: "cylinder" | "cone" | "sphere" | "torus"; faces: number[]; max_deviation: number; tolerance: number }[];
   omissions: {
     freeform_surfaces: number;
     freeform_curves: number;
@@ -72,7 +90,7 @@ export interface Report {
     excluded_lines: number;
     excluded_points: number;
   };
-  layers: { name: string; source: string; color: string; entity_colors: string[]; faces: number; polylines: number; points: number }[];
+  layers: { name: string; source: string; color: string; entity_colors: string[]; more_colors: boolean; faces: number; polylines: number; points: number; surfaces: number }[];
   diagnostics: { severity: "info" | "warning"; code: string; line: number; count: number; message: string }[];
 }
 
@@ -98,18 +116,19 @@ interface Pending {
   progress?: (p: Progress) => void;
 }
 
-/** A model and the material library that goes with it. */
-export interface Source {
-  file: File;
-  mtl: File | null;
+/** The files of one drawing, as the app holds them (`Job` in lib/files.ts). A drawing is
+ *  known by this object: a new one (another file, added materials, a reload) is new. */
+export interface Drawing {
+  name: string;
+  sources: SourceFile[];
 }
 
 class Engine {
   private worker!: Worker;
   private seq = 0;
   private pending = new Map<number, Pending>();
-  /** What the worker holds now; `null` after a crash or before the first open. */
-  private loaded: Source | null = null;
+  /** The drawing the worker holds; `null` after a crash or before the first open. */
+  private loaded: Drawing | null = null;
   private queue: Promise<unknown> = Promise.resolve();
 
   constructor() {
@@ -169,51 +188,32 @@ class Engine {
     return run;
   }
 
-  /** Make the worker hold `src` (and its material library), opening it again if needed. */
-  private async hold(src: Source, dwg: boolean): Promise<void> {
-    const l = this.loaded;
-    if (l?.file === src.file && (l.mtl === src.mtl || src.mtl === null)) return;
-    if (l?.file === src.file && src.mtl) {
-      await this.call<void>({ type: "mtl", mtl: src.mtl });
-      this.loaded = { file: src.file, mtl: src.mtl };
-      return;
-    }
+  private async load(d: Drawing, dwg: boolean, progress?: (p: Progress) => void): Promise<Inspection> {
     this.loaded = null;
-    await this.call<Inspection>({ type: "open", file: src.file, mtl: src.mtl, dwg });
-    this.loaded = { file: src.file, mtl: src.mtl };
+    const info = await this.call<Inspection>({ type: "open", sources: d.sources, name: d.name, dwg }, progress);
+    this.loaded = d;
+    return info;
   }
 
-  open(file: File, dwg: boolean, progress?: (p: Progress) => void): Promise<Inspection> {
+  /** Read the files of one drawing. Its `name` names it when it holds several models. */
+  open(d: Drawing, dwg: boolean, progress?: (p: Progress) => void): Promise<Inspection> {
+    return this.serial(() => this.load(d, dwg, progress));
+  }
+
+  convert(d: Drawing, settings: EngineSettings, preview: boolean, progress?: (p: Progress) => void): Promise<Result> {
     return this.serial(async () => {
-      this.loaded = null;
-      const info = await this.call<Inspection>({ type: "open", file, mtl: null, dwg }, progress);
-      this.loaded = { file, mtl: null };
-      return info;
+      if (this.loaded !== d) await this.load(d, settings.format === "dwg");
+      const r = await this.call<Converted>({ type: "convert", settings, preview }, progress);
+      return {
+        file: r.file,
+        report: JSON.parse(r.report) as Report,
+        decisions: JSON.parse(r.decisions) as Decisions,
+        preview: r.preview,
+        timings: r.timings,
+        ms: r.ms,
+      };
     });
   }
-
-  /** Give `file` its material library. */
-  setMtl(file: File, mtl: File): Promise<void> {
-    return this.serial(() => this.hold({ file, mtl }, false));
-  }
-
-  convert(src: Source, settings: EngineSettings, preview: boolean, progress?: (p: Progress) => void): Promise<Result> {
-    return this.serial(async () => {
-      await this.hold(src, settings.format === "dwg");
-      return parse(await this.call<Converted>({ type: "convert", settings, preview }, progress));
-    });
-  }
-}
-
-function parse(r: Converted): Result {
-  return {
-    file: r.file,
-    report: JSON.parse(r.report) as Report,
-    decisions: JSON.parse(r.decisions) as Decisions,
-    preview: r.preview,
-    timings: r.timings,
-    ms: r.ms,
-  };
 }
 
 export const engine = new Engine();
@@ -224,5 +224,5 @@ export async function sha256Hex(blob: Blob): Promise<string> {
   return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-/** Nothing was written: no faces, lines or points. */
-export const isEmpty = (r: Report) => r.output.faces + r.output.polylines + r.output.points === 0;
+/** Nothing was written: no faces, lines, curves or points. */
+export const isEmpty = (r: Report) => r.output.faces + r.output.polylines + r.output.points + (r.output.splines ?? 0) === 0;

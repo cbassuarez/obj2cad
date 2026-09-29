@@ -7,13 +7,26 @@
 
 use crate::diag::{Code, Diagnostic, Diagnostics, Severity};
 use crate::mtl::Palette;
-use crate::obj::ObjDocument;
+use crate::obj::{ObjDocument, NO_UV};
+use crate::texture::{self, Texture};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 /// AutoCAD's default SMOOTHMESHMAXFACE; larger meshes are split so they open with default settings.
 pub const MAX_FACES_PER_MESH: usize = 1_000_000;
+
+/// Face colors sampled from one texture are reduced to at most this many, so a textured
+/// model becomes a few meshes rather than one per face.
+pub const TEXTURE_COLORS: usize = 32;
+
+/// Material colors and textures for a conversion.
+#[derive(Default)]
+pub struct Materials<'a> {
+    pub palette: Option<&'a Palette>,
+    /// Material name → its diffuse texture.
+    pub textures: HashMap<&'a str, Texture<'a>>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -96,6 +109,9 @@ pub struct Options {
     /// Output layer names to leave out (for "visible layers only").
     #[serde(default)]
     pub exclude_layers: Vec<String>,
+    /// Also write curved surfaces recognized in the mesh (the mesh itself is unchanged).
+    #[serde(default)]
+    pub curves: bool,
 }
 
 fn default_layer() -> String {
@@ -111,6 +127,7 @@ impl Default for Options {
             default_layer: default_layer(),
             keep_loose_points: false,
             exclude_layers: Vec::new(),
+            curves: false,
         }
     }
 }
@@ -155,6 +172,8 @@ pub struct MeshEntity {
     /// Faces as indices into `vertices`: `face_offsets[i]..face_offsets[i+1]`.
     pub face_offsets: Vec<u32>,
     pub face_indices: Vec<u32>,
+    /// Index of each face in the source document (`ObjDocument::faces`).
+    pub source_faces: Vec<u32>,
 }
 
 impl MeshEntity {
@@ -163,7 +182,9 @@ impl MeshEntity {
     }
 
     pub fn faces(&self) -> impl Iterator<Item = &[u32]> + '_ {
-        self.face_offsets.windows(2).map(|w| &self.face_indices[w[0] as usize..w[1] as usize])
+        self.face_offsets
+            .windows(2)
+            .map(|w| &self.face_indices[w[0] as usize..w[1] as usize])
     }
 }
 
@@ -172,6 +193,44 @@ pub struct PolylineEntity {
     pub layer: u32,
     pub color: Option<[u8; 3]>,
     pub vertices: Vec<u32>,
+}
+
+/// A curved surface (or solid) recognized in the mesh, as an ACIS body. Written next to
+/// the exact mesh, never instead of it.
+#[derive(Debug, Clone)]
+pub struct SurfaceEntity {
+    pub layer: u32,
+    pub color: Option<[u8; 3]>,
+    pub body: obj2cad_acis::Body,
+    /// What it was recognized from, for the report (`None` for test bodies).
+    pub region: Option<Region>,
+}
+
+/// The mesh region a surface was recognized from. Every vertex of every face in it lies
+/// on the surface within that vertex's tolerance.
+#[derive(Debug, Clone, Serialize)]
+pub struct Region {
+    /// `cylinder`, `cone`, `sphere` or `torus`.
+    pub kind: &'static str,
+    /// Source faces (indices into `ObjDocument::faces`) that lie on the surface.
+    pub faces: Vec<u32>,
+    /// Largest distance of any of their vertices from the surface, in model units.
+    pub max_deviation: f64,
+    /// Largest distance allowed for any of them (each vertex's own precision).
+    pub tolerance: f64,
+}
+
+/// A B-spline from an OBJ free-form curve: the control points are source vertices
+/// (exact), the knots and weights the file's own numbers.
+#[derive(Debug, Clone)]
+pub struct SplineEntity {
+    pub layer: u32,
+    pub color: Option<[u8; 3]>,
+    pub degree: u32,
+    pub knots: Vec<f64>,
+    pub control: Vec<u32>,
+    /// One per control point, for rational curves.
+    pub weights: Option<Vec<f64>>,
 }
 
 #[derive(Debug, Clone)]
@@ -212,12 +271,18 @@ pub struct CadModel<'a> {
     pub meshes: Vec<MeshEntity>,
     pub polylines: Vec<PolylineEntity>,
     pub points: Vec<PointEntity>,
+    /// Free-form curves from the file.
+    pub splines: Vec<SplineEntity>,
+    /// Curved surfaces recognized in the mesh (empty unless requested).
+    pub surfaces: Vec<SurfaceEntity>,
     /// Parser diagnostics plus everything conversion could not carry over.
     pub diagnostics: Vec<Diagnostic>,
     pub unreferenced_vertices: u64,
     pub omissions: Omissions,
     /// The file has no elements at all, so every vertex was written as a point.
     pub point_cloud: bool,
+    /// Faces whose color was sampled from a texture (approximate colors).
+    pub texture_colored_faces: u64,
 }
 
 impl CadModel<'_> {
@@ -277,16 +342,39 @@ impl CadModel<'_> {
         for p in &self.points {
             take(p.vertex);
         }
+        for c in &self.splines {
+            c.control.iter().for_each(|&v| take(v));
+        }
+        for s in &self.surfaces {
+            if let Some((a, b)) = s.body.bounds() {
+                for axis in 0..3 {
+                    lo[axis] = lo[axis].min(a[axis]);
+                    hi[axis] = hi[axis].max(b[axis]);
+                }
+                any = true;
+            }
+        }
         any.then_some((lo, hi))
     }
 }
 
 /// Characters AutoCAD rejects in symbol-table names.
-const INVALID_NAME_CHARS: &[char] = &['<', '>', '/', '\\', '"', ':', ';', '?', '*', '|', '=', '`', ','];
+const INVALID_NAME_CHARS: &[char] = &[
+    '<', '>', '/', '\\', '"', ':', ';', '?', '*', '|', '=', '`', ',',
+];
 
 fn dxf_safe_name(raw: &str) -> String {
-    let mut s: String =
-        raw.trim().chars().map(|c| if INVALID_NAME_CHARS.contains(&c) || c.is_control() { '_' } else { c }).collect();
+    let mut s: String = raw
+        .trim()
+        .chars()
+        .map(|c| {
+            if INVALID_NAME_CHARS.contains(&c) || c.is_control() {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
     if s.chars().count() > 255 {
         s = s.chars().take(255).collect();
     }
@@ -313,7 +401,11 @@ struct LayerTable {
 impl LayerTable {
     fn new(default_name: &str) -> Self {
         Self {
-            layers: vec![Layer { name: "0".into(), source: String::new(), color: layer_color(0) }],
+            layers: vec![Layer {
+                name: "0".into(),
+                source: String::new(),
+                color: layer_color(0),
+            }],
             by_source: HashMap::new(),
             taken: HashSet::from(["0".to_owned()]),
             default: None,
@@ -339,7 +431,11 @@ impl LayerTable {
         }
         let name = self.unique(source);
         let id = self.layers.len() as u32;
-        self.layers.push(Layer { name, source: source.to_owned(), color: layer_color(id) });
+        self.layers.push(Layer {
+            name,
+            source: source.to_owned(),
+            color: layer_color(id),
+        });
         self.by_source.insert(source.to_owned(), id);
         id
     }
@@ -348,16 +444,111 @@ impl LayerTable {
         if let Some(id) = self.default {
             return id;
         }
-        let base = if self.default_name.trim().is_empty() { "OBJ".to_owned() } else { self.default_name.clone() };
+        let base = if self.default_name.trim().is_empty() {
+            "OBJ".to_owned()
+        } else {
+            self.default_name.clone()
+        };
         let name = self.unique(&base);
         let id = self.layers.len() as u32;
-        self.layers.push(Layer { name, source: String::new(), color: layer_color(id) });
+        self.layers.push(Layer {
+            name,
+            source: String::new(),
+            color: layer_color(id),
+        });
         self.default = Some(id);
         id
     }
 }
 
-pub fn convert<'a>(doc: &'a ObjDocument, palette: Option<&Palette>, options: Options) -> CadModel<'a> {
+pub fn convert<'a>(
+    doc: &'a ObjDocument,
+    palette: Option<&Palette>,
+    options: Options,
+) -> CadModel<'a> {
+    convert_with(
+        doc,
+        &Materials {
+            palette,
+            textures: HashMap::new(),
+        },
+        options,
+    )
+}
+
+/// Color of vertex `v` from the file (`v x y z r g b`, or a point cloud's RGB columns).
+fn vertex_rgb(doc: &ObjDocument, v: u32) -> Option<[u8; 3]> {
+    doc.colors
+        .get(v as usize)
+        .copied()
+        .flatten()
+        .map(|c| c.map(|x| (f64::from(x).clamp(0.0, 1.0) * 255.0).round() as u8))
+}
+
+/// Per-face colors sampled from textures, reduced per texture (see [`TEXTURE_COLORS`]).
+/// `None` for faces that keep their material color.
+fn texture_colors(doc: &ObjDocument, materials: &Materials) -> Option<Vec<Option<[u8; 3]>>> {
+    if materials.textures.is_empty() || doc.face_uvs.is_empty() {
+        return None;
+    }
+    let tex_of_attr: Vec<Option<(usize, &Texture)>> = doc
+        .attrs
+        .iter()
+        .map(|a| {
+            let m = a.material?;
+            let name = doc.materials[m as usize].as_str();
+            materials.textures.get(name).map(|t| (m as usize, t))
+        })
+        .collect();
+    if tex_of_attr.iter().all(Option::is_none) {
+        return None;
+    }
+    let mut out: Vec<Option<[u8; 3]>> = vec![None; doc.faces.len()];
+    // Sampled colors per material, then reduced.
+    let mut sampled: HashMap<usize, (Vec<usize>, Vec<[u8; 3]>)> = HashMap::new();
+    let mut uvs: Vec<[f32; 2]> = Vec::new();
+    for fi in 0..doc.faces.len() {
+        let Some((m, tex)) = tex_of_attr[doc.faces.attr[fi] as usize] else {
+            continue;
+        };
+        let range = doc.faces.offsets[fi] as usize..doc.faces.offsets[fi + 1] as usize;
+        uvs.clear();
+        for &t in &doc.face_uvs[range] {
+            if t == NO_UV {
+                break;
+            }
+            uvs.push(doc.texcoords[t as usize]);
+        }
+        if uvs.len() != doc.faces.get(fi).len() {
+            continue;
+        }
+        let c = tex
+            .face_color(&uvs)
+            .map(|x| x.round().clamp(0.0, 255.0) as u8);
+        let e = sampled.entry(m).or_default();
+        e.0.push(fi);
+        e.1.push(c);
+    }
+    let mut keys: Vec<usize> = sampled.keys().copied().collect();
+    keys.sort_unstable();
+    for m in keys {
+        let (faces, colors) = &sampled[&m];
+        let (palette, index) = texture::quantize(colors, TEXTURE_COLORS);
+        for (&fi, &k) in faces.iter().zip(&index) {
+            out[fi] = Some(palette[k as usize]);
+        }
+    }
+    Some(out)
+}
+
+/// [`convert`] with textures: faces on a textured material that have texture coordinates
+/// are colored from the image (one color per face, approximate). Shapes are unchanged.
+pub fn convert_with<'a>(
+    doc: &'a ObjDocument,
+    materials: &Materials,
+    options: Options,
+) -> CadModel<'a> {
+    let palette = materials.palette;
     let mut diags = Diagnostics::default();
     note_dropped(doc, &mut diags);
     if palette.is_none() && !doc.materials.is_empty() {
@@ -391,7 +582,11 @@ pub fn convert<'a>(doc: &'a ObjDocument, palette: Option<&Palette>, options: Opt
             }
         })
         .collect();
-    if table.layers.iter().any(|l| !l.source.is_empty() && l.name != l.source) {
+    if table
+        .layers
+        .iter()
+        .any(|l| !l.source.is_empty() && l.name != l.source)
+    {
         diags.push(Severity::Info, Code::LayerRenamed, 0, || {
             "some names were adjusted to be valid, unique layer names (see layer map)".into()
         });
@@ -402,21 +597,32 @@ pub fn convert<'a>(doc: &'a ObjDocument, palette: Option<&Palette>, options: Opt
         .layers
         .iter()
         .enumerate()
-        .filter(|(_, l)| options.exclude_layers.iter().any(|x| x.eq_ignore_ascii_case(&l.name)))
+        .filter(|(_, l)| {
+            options
+                .exclude_layers
+                .iter()
+                .any(|x| x.eq_ignore_ascii_case(&l.name))
+        })
         .map(|(i, _)| i as u32)
         .collect();
     let mut omissions = Omissions {
         freeform_surfaces: doc.counts.freeform_surfaces,
         freeform_curves: doc.counts.freeform_curves,
         broken_faces: doc.counts.faces_skipped,
-        excluded_layers: excluded.iter().map(|&i| table.layers[i as usize].name.clone()).collect(),
+        excluded_layers: excluded
+            .iter()
+            .map(|&i| table.layers[i as usize].name.clone())
+            .collect(),
         ..Default::default()
     };
     omissions.excluded_layers.sort();
 
     let color_of_attr = |attr: u32| -> Option<[u8; 3]> {
         let m = doc.attrs[attr as usize].material?;
-        palette?.get(&doc.materials[m as usize]).copied().map(kd_to_rgb)
+        palette?
+            .get(&doc.materials[m as usize])
+            .copied()
+            .map(kd_to_rgb)
     };
 
     // ---- meshes: one per (layer, color) in order of first use, chunked ------------------
@@ -424,23 +630,40 @@ pub fn convert<'a>(doc: &'a ObjDocument, palette: Option<&Palette>, options: Opt
     let mut meshes: Vec<MeshEntity> = Vec::new();
     let mut open: HashMap<(u32, Option<[u8; 3]>), usize> = HashMap::new();
     // Per-attribute (layer, color) keys, computed once rather than per face.
-    let keys: Vec<(u32, Option<[u8; 3]>)> =
-        (0..doc.attrs.len() as u32).map(|a| (layer_of_attr[a as usize], color_of_attr(a))).collect();
+    let keys: Vec<(u32, Option<[u8; 3]>)> = (0..doc.attrs.len() as u32)
+        .map(|a| (layer_of_attr[a as usize], color_of_attr(a)))
+        .collect();
+    let face_colors = texture_colors(doc, materials);
+    let texture_colored_faces = face_colors
+        .as_ref()
+        .map_or(0, |c| c.iter().filter(|x| x.is_some()).count() as u64);
+    if texture_colored_faces > 0 {
+        diags.push(Severity::Info, Code::TextureColors, 0, || {
+            format!(
+                "{texture_colored_faces} faces are colored from textures, at most {TEXTURE_COLORS} colors per texture (approximate)"
+            )
+        });
+    }
     // Source vertex -> (mesh, local index) for the first mesh that used it; vertices shared
     // with other meshes fall back to a map (rare: only on layer/material borders).
     let mut slot: Vec<(u32, u32)> = vec![(u32::MAX, 0); doc.positions.len()];
     let mut shared: HashMap<(u32, u32), u32> = HashMap::new();
-    let (mut last_attr, mut last_mi) = (u32::MAX, 0usize);
+    let (mut last_key, mut last_mi) = (None, 0usize);
     for (fi, face) in doc.faces.iter().enumerate() {
         let attr = doc.faces.attr[fi];
-        let key = keys[attr as usize];
+        let mut key = keys[attr as usize];
+        if let Some(c) = face_colors.as_ref().and_then(|c| c[fi]) {
+            key.1 = Some(c);
+        }
         if excluded.contains(&key.0) {
             omissions.excluded_faces += 1;
             face.iter().for_each(|&v| referenced[v as usize] = true);
             continue;
         }
-        let full = meshes.get(last_mi).is_some_and(|m| m.face_count() >= MAX_FACES_PER_MESH);
-        if attr != last_attr || full {
+        let full = meshes
+            .get(last_mi)
+            .is_some_and(|m| m.face_count() >= MAX_FACES_PER_MESH);
+        if last_key != Some(key) || full {
             last_mi = match open.get(&key) {
                 Some(&mi) if meshes[mi].face_count() < MAX_FACES_PER_MESH => mi,
                 _ => {
@@ -450,12 +673,13 @@ pub fn convert<'a>(doc: &'a ObjDocument, palette: Option<&Palette>, options: Opt
                         vertices: Vec::new(),
                         face_offsets: vec![0],
                         face_indices: Vec::new(),
+                        source_faces: Vec::new(),
                     });
                     open.insert(key, meshes.len() - 1);
                     meshes.len() - 1
                 }
             };
-            last_attr = attr;
+            last_key = Some(key);
         }
         let mi = last_mi;
         let m = &mut meshes[mi];
@@ -478,6 +702,7 @@ pub fn convert<'a>(doc: &'a ObjDocument, palette: Option<&Palette>, options: Opt
             m.face_indices.push(li);
         }
         m.face_offsets.push(m.face_indices.len() as u32);
+        m.source_faces.push(fi as u32);
     }
     let face_vertices: usize = {
         let mut seen = vec![false; doc.positions.len()];
@@ -517,7 +742,11 @@ pub fn convert<'a>(doc: &'a ObjDocument, palette: Option<&Palette>, options: Opt
             omissions.excluded_lines += 1;
             continue;
         }
-        polylines.push(PolylineEntity { layer: layer_of_attr[attr as usize], color: color_of_attr(attr), vertices: l.to_vec() });
+        polylines.push(PolylineEntity {
+            layer: layer_of_attr[attr as usize],
+            color: color_of_attr(attr),
+            vertices: l.to_vec(),
+        });
     }
     let mut points = Vec::new();
     for (i, p) in doc.points.iter().enumerate() {
@@ -528,22 +757,68 @@ pub fn convert<'a>(doc: &'a ObjDocument, palette: Option<&Palette>, options: Opt
                 omissions.excluded_points += 1;
                 continue;
             }
-            points.push(PointEntity { layer: layer_of_attr[attr as usize], color: color_of_attr(attr), vertex: v });
+            points.push(PointEntity {
+                layer: layer_of_attr[attr as usize],
+                color: vertex_rgb(doc, v).or_else(|| color_of_attr(attr)),
+                vertex: v,
+            });
         }
     }
+
+    let mut splines = Vec::new();
+    for c in &doc.curves {
+        c.control
+            .iter()
+            .for_each(|&v| referenced[v as usize] = true);
+        let layer = layer_of_attr[c.attr as usize];
+        if excluded.contains(&layer) {
+            omissions.excluded_lines += 1;
+            continue;
+        }
+        splines.push(SplineEntity {
+            layer,
+            color: color_of_attr(c.attr),
+            degree: c.degree,
+            knots: c.knots.clone(),
+            control: c.control.clone(),
+            weights: c.rational.then(|| {
+                c.control
+                    .iter()
+                    .map(|&v| doc.weights.get(v as usize).copied().unwrap_or(1.0))
+                    .collect()
+            }),
+        });
+    }
+    // Only the free-form curves that couldn't be written are left out.
+    omissions.freeform_curves = doc
+        .counts
+        .freeform_curves
+        .saturating_sub(doc.curves.len() as u64);
 
     // Loose vertices: a file of nothing but vertices is a point cloud, written as points.
     // In other files they are usually leftovers, kept only on request.
     let unreferenced = referenced.iter().filter(|r| !**r).count() as u64;
-    let point_cloud = doc.faces.is_empty() && doc.lines.is_empty() && doc.points.is_empty() && !doc.positions.is_empty();
+    let point_cloud = doc.faces.is_empty()
+        && doc.lines.is_empty()
+        && doc.points.is_empty()
+        && doc.curves.is_empty()
+        && !doc.positions.is_empty();
     if unreferenced > 0 && (point_cloud || options.keep_loose_points) {
         let layer = table.default_layer();
-        if options.exclude_layers.iter().any(|x| x.eq_ignore_ascii_case(&table.layers[layer as usize].name)) {
+        if options
+            .exclude_layers
+            .iter()
+            .any(|x| x.eq_ignore_ascii_case(&table.layers[layer as usize].name))
+        {
             omissions.excluded_points += unreferenced;
         } else {
             for (v, used) in referenced.iter().enumerate() {
                 if !used {
-                    points.push(PointEntity { layer, color: None, vertex: v as u32 });
+                    points.push(PointEntity {
+                        layer,
+                        color: vertex_rgb(doc, v as u32),
+                        vertex: v as u32,
+                    });
                 }
             }
         }
@@ -558,7 +833,9 @@ pub fn convert<'a>(doc: &'a ObjDocument, palette: Option<&Palette>, options: Opt
     }
     if !omissions.excluded_layers.is_empty() {
         let names = omissions.excluded_layers.join(", ");
-        diags.push(Severity::Info, Code::LayersExcluded, 0, || format!("layers left out on request: {names}"));
+        diags.push(Severity::Info, Code::LayersExcluded, 0, || {
+            format!("layers left out on request: {names}")
+        });
     }
 
     let mut diagnostics = doc.diagnostics.clone();
@@ -572,26 +849,86 @@ pub fn convert<'a>(doc: &'a ObjDocument, palette: Option<&Palette>, options: Opt
         meshes,
         polylines,
         points,
+        splines,
+        surfaces: Vec::new(),
         diagnostics,
         unreferenced_vertices: unreferenced,
         omissions,
         point_cloud,
+        texture_colored_faces,
     }
 }
 
 fn note_dropped(doc: &ObjDocument, d: &mut Diagnostics) {
     let c = &doc.counts;
+    // Rational curves carry their control vertices' weights; other weights are lost.
+    let weights_lost = if c.weighted_vertices == 0 {
+        0
+    } else {
+        let mut carried = vec![false; doc.positions.len()];
+        for curve in doc.curves.iter().filter(|x| x.rational) {
+            curve
+                .control
+                .iter()
+                .for_each(|&v| carried[v as usize] = true);
+        }
+        doc.weights
+            .iter()
+            .enumerate()
+            .filter(|&(v, &w)| w != 1.0 && !carried[v])
+            .count() as u64
+    };
+    // Points carry their vertex's color; faces and lines carry one color per entity.
+    let colors_lost = if c.vertices_with_color == 0 {
+        0
+    } else {
+        let mut seen = vec![false; doc.positions.len()];
+        for &v in doc.faces.indices.iter().chain(&doc.lines.indices) {
+            if doc.colors[v as usize].is_some() {
+                seen[v as usize] = true;
+            }
+        }
+        seen.iter().filter(|x| **x).count() as u64
+    };
     let drops: [(u64, Code, &str); 6] = [
-        (c.texcoords, Code::TexcoordsDropped, "texture coordinates (vt) are not stored in DXF/DWG"),
-        (c.normals, Code::NormalsDropped, "vertex normals (vn) are not stored in DXF/DWG"),
-        (c.param_vertices, Code::ParamVerticesDropped, "parameter-space vertices (vp) were not written"),
-        (c.weighted_vertices, Code::VertexWeightDropped, "homogeneous vertex weights (w ≠ 1) were not written"),
-        (c.vertices_with_color, Code::VertexColorsDropped, "per-vertex colors are not written yet"),
-        (c.smoothing_statements, Code::SmoothingGroupsIgnored, "smoothing groups (s) have no DXF/DWG equivalent"),
+        (
+            c.texcoords,
+            Code::TexcoordsDropped,
+            "texture coordinates (vt) are not stored in DXF/DWG",
+        ),
+        (
+            c.normals,
+            Code::NormalsDropped,
+            "vertex normals (vn) are not stored in DXF/DWG",
+        ),
+        (
+            c.param_vertices,
+            Code::ParamVerticesDropped,
+            "parameter-space vertices (vp) were not written",
+        ),
+        (
+            weights_lost,
+            Code::VertexWeightDropped,
+            "homogeneous vertex weights (w ≠ 1) were not written",
+        ),
+        (
+            colors_lost,
+            Code::VertexColorsDropped,
+            "per-vertex colors on faces and lines are not written",
+        ),
+        (
+            c.smoothing_statements,
+            Code::SmoothingGroupsIgnored,
+            "smoothing groups (s) have no DXF/DWG equivalent",
+        ),
     ];
     for (n, code, msg) in drops {
         if n > 0 {
-            let sev = if code == Code::SmoothingGroupsIgnored { Severity::Info } else { Severity::Warning };
+            let sev = if code == Code::SmoothingGroupsIgnored {
+                Severity::Info
+            } else {
+                Severity::Warning
+            };
             d.push(sev, code, 0, || format!("{msg} ({n} in source)"));
         }
     }
@@ -609,7 +946,14 @@ mod tests {
     #[test]
     fn axis_swap_is_exact_including_text_and_signed_zero() {
         let doc = parse(b"v 1.5 -0.000000 2.25\nv 0 3 -4\np 1 2\n").unwrap();
-        let m = convert(&doc, None, Options { up_axis: UpAxis::YUpToZUp, ..Default::default() });
+        let m = convert(
+            &doc,
+            None,
+            Options {
+                up_axis: UpAxis::YUpToZUp,
+                ..Default::default()
+            },
+        );
         assert_eq!(m.position(0), [1.5, -2.25, -0.0]);
         assert!(m.position(0)[2].is_sign_negative());
         assert_eq!(m.coord_text(0, 1), "-2.25");
@@ -619,7 +963,9 @@ mod tests {
 
     #[test]
     fn layers_are_valid_and_unique() {
-        let doc = parse(b"v 0 0 0\nv 1 0 0\nv 0 1 0\no a/b\nf 1 2 3\no a_b\nf 1 2 3\no A_B\nf 1 2 3\n").unwrap();
+        let doc =
+            parse(b"v 0 0 0\nv 1 0 0\nv 0 1 0\no a/b\nf 1 2 3\no a_b\nf 1 2 3\no A_B\nf 1 2 3\n")
+                .unwrap();
         let m = convert(&doc, None, Options::default());
         assert_eq!(names(&m), ["0", "a_b", "a_b~2", "A_B~3"]);
         assert!(m.diagnostics.iter().any(|d| d.code == Code::LayerRenamed));
@@ -628,7 +974,14 @@ mod tests {
     #[test]
     fn unnamed_geometry_goes_on_the_default_layer_not_layer_0() {
         let doc = parse(b"v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\no Lid\nf 3 2 1\n").unwrap();
-        let m = convert(&doc, None, Options { default_layer: "chair".into(), ..Default::default() });
+        let m = convert(
+            &doc,
+            None,
+            Options {
+                default_layer: "chair".into(),
+                ..Default::default()
+            },
+        );
         assert_eq!(names(&m), ["0", "chair", "Lid"]);
         assert!(m.meshes.iter().all(|e| e.layer != 0));
         assert_eq!(m.layers[1].color, LAYER_COLORS[0]);
@@ -638,7 +991,16 @@ mod tests {
     fn layer_modes() {
         let src = b"v 0 0 0\nv 1 0 0\nv 0 1 0\no Chair\ng seat\nusemtl wood\nf 1 2 3\ng back\nusemtl steel\nf 3 2 1\n";
         let doc = parse(src).unwrap();
-        let by = |mode| names(&convert(&doc, None, Options { layer_mode: mode, ..Default::default() }));
+        let by = |mode| {
+            names(&convert(
+                &doc,
+                None,
+                Options {
+                    layer_mode: mode,
+                    ..Default::default()
+                },
+            ))
+        };
         assert_eq!(by(LayerMode::Objects), ["0", "Chair"]);
         assert_eq!(by(LayerMode::Groups), ["0", "seat", "back"]);
         assert_eq!(by(LayerMode::Materials), ["0", "wood", "steel"]);
@@ -660,8 +1022,22 @@ mod tests {
     fn loose_vertices() {
         let doc = parse(b"v 0 0 0\nv 1 0 0\nv 0 1 0\nv 9 9 9\nf 1 2 3\n").unwrap();
         let m = convert(&doc, None, Options::default());
-        assert_eq!((m.unreferenced_vertices, m.points.len(), m.omissions.loose_points), (1, 0, 1));
-        let m = convert(&doc, None, Options { keep_loose_points: true, ..Default::default() });
+        assert_eq!(
+            (
+                m.unreferenced_vertices,
+                m.points.len(),
+                m.omissions.loose_points
+            ),
+            (1, 0, 1)
+        );
+        let m = convert(
+            &doc,
+            None,
+            Options {
+                keep_loose_points: true,
+                ..Default::default()
+            },
+        );
         assert_eq!((m.points.len(), m.omissions.loose_points), (1, 0));
         assert_eq!(m.points[0].vertex, 3);
     }
@@ -669,7 +1045,14 @@ mod tests {
     #[test]
     fn point_clouds_become_points() {
         let doc = parse(b"v 0 0 0\nv 1 0 0\nv 0 1 0\n").unwrap();
-        let m = convert(&doc, None, Options { default_layer: "scan".into(), ..Default::default() });
+        let m = convert(
+            &doc,
+            None,
+            Options {
+                default_layer: "scan".into(),
+                ..Default::default()
+            },
+        );
         assert!(m.point_cloud);
         assert_eq!(m.points.len(), 3);
         assert_eq!(m.layers[m.points[0].layer as usize].name, "scan");
@@ -677,21 +1060,44 @@ mod tests {
 
     #[test]
     fn excluded_layers_are_left_out_and_recorded() {
-        let doc = parse(b"v 0 0 0\nv 1 0 0\nv 0 1 0\no Keep\nf 1 2 3\no Drop\nf 3 2 1\nl 1 2\n").unwrap();
-        let m = convert(&doc, None, Options { exclude_layers: vec!["drop".into()], ..Default::default() });
+        let doc =
+            parse(b"v 0 0 0\nv 1 0 0\nv 0 1 0\no Keep\nf 1 2 3\no Drop\nf 3 2 1\nl 1 2\n").unwrap();
+        let m = convert(
+            &doc,
+            None,
+            Options {
+                exclude_layers: vec!["drop".into()],
+                ..Default::default()
+            },
+        );
         assert_eq!(m.meshes.iter().map(|e| e.face_count()).sum::<usize>(), 1);
         assert!(m.polylines.is_empty());
         assert_eq!(m.omissions.excluded_layers, ["Drop"]);
-        assert_eq!((m.omissions.excluded_faces, m.omissions.excluded_lines), (1, 1));
-        assert!(!m.omissions.is_partial(), "leaving out what was asked isn't partial");
-        assert_eq!(m.unreferenced_vertices, 0, "vertices of excluded faces aren't 'loose'");
+        assert_eq!(
+            (m.omissions.excluded_faces, m.omissions.excluded_lines),
+            (1, 1)
+        );
+        assert!(
+            !m.omissions.is_partial(),
+            "leaving out what was asked isn't partial"
+        );
+        assert_eq!(
+            m.unreferenced_vertices, 0,
+            "vertices of excluded faces aren't 'loose'"
+        );
     }
 
     #[test]
     fn omissions_track_what_is_missing() {
-        let doc = parse(b"v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\nf 1 2\ncstype bspline\nsurf 0 1 0 1 1 2 3\n").unwrap();
+        let doc = parse(
+            b"v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\nf 1 2\ncstype bspline\nsurf 0 1 0 1 1 2 3\n",
+        )
+        .unwrap();
         let m = convert(&doc, None, Options::default());
-        assert_eq!((m.omissions.broken_faces, m.omissions.freeform_surfaces), (1, 1));
+        assert_eq!(
+            (m.omissions.broken_faces, m.omissions.freeform_surfaces),
+            (1, 1)
+        );
         assert!(m.omissions.is_partial());
     }
 }
