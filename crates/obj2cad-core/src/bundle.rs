@@ -21,7 +21,8 @@ use std::collections::{BTreeMap, HashMap};
 pub struct InputFile<'a> {
     pub path: String,
     pub bytes: &'a [u8],
-    /// Precomputed SHA-256 (the browser hashes natively); computed when `None`.
+    /// Precomputed SHA-256 (the browser hashes natively); computed when `None`. Empty
+    /// when the caller supplies it after loading, with [`Bundle::set_hashes`].
     pub sha256: Option<String>,
     /// Modification time, Unix seconds (whole seconds, so every caller agrees).
     pub modified: Option<f64>,
@@ -80,6 +81,37 @@ pub struct Bundle {
     pub source_len: u64,
     /// The newest modification time among the files used: the drawing's date.
     pub modified: Option<f64>,
+    /// Entries of the models and clouds (for the identity).
+    geometry: Vec<usize>,
+}
+
+impl Bundle {
+    /// Set each input file's SHA-256 (by its position in the list given to [`load`]) and
+    /// the identity that follows from them. For callers that hash while the files are
+    /// parsed: they load with empty hashes, then set them here.
+    pub fn set_hashes(&mut self, sha256: &[String]) {
+        for e in &mut self.files {
+            if let Some(h) = sha256.get(e.input) {
+                e.sha256 = Some(h.clone());
+            }
+        }
+        self.source_sha256 = source_sha256(&self.files, &self.geometry);
+    }
+}
+
+/// The model's SHA-256; for several models or clouds, a hash of every used file's name and
+/// SHA-256 (sorted).
+fn source_sha256(entries: &[FileEntry], geometry: &[usize]) -> String {
+    if let [g] = geometry {
+        return entries[*g].sha256.clone().unwrap_or_default();
+    }
+    let used: BTreeMap<&str, &str> = entries
+        .iter()
+        .filter(|e| !matches!(e.role, Role::NotUsed | Role::Missing))
+        .map(|e| (e.name.as_str(), e.sha256.as_deref().unwrap_or("")))
+        .collect();
+    let manifest: String = used.iter().map(|(n, h)| format!("{h}  {n}\n")).collect();
+    sha256_hex(manifest.as_bytes())
 }
 
 /// A model or cloud that couldn't be read, and which file it was.
@@ -356,20 +388,11 @@ pub fn load(
             e.sha256 = Some(sha256_hex(f.bytes));
         }
     }
-    let (display, source_sha256, source_len) = if geometry.len() == 1 {
+    let source_sha256 = source_sha256(&entries, &geometry);
+    let (display, source_len) = if geometry.len() == 1 {
         let g = geometry[0];
-        (
-            names[g].clone(),
-            entries[g].sha256.clone().unwrap_or_default(),
-            files[g].bytes.len() as u64,
-        )
+        (names[g].clone(), files[g].bytes.len() as u64)
     } else {
-        let used: BTreeMap<&str, &str> = entries
-            .iter()
-            .filter(|e| !matches!(e.role, Role::NotUsed | Role::Missing))
-            .map(|e| (e.name.as_str(), e.sha256.as_deref().unwrap_or("")))
-            .collect();
-        let manifest: String = used.iter().map(|(n, h)| format!("{h}  {n}\n")).collect();
         let len = entries
             .iter()
             .filter(|e| !matches!(e.role, Role::NotUsed | Role::Missing))
@@ -383,7 +406,7 @@ pub fn load(
                 .map_or("bundle", |&g| stem_of(&names[g]))
                 .to_owned()
         };
-        (display, sha256_hex(manifest.as_bytes()), len)
+        (display, len)
     };
     let modified = entries
         .iter()
@@ -403,6 +426,7 @@ pub fn load(
         name: display,
         source_sha256,
         source_len,
+        geometry,
     })
 }
 
@@ -636,6 +660,42 @@ mod tests {
             bytes,
             sha256: None,
             modified: None,
+        }
+    }
+
+    #[test]
+    fn hashes_given_after_loading_give_the_same_identity() {
+        let a = b"v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n".as_slice();
+        let b = b"v 5 0 0\nv 6 0 0\nv 5 1 0\nf 1 2 3\n".as_slice();
+        for set in [
+            vec![("a.obj", a)],
+            vec![("a.obj", a), ("b.obj", b), ("notes.txt", b"x".as_slice())],
+        ] {
+            let now = load(
+                set.iter().map(|(p, x)| file(p, x)).collect(),
+                "site",
+                |_, _| {},
+            )
+            .unwrap();
+            let later_files = set
+                .iter()
+                .map(|(p, x)| InputFile {
+                    sha256: Some(String::new()),
+                    ..file(p, x)
+                })
+                .collect();
+            let mut later = load(later_files, "site", |_, _| {}).unwrap();
+            assert_ne!(later.source_sha256, now.source_sha256);
+            later.set_hashes(&set.iter().map(|(_, x)| sha256_hex(x)).collect::<Vec<_>>());
+            assert_eq!(later.source_sha256, now.source_sha256);
+            let hashes = |b: &Bundle| b.files.iter().map(|f| f.sha256.clone()).collect::<Vec<_>>();
+            assert_eq!(hashes(&later).len(), hashes(&now).len());
+            // Unused files are hashed only when given (the engine doesn't hash them itself).
+            for (l, n) in hashes(&later).iter().zip(hashes(&now)) {
+                if n.is_some() {
+                    assert_eq!(l, &n);
+                }
+            }
         }
     }
 

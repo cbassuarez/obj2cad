@@ -40,6 +40,18 @@ fn split(line: &[u8], sep: Sep) -> Vec<&[u8]> {
         .collect()
 }
 
+/// The tokens of a row, as [`split`] finds them, without collecting them.
+fn tokens(line: &[u8], sep: Sep) -> impl Iterator<Item = &[u8]> {
+    let is_sep = move |b: &u8| match sep {
+        Sep::Space => *b == b' ' || *b == b'\t',
+        Sep::Comma => *b == b',',
+        Sep::Semicolon => *b == b';',
+    };
+    line.split(is_sep)
+        .map(trim)
+        .filter(move |t| sep != Sep::Space || !t.is_empty())
+}
+
 fn trim(t: &[u8]) -> &[u8] {
     let start = t
         .iter()
@@ -119,40 +131,41 @@ pub fn parse(src: &[u8], name: &str) -> Result<ObjDocument, ParseError> {
         b'\n'
     };
 
-    // Data lines: (line number, bytes).
-    let mut data: Vec<(u64, &[u8])> = Vec::new();
+    // The lines, numbered from 1, without their line ending, trimmed.
+    let lines = memchr::memchr_iter(sep_byte, src)
+        .chain(std::iter::once(src.len()))
+        .scan(0usize, |start, end| {
+            let raw = &src[*start..end];
+            *start = end + 1;
+            Some(trim(raw.strip_suffix(b"\r").unwrap_or(raw)))
+        })
+        .enumerate()
+        .map(|(i, t)| (i as u64 + 1, t))
+        .filter(|(_, t)| !(t.is_empty() || t[0] == b'#' || t.starts_with(b"//")));
+
+    // The first line may be a point count (PTS) or a row of column names.
+    let mut lines = lines.peekable();
     let mut declared: Option<(u64, u64)> = None;
-    let mut seen_content = false;
-    for (i, raw) in src.split(|&b| b == sep_byte).enumerate() {
-        let line = i as u64 + 1;
-        let t = trim(raw.strip_suffix(b"\r").unwrap_or(raw));
-        if t.is_empty() || t[0] == b'#' || t.starts_with(b"//") {
-            continue;
+    if let Some(&(line, t)) = lines.peek() {
+        if t.iter().all(u8::is_ascii_digit) {
+            declared = std::str::from_utf8(t)
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .map(|n| (line, n));
+            lines.next();
+        } else if t
+            .iter()
+            .any(|b| b.is_ascii_alphabetic() && !matches!(b, b'e' | b'E'))
+            && !t
+                .windows(3)
+                .any(|w| w.eq_ignore_ascii_case(b"nan") || w.eq_ignore_ascii_case(b"inf"))
+        {
+            lines.next();
         }
-        if !seen_content {
-            seen_content = true;
-            // A point count (PTS) or a row of column names.
-            if t.iter().all(u8::is_ascii_digit) {
-                declared = std::str::from_utf8(t)
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .map(|n| (line, n));
-                continue;
-            }
-            if t.iter()
-                .any(|b| b.is_ascii_alphabetic() && !matches!(b, b'e' | b'E'))
-                && !t
-                    .windows(3)
-                    .any(|w| w.eq_ignore_ascii_case(b"nan") || w.eq_ignore_ascii_case(b"inf"))
-            {
-                continue;
-            }
-        }
-        data.push((line, t));
     }
 
     let mut issues: Vec<ParseIssue> = Vec::new();
-    let Some(&(first_line, first)) = data.first() else {
+    let Some(&(first_line, first)) = lines.peek() else {
         let mut doc = empty_doc();
         doc.diagnostics = Vec::new();
         return Ok(doc);
@@ -176,7 +189,15 @@ pub fn parse(src: &[u8], name: &str) -> Result<ObjDocument, ParseError> {
         return Err(fail(issues, false));
     }
 
-    // Pass 1: validate every number, and learn what the extra columns look like.
+    // One pass: every number is checked and read once; what the extra columns mean is
+    // decided once the whole file is seen, so they are kept (as f32: colors are small
+    // integers, and normals and intensity aren't carried).
+    let estimate = src.len() / (columns * 6);
+    let mut doc = empty_doc();
+    doc.positions.reserve(estimate);
+    doc.coord_offsets.reserve(estimate * 3);
+    doc.coord_text.reserve(src.len() / 2);
+    let mut extra: Vec<f32> = Vec::with_capacity(estimate * (columns - 3));
     let mut facts = vec![
         Column {
             byte: true,
@@ -186,26 +207,30 @@ pub fn parse(src: &[u8], name: &str) -> Result<ObjDocument, ParseError> {
     ];
     let mut unit_rows = [true, true]; // columns 3..6 and 6..9 look like unit normals
     let mut truncated = false;
-    for &(line, text) in &data {
-        let toks = split(text, sep);
-        let issue = if toks.len() != columns {
+    for (line, text) in lines {
+        let mut toks: [&[u8]; 9] = [&[]; 9];
+        let mut count = 0;
+        for t in tokens(text, sep) {
+            if count < 9 {
+                toks[count] = t;
+            }
+            count += 1;
+        }
+        let issue = if count != columns {
             Some((
                 ErrorKind::WrongArity,
-                format!(
-                    "{} columns; the file's first point has {columns}",
-                    toks.len()
-                ),
+                format!("{count} columns; the file's first point has {columns}"),
             ))
         } else {
             let mut bad = None;
             let mut vals = [0f64; 9];
-            for (c, t) in toks.iter().enumerate() {
+            for (c, t) in toks[..columns].iter().enumerate() {
                 match number(t) {
                     Ok(v) => {
                         vals[c] = v;
                         if c >= 3 {
                             let f = &mut facts[c];
-                            f.byte &= t.iter().all(u8::is_ascii_digit) && v <= 255.0;
+                            f.byte &= v <= 255.0 && t.iter().all(u8::is_ascii_digit);
                             f.above_one |= v > 1.0;
                         }
                     }
@@ -215,15 +240,37 @@ pub fn parse(src: &[u8], name: &str) -> Result<ObjDocument, ParseError> {
                     }
                 }
             }
-            if bad.is_none() && columns >= 6 {
-                let unit = |a: usize| {
-                    let n =
-                        vals[a] * vals[a] + vals[a + 1] * vals[a + 1] + vals[a + 2] * vals[a + 2];
-                    (n - 1.0).abs() < 1e-2
-                };
-                unit_rows[0] &= unit(3);
-                if columns == 9 {
-                    unit_rows[1] &= unit(6);
+            if bad.is_none() {
+                if columns >= 6 {
+                    let unit = |a: usize| {
+                        let n = vals[a] * vals[a]
+                            + vals[a + 1] * vals[a + 1]
+                            + vals[a + 2] * vals[a + 2];
+                        (n - 1.0).abs() < 1e-2
+                    };
+                    unit_rows[0] &= unit(3);
+                    if columns == 9 {
+                        unit_rows[1] &= unit(6);
+                    }
+                }
+                // Once a row is wrong nothing more is built; only problems are gathered.
+                if issues.is_empty() {
+                    for t in &toks[..3] {
+                        doc.coord_text.extend_from_slice(t);
+                        let end = u32::try_from(doc.coord_text.len()).map_err(|_| {
+                            fail(
+                                vec![ParseIssue {
+                                    line: 0,
+                                    kind: ErrorKind::TooLarge,
+                                    message: "coordinate text exceeds 4 GB".into(),
+                                }],
+                                false,
+                            )
+                        })?;
+                        doc.coord_offsets.push(end);
+                    }
+                    doc.positions.push([vals[0], vals[1], vals[2]]);
+                    extra.extend(vals[3..columns].iter().map(|&v| v as f32));
                 }
             }
             bad
@@ -284,37 +331,16 @@ pub fn parse(src: &[u8], name: &str) -> Result<ObjDocument, ParseError> {
         },
     };
 
-    // Pass 2: build the document.
-    let mut doc = empty_doc();
-    let n = data.len();
-    doc.positions.reserve(n);
-    doc.colors.reserve(n);
-    doc.coord_offsets.reserve(n * 3);
-    for &(_, text) in &data {
-        let toks = split(text, sep);
-        let mut p = [0f64; 3];
-        for (a, t) in toks[..3].iter().enumerate() {
-            p[a] = number(t).expect("validated");
-            doc.coord_text.extend_from_slice(t);
-            let end = u32::try_from(doc.coord_text.len()).map_err(|_| {
-                fail(
-                    vec![ParseIssue {
-                        line: 0,
-                        kind: ErrorKind::TooLarge,
-                        message: "coordinate text exceeds 4 GB".into(),
-                    }],
-                    false,
-                )
-            })?;
-            doc.coord_offsets.push(end);
-        }
-        doc.positions.push(p);
-        doc.colors.push(
-            layout
-                .rgb_at()
-                .map(|c| [0, 1, 2].map(|k| number(toks[c + k]).expect("validated") as f32 / 255.0)),
-        );
-    }
+    let n = doc.positions.len();
+    let width = columns - 3;
+    doc.colors = match layout.rgb_at() {
+        Some(c) => extra
+            .chunks_exact(width)
+            .map(|e| Some([0, 1, 2].map(|k| e[c - 3 + k] / 255.0)))
+            .collect(),
+        None => vec![None; n],
+    };
+    drop(extra);
     if layout.rgb_at().is_some() {
         doc.counts.vertices_with_color = n as u64;
     }
@@ -364,6 +390,9 @@ fn empty_doc() -> ObjDocument {
 }
 
 fn number(t: &[u8]) -> Result<f64, (ErrorKind, String)> {
+    if let Some(v) = crate::obj::plain_number(t) {
+        return Ok(v);
+    }
     let s = std::str::from_utf8(t).map_err(|_| {
         (
             ErrorKind::InvalidNumber,

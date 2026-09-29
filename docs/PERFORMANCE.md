@@ -63,6 +63,29 @@ and write while it is; Download waits for the file. The figures above predate th
   to the main thread without copying.
 - WebAssembly SIMD enabled (`.cargo/config.toml`).
 
+### Point clouds
+
+Reference: an OBJ with a 94 MB, 3-million-point colored `.xyz` scan (392 MB of DXF).
+Native, before → after: reading the scan 4.7 → 1.0 s, writing 1.2 → 0.6 s, the whole CLI
+run 16.1 → 9.5 s; every output byte-identical.
+
+- **One pass over a cloud:** no list of lines, no allocation per line, each number read
+  once (the extra columns are kept compactly until their meaning is decided).
+- **Plain decimals read fast and exactly:** digits as an integer below 2^53 divided by an
+  exact power of ten, one correctly rounded division (Clinger's fast path, which
+  `str::parse` takes too); anything else goes to `str::parse`. OBJ numbers too.
+- **Writer:** group codes and entity handles written directly (no formatting machinery
+  or allocation per entity); coordinate text copied as bytes.
+- **Hash:** records sort by their first 32 bytes as integers (a point is decided
+  without comparing bytes), and the stream reaches SHA-256 in 64 KB pieces.
+- **In the app:** a .zip is no longer unpacked on the page (it froze it for seconds):
+  the page reads the archive's directory, and the worker takes each file out with the
+  browser's own decompressor. A large cloud next to models loads after them, with a
+  spinner in the layers pane; the file is still written once. The written file becomes a
+  `Blob` a few megabytes at a time while the page is idle (in one go, a 370 MB file held
+  the page for over three seconds). Layer extents come from the engine, so three.js never
+  scans vertex buffers, and colors arrive ready for display.
+
 ## Next levers, if needed
 
 - M2 is at its budget. About 0.63 s is engine work (write, parity, output digest); the rest

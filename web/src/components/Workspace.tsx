@@ -29,6 +29,7 @@ export function Workspace({
   hidden: hiddenNames,
   preview,
   inspection,
+  pending = [],
   prefs,
   busy,
   downloaded,
@@ -54,6 +55,8 @@ export function Workspace({
   hidden: string[];
   preview: PreviewState | null;
   inspection: Inspection | null;
+  /** Files still loading, shown after the rest of the drawing. */
+  pending?: string[];
   prefs: Prefs;
   busy: string | null;
   downloaded: string | null;
@@ -208,6 +211,13 @@ export function Workspace({
       <div className="relative min-h-[200px] flex-1 lg:absolute lg:inset-0">
         <div ref={host} className="absolute inset-0" />
         {preview && available && drawn !== preview.id && <PreparingView />}
+        {preview && preview.buffers.pointStride > 1 && (
+          <div className="pointer-events-none absolute bottom-4 left-1/2 hidden -translate-x-1/2 sm:block">
+            <div className="panel !rounded-[4px] px-3 py-1.5 text-[12.5px] text-fg-2">
+              Showing 1 in {preview.buffers.pointStride} points · the file has every point
+            </div>
+          </div>
+        )}
         {!available && (
           <div className="absolute inset-0 grid place-items-center p-6">
             <div className="panel px-5 py-4 text-[13.5px] font-semibold">No preview for this model</div>
@@ -266,6 +276,7 @@ export function Workspace({
             onSelect={setSelected}
             onHover={setHovered}
             inspection={inspection}
+            pending={pending}
           />
         </motion.div>
       </div>

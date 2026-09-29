@@ -56,7 +56,10 @@ pub use obj2cad_core::output::Meta;
 /// Is `text` a plain decimal DXF readers parse unambiguously: `-?\d+(\.\d+)?([eE][+-]?\d+)?`
 /// with at most 17 significant digits (longer inputs risk mis-rounding in some readers)?
 fn is_plain_decimal(text: &str) -> bool {
-    let b = text.as_bytes();
+    plain_decimal(text.as_bytes())
+}
+
+fn plain_decimal(b: &[u8]) -> bool {
     let mut i = usize::from(b.first() == Some(&b'-'));
     // Significant digits: from the first non-zero mantissa digit to the last non-zero one.
     let (mut seen, mut first_nz, mut last_nz) = (0usize, usize::MAX, 0usize);
@@ -165,8 +168,19 @@ impl Out<'_> {
 
     fn code(&mut self, code: i32) {
         match self.format {
+            // Right-aligned to three characters like AutoCAD writes it (the codes below 1000,
+            // written directly: this runs for every value in the file).
+            Format::Ascii if (0..1000).contains(&code) => {
+                let (h, t, o) = (code / 100, code / 10 % 10, code % 10);
+                self.buf.extend_from_slice(&[
+                    if h > 0 { b'0' + h as u8 } else { b' ' },
+                    if h > 0 || t > 0 { b'0' + t as u8 } else { b' ' },
+                    b'0' + o as u8,
+                    b'\r',
+                    b'\n',
+                ]);
+            }
             Format::Ascii => {
-                // Right-aligned to three characters like AutoCAD writes it.
                 let t = self.itoa.format(code);
                 for _ in t.len()..3 {
                     self.buf.push(b' ');
@@ -296,16 +310,22 @@ impl Out<'_> {
         h
     }
 
-    fn entity_head(
-        &mut self,
-        kind: &str,
-        owner: &str,
-        layer: &str,
-        color: Option<[u8; 3]>,
-    ) -> String {
-        let h = self.handle();
+    /// Start an entity; returns its handle.
+    fn entity_head(&mut self, kind: &str, owner: &str, layer: &str, color: Option<[u8; 3]>) -> u64 {
+        let h = self.next_handle;
+        self.next_handle += 1;
         self.str(0, kind);
-        self.str(5, &h);
+        // The handle in hex, written directly (one per entity: millions for a scan).
+        self.code(5);
+        let digits = (64 - h.leading_zeros()).div_ceil(4).max(1);
+        for i in (0..digits).rev() {
+            self.buf
+                .push(b"0123456789ABCDEF"[(h >> (i * 4)) as usize & 15]);
+        }
+        match self.format {
+            Format::Ascii => self.buf.extend_from_slice(b"\r\n"),
+            Format::Binary => self.buf.push(0),
+        }
         self.str(330, owner);
         self.str(100, "AcDbEntity");
         self.str(8, layer);
@@ -327,19 +347,21 @@ impl Out<'_> {
                 continue;
             }
             self.code(code);
-            let (t, negate) = model.coord_source(v, axis);
-            if is_plain_decimal(t) {
+            let (t, negate) = model.coord_source_bytes(v, axis);
+            if plain_decimal(t) {
                 debug_assert_eq!(
-                    t.parse::<f64>()
+                    std::str::from_utf8(t)
+                        .unwrap()
+                        .parse::<f64>()
                         .map(|x| if negate { -x } else { x }.to_bits()),
                     Ok(p[axis].to_bits())
                 );
-                match (negate, t.strip_prefix('-')) {
-                    (false, _) => self.buf.extend_from_slice(t.as_bytes()),
-                    (true, Some(rest)) => self.buf.extend_from_slice(rest.as_bytes()),
+                match (negate, t.strip_prefix(b"-")) {
+                    (false, _) => self.buf.extend_from_slice(t),
+                    (true, Some(rest)) => self.buf.extend_from_slice(rest),
                     (true, None) => {
                         self.buf.push(b'-');
-                        self.buf.extend_from_slice(t.as_bytes());
+                        self.buf.extend_from_slice(t);
                     }
                 }
             } else {
@@ -555,7 +577,10 @@ fn entities(out: &mut Out, model: &CadModel, meta: &Meta) -> io::Result<()> {
     }
     for l in &model.polylines {
         let layer = &model.layers[l.layer as usize].name;
-        let h = out.entity_head("POLYLINE", MODEL_SPACE_RECORD, layer, l.color);
+        let h = format!(
+            "{:X}",
+            out.entity_head("POLYLINE", MODEL_SPACE_RECORD, layer, l.color)
+        );
         out.str(100, "AcDb3dPolyline");
         out.int(66, 1);
         for code in [10, 20, 30] {
@@ -604,7 +629,10 @@ fn entities(out: &mut Out, model: &CadModel, meta: &Meta) -> io::Result<()> {
     for s in &model.surfaces {
         let layer = &model.layers[s.layer as usize].name;
         let kind = if s.body.solid { "3DSOLID" } else { "SURFACE" };
-        let h = out.entity_head(kind, MODEL_SPACE_RECORD, layer, s.color);
+        let h = format!(
+            "{:X}",
+            out.entity_head(kind, MODEL_SPACE_RECORD, layer, s.color)
+        );
         out.str(100, "AcDbModelerGeometry");
         out.int(290, 1);
         out.str(

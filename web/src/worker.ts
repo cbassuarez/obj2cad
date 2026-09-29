@@ -5,6 +5,7 @@
 import initCore, * as core from "./wasm/obj2cad_wasm.js";
 import type { EngineSettings } from "@/lib/settings";
 import { geometryKey } from "@/lib/settings";
+import { extract, type ZipEntry } from "@/lib/zip";
 
 type Module = typeof core;
 type Kind = "core" | "dwg";
@@ -49,6 +50,10 @@ export interface PreviewBuffers {
   points: Float32Array;
   pointColors: Uint8Array;
   pointGroups: Uint32Array;
+  /** Per layer: `[layer, min x, y, z, max x, y, z]`. */
+  layerBounds: Float32Array;
+  /** 1, or n when a large cloud is shown as every n-th point. */
+  pointStride: number;
   origin: number[];
   available: boolean;
 }
@@ -63,16 +68,18 @@ export interface Converted {
   ms: number;
 }
 
-/** One file of a drawing (see `Source` in lib/files.ts). */
+/** One file of a drawing (see `Source` in lib/files.ts): a file, or one inside a .zip. */
 export interface SourceFile {
   file: File;
   path: string;
+  zip?: ZipEntry;
 }
 
 export type Request =
   | { id: number; type: "open"; sources: SourceFile[]; name: string; dwg: boolean }
   | { id: number; type: "convert"; settings: EngineSettings; preview: boolean; early: boolean }
-  | { id: number; type: "warm"; dwg: boolean };
+  | { id: number; type: "warm"; dwg: boolean }
+  | { id: number; type: "preview"; settings: EngineSettings };
 
 /** The model, ready to show before its file is written (a provisional report: no parity
  *  hash, no output size). */
@@ -164,17 +171,25 @@ async function load(id: number, sources: SourceFile[], name: string, kind: Kind)
   open?.session.free();
   open = null;
   const session = new mod.Session();
-  const total = sources.reduce((n, s) => n + s.file.size, 0);
+  const size = (s: SourceFile) => s.zip?.size ?? s.file.size;
+  const total = sources.reduce((n, s) => n + size(s), 0);
   let before = 0;
   try {
+    // Each file is hashed by the browser on its own threads while the engine parses it;
+    // the hashes are given to the engine afterwards.
+    const hashes: Promise<string>[] = [];
     for (const s of sources) {
-      const bytes = await read(s.file, (done) => post({ id, type: "progress", progress: { stage: "read", done: before + done, total } }));
-      before += s.file.size;
+      const progress = (done: number) => post({ id, type: "progress", progress: { stage: "read", done: before + done, total } });
+      // A file inside a .zip is taken out here, off the page, by the browser's decompressor.
+      const bytes = s.zip ? await extract(s.file, s.zip, progress) : await read(s.file, progress);
+      before += size(s);
       // Whole seconds, like the command-line tool; -1 when the date is unknown.
       const modified = s.file.lastModified > 0 ? Math.floor(s.file.lastModified / 1000) : -1;
-      session.add_file(s.path, bytes, await sha256(bytes), modified);
+      hashes.push(sha256(bytes));
+      session.add_file(s.path, bytes, "", modified);
     }
     session.load(name, (done: number, all: number) => post({ id, type: "progress", progress: { stage: "parse", done, total: all } }));
+    session.set_hashes(await Promise.all(hashes));
   } catch (e) {
     session.free();
     throw e;
@@ -197,6 +212,8 @@ function takePreview(c: core.Conversion): PreviewBuffers | null {
         points: c.take_points(),
         pointColors: c.take_point_colors(),
         pointGroups: c.take_point_groups(),
+        layerBounds: c.take_layer_bounds(),
+        pointStride: c.point_stride(),
         origin: Array.from(c.origin()),
         available: c.preview_available(),
       }
@@ -204,7 +221,9 @@ function takePreview(c: core.Conversion): PreviewBuffers | null {
 }
 
 const buffers = (p: PreviewBuffers) =>
-  [p.positions, p.colors, p.indices, p.edges, p.groups, p.lines, p.lineColors, p.lineGroups, p.points, p.pointColors, p.pointGroups].map((a) => a.buffer);
+  [p.positions, p.colors, p.indices, p.edges, p.groups, p.lines, p.lineColors, p.lineGroups, p.points, p.pointColors, p.pointGroups, p.layerBounds].map(
+    (a) => a.buffer,
+  );
 
 function convert(id: number, o: Open, settings: EngineSettings, wantPreview: boolean, early: boolean): Converted {
   const t0 = performance.now();
@@ -275,6 +294,17 @@ self.onmessage = async (e: MessageEvent<Request>) => {
       // Compile an engine module ahead of need (the DWG writer, for people who use it).
       await engine(req.dwg ? "dwg" : "core");
       post({ id: req.id, type: "ok", result: null });
+    } else if (req.type === "preview") {
+      // The model to show and a provisional report, without writing a file.
+      if (!open) throw new Error("no file is open");
+      const c = open.session.preview(JSON.stringify(req.settings));
+      try {
+        const preview = takePreview(c)!;
+        const early: Early = { preview, report: c.report(), decisions: c.decisions() };
+        post({ id: req.id, type: "ok", result: early }, buffers(preview));
+      } finally {
+        c.free();
+      }
     } else if (req.type === "open") {
       open = await load(req.id, req.sources, req.name, req.dwg ? "dwg" : "core");
       post({ id: req.id, type: "ok", result: JSON.parse(open.session.inspect()) });

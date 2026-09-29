@@ -240,6 +240,47 @@ pub struct FreeformCurve {
     pub line: u64,
 }
 
+/// Powers of ten that are exact in f64.
+const POW10: [f64; 23] = [
+    1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16,
+    1e17, 1e18, 1e19, 1e20, 1e21, 1e22,
+];
+
+/// The value of a plain decimal token (`-?digits[.digits]`, as most exporters write) when it
+/// can be computed exactly the fast way: its digits as an integer below 2^53 divided by an
+/// exact power of ten. One IEEE division is correctly rounded, so this is the value
+/// `str::parse` gives (Clinger's fast path, which it takes too); anything else returns
+/// `None` for the full parser. Most coordinates in real files take this path.
+pub(crate) fn plain_number(t: &[u8]) -> Option<f64> {
+    let (neg, digits) = match t.split_first() {
+        Some((b'-', rest)) => (true, rest),
+        _ => (false, t),
+    };
+    if digits.is_empty() || digits.len() > 19 {
+        return None;
+    }
+    let (mut m, mut seen, mut frac) = (0u64, 0usize, None::<usize>);
+    for &b in digits {
+        match b {
+            b'0'..=b'9' => {
+                m = m * 10 + u64::from(b - b'0');
+                seen += 1;
+                if let Some(f) = frac.as_mut() {
+                    *f += 1;
+                }
+            }
+            b'.' if frac.is_none() => frac = Some(0),
+            _ => return None,
+        }
+    }
+    let k = frac.unwrap_or(0);
+    if seen == 0 || m >= 1 << 53 || k >= POW10.len() {
+        return None;
+    }
+    let v = m as f64 / POW10[k];
+    Some(if neg { -v } else { v })
+}
+
 impl ObjDocument {
     /// The exact source text of coordinate `axis` (0..3) of vertex `v`.
     pub fn coord_text(&self, v: usize, axis: usize) -> &str {
@@ -248,6 +289,12 @@ impl ObjDocument {
             &self.coord_text[self.coord_offsets[k] as usize..self.coord_offsets[k + 1] as usize];
         // Only ASCII number tokens that parsed successfully are stored.
         std::str::from_utf8(s).expect("coordinate text is ASCII")
+    }
+
+    /// [`Self::coord_text`] as bytes (without re-checking that they are text).
+    pub fn coord_bytes(&self, v: usize, axis: usize) -> &[u8] {
+        let k = v * 3 + axis;
+        &self.coord_text[self.coord_offsets[k] as usize..self.coord_offsets[k + 1] as usize]
     }
 
     pub fn has_vertex_colors(&self) -> bool {
@@ -701,6 +748,9 @@ impl Parser {
     }
 
     fn number(&self, tok: &[u8]) -> Result<f64, ParseIssue> {
+        if let Some(v) = plain_number(tok) {
+            return Ok(v);
+        }
         let s = match std::str::from_utf8(tok) {
             Ok(s) => s,
             Err(_) => {
@@ -1340,6 +1390,50 @@ mod tests {
         assert!(d.curves[0].rational);
         assert_eq!(d.curves[1].knots, [0.0, 0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 2.0]);
         assert_eq!(d.curves[1].control, [0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn plain_numbers_read_exactly_as_the_full_parser_does() {
+        let full = |t: &str| t.parse::<f64>().unwrap();
+        for t in [
+            "0",
+            "-0.000000",
+            "12.5",
+            "5.",
+            ".5",
+            "0.1",
+            "-123.456789",
+            "9007199254740991",
+            "1.0000000000000002",
+        ] {
+            let fast = plain_number(t.as_bytes());
+            if let Some(v) = fast {
+                assert_eq!(v.to_bits(), full(t).to_bits(), "{t}");
+            }
+        }
+        assert!(plain_number(b"-0.000").unwrap().is_sign_negative());
+        for t in [
+            &b"1e3"[..],
+            b"+5",
+            b"-",
+            b".",
+            b"1.2.3",
+            b"nan",
+            b"12345678901234567890",
+        ] {
+            assert_eq!(plain_number(t), None, "{:?}", std::str::from_utf8(t));
+        }
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn plain_numbers_match_str_parse(int in 0u64..100_000_000_000, frac in 0u64..10_000_000_000, digits in 0usize..11, neg: bool) {
+            let f = format!("{frac:0digits$}");
+            let t = format!("{}{int}{}{}", if neg { "-" } else { "" }, if digits > 0 { "." } else { "" }, if digits > 0 { &f[f.len() - digits..] } else { "" });
+            if let Some(v) = plain_number(t.as_bytes()) {
+                proptest::prop_assert_eq!(v.to_bits(), t.parse::<f64>().unwrap().to_bits(), "{}", t);
+            }
+        }
     }
 
     #[test]

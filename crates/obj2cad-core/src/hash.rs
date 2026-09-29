@@ -73,29 +73,44 @@ fn write_parity(model: &CadModel, out: &mut impl Out) {
         fn write(self, out: &mut impl Out, tag: u8) {
             let bytes = &self.bytes;
             let rec = |s: u32, l: u32| &bytes[s as usize..(s + l) as usize];
-            // Bytewise order, compared first as a big-endian integer of each record's
-            // first 16 bytes (zero-padded), which orders the same way and is far cheaper.
-            let prefix = |s: u32, l: u32| {
-                let mut k = [0u8; 16];
+            // Bytewise order, compared first as two big-endian integers of each record's
+            // first 32 bytes (zero-padded), which order the same way and are far cheaper;
+            // that decides every point (24 bytes) and most faces without touching bytes.
+            let key = |s: u32, l: u32| {
+                let mut k = [0u8; 32];
                 let r = rec(s, l);
-                let n = r.len().min(16);
+                let n = r.len().min(32);
                 k[..n].copy_from_slice(&r[..n]);
-                u128::from_be_bytes(k)
+                let (a, b) = k.split_at(16);
+                (
+                    u128::from_be_bytes(a.try_into().expect("16 bytes")),
+                    u128::from_be_bytes(b.try_into().expect("16 bytes")),
+                )
             };
-            let mut keyed: Vec<(u128, u32, u32)> = self
-                .spans
-                .iter()
-                .map(|&(s, l)| (prefix(s, l), s, l))
-                .collect();
+            let mut keyed: Vec<((u128, u128), u32, u32)> =
+                self.spans.iter().map(|&(s, l)| (key(s, l), s, l)).collect();
             keyed.sort_unstable_by(|a, b| {
-                a.0.cmp(&b.0).then_with(|| rec(a.1, a.2).cmp(rec(b.1, b.2)))
+                a.0.cmp(&b.0).then_with(|| {
+                    if a.2.max(b.2) <= 32 {
+                        a.2.cmp(&b.2) // equal zero-padded prefixes: the shorter one first
+                    } else {
+                        rec(a.1, a.2).cmp(rec(b.1, b.2))
+                    }
+                })
             });
-            out.put(&[tag]);
-            out.put(&(keyed.len() as u64).to_le_bytes());
+            // Out in large pieces (a hasher takes them far faster than one per record).
+            let mut buf: Vec<u8> = Vec::with_capacity(1 << 16);
+            buf.push(tag);
+            buf.extend_from_slice(&(keyed.len() as u64).to_le_bytes());
             for &(_, s, l) in &keyed {
-                out.put(&l.to_le_bytes());
-                out.put(rec(s, l));
+                buf.extend_from_slice(&l.to_le_bytes());
+                buf.extend_from_slice(rec(s, l));
+                if buf.len() >= (1 << 16) - 4096 {
+                    out.put(&buf);
+                    buf.clear();
+                }
             }
+            out.put(&buf);
         }
     }
 
