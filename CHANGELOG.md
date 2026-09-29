@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.1](https://github.com/cbassuarez/obj2cad/compare/obj2cad-v0.5.0...obj2cad-v0.5.1) (2026-09-29)
+
+
+### Performance Improvements
+
+* show large models sooner, and never look frozen while opening them ([#13](https://github.com/cbassuarez/obj2cad/issues/13)) ([d6acd6a](https://github.com/cbassuarez/obj2cad/commit/d6acd6a1c3de89faa21956de384c68b53c1b46cc))
+
 ## [0.5.0](https://github.com/cbassuarez/obj2cad/compare/obj2cad-v0.4.0...obj2cad-v0.5.0) (2026-09-29)
 
 
