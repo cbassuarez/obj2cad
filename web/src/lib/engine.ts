@@ -7,10 +7,10 @@
 // the worker holds another one, that drawing is opened again first. Without this, opening
 // a file from the list while the list was still converting could show (and download)
 // another file's drawing under its name.
-import type { Converted, Early as EarlyReply, Failure, ParseFailure, PreviewBuffers, Progress, Reply, Request, SourceFile } from "@/worker";
+import type { Converted, Early as EarlyReply, Failure, ParseFailure, PointBatch, PreviewBuffers, Progress, Reply, Request, SourceFile } from "@/worker";
 import type { EngineSettings, LayerMode, UpAxis, Units } from "@/lib/settings";
 
-export type { Failure, ParseFailure, PreviewBuffers, Progress };
+export type { Failure, ParseFailure, PointBatch, PreviewBuffers, Progress };
 
 /** A file of the drawing and what it was used for (crates/obj2cad-core/src/bundle.rs). */
 export interface BundleFile {
@@ -169,6 +169,7 @@ interface Pending {
   reject: (e: EngineError) => void;
   progress?: (p: Progress) => void;
   early?: (e: EarlyReply) => void;
+  points?: (b: PointBatch) => void;
   /** Reading or converting a drawing (not warming up an engine module). */
   work: boolean;
 }
@@ -208,6 +209,10 @@ class Engine {
         p.early?.(msg.early);
         return;
       }
+      if (msg.type === "points") {
+        p.points?.(msg.batch);
+        return;
+      }
       this.pending.delete(msg.id);
       if (msg.type === "ok") p.resolve(msg.result);
       else {
@@ -237,10 +242,15 @@ class Engine {
     this.start();
   }
 
-  private call<T>(req: Without<Request, "id">, progress?: (p: Progress) => void, early?: (e: EarlyReply) => void): Promise<T> {
+  private call<T>(
+    req: Without<Request, "id">,
+    progress?: (p: Progress) => void,
+    early?: (e: EarlyReply) => void,
+    points?: (b: PointBatch) => void,
+  ): Promise<T> {
     const id = ++this.seq;
     return new Promise<T>((resolve, reject) => {
-      this.pending.set(id, { resolve: resolve as (r: unknown) => void, reject, progress, early, work: req.type !== "warm" });
+      this.pending.set(id, { resolve: resolve as (r: unknown) => void, reject, progress, early, points, work: req.type !== "warm" });
       this.worker.postMessage({ ...req, id } as Request);
     });
   }
@@ -255,9 +265,9 @@ class Engine {
     return run;
   }
 
-  private async load(d: Drawing, dwg: boolean, progress?: (p: Progress) => void): Promise<Inspection> {
+  private async load(d: Drawing, dwg: boolean, progress?: (p: Progress) => void, points?: (b: PointBatch) => void): Promise<Inspection> {
     this.loaded = null;
-    const info = await this.call<Inspection>({ type: "open", sources: d.sources, name: d.name, dwg }, progress);
+    const info = await this.call<Inspection>({ type: "open", sources: d.sources, name: d.name, dwg }, progress, undefined, points);
     this.loaded = d;
     return info;
   }
@@ -269,10 +279,11 @@ class Engine {
 
   /** Read the files of one drawing. Its `name` names it when it holds several models.
    *  With `interrupt`, whatever the engine is doing for another drawing is stopped rather
-   *  than waited for (a person opened another file; the old one's work is moot). */
-  open(d: Drawing, dwg: boolean, progress?: (p: Progress) => void, interrupt = false): Promise<Inspection> {
+   *  than waited for (a person opened another file; the old one's work is moot).
+   *  `points` receives the points of large files as they are read, to show meanwhile. */
+  open(d: Drawing, dwg: boolean, progress?: (p: Progress) => void, interrupt = false, points?: (b: PointBatch) => void): Promise<Inspection> {
     if (interrupt && [...this.pending.values()].some((p) => p.work)) this.restart();
-    return this.serial(() => this.load(d, dwg, progress));
+    return this.serial(() => this.load(d, dwg, progress, points));
   }
 
   /** The model to show, with a provisional report, and no file (part of a bundle, shown

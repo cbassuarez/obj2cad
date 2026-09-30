@@ -20,6 +20,7 @@ use crate::diag::{Code, Diagnostics, Severity};
 use crate::obj::{
     ElementAttrs, Elements, ErrorKind, ObjDocument, ParseError, ParseIssue, MAX_ISSUES,
 };
+use crate::partial::{Colors, Partial, STEP};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Sep {
@@ -105,6 +106,16 @@ struct Column {
 }
 
 pub fn parse(src: &[u8], name: &str) -> Result<ObjDocument, ParseError> {
+    parse_with_progress(src, name, |_| {})
+}
+
+/// [`parse`], calling `progress` with what has been read about every
+/// [`crate::partial::STEP`] bytes, and once at the end.
+pub fn parse_with_progress(
+    src: &[u8],
+    name: &str,
+    mut progress: impl FnMut(&Partial),
+) -> Result<ObjDocument, ParseError> {
     let fail = |issues: Vec<ParseIssue>, truncated: bool| {
         let mut issues = issues;
         let first = issues.remove(0);
@@ -207,7 +218,38 @@ pub fn parse(src: &[u8], name: &str) -> Result<ObjDocument, ParseError> {
     ];
     let mut unit_rows = [true, true]; // columns 3..6 and 6..9 look like unit normals
     let mut truncated = false;
+    let width = columns - 3;
+    let mut next_report = STEP;
     for (line, text) in lines {
+        // Where this line starts in the file (every line is a slice of it).
+        let at = text.as_ptr() as usize - src.as_ptr() as usize;
+        if at >= next_report {
+            next_report = at + STEP;
+            // The columns that look like colors so far (the same test as at the end).
+            let rgb = |a: usize| {
+                (a..a + 3).all(|c| facts[c].byte) && (a..a + 3).any(|c| facts[c].above_one)
+            };
+            let rgb_at = match columns {
+                6 if rgb(3) => Some(3),
+                7 if rgb(4) && !facts[3].byte => Some(4),
+                9 if rgb(3) => Some(3),
+                9 if rgb(6) => Some(6),
+                _ => None,
+            };
+            progress(&Partial {
+                done: at,
+                total: src.len(),
+                positions: &doc.positions,
+                colors: match rgb_at {
+                    Some(c) => Colors::Columns {
+                        extra: &extra,
+                        width,
+                        at: c - 3,
+                    },
+                    None => Colors::None,
+                },
+            });
+        }
         let mut toks: [&[u8]; 9] = [&[]; 9];
         let mut count = 0;
         for t in tokens(text, sep) {
@@ -332,7 +374,6 @@ pub fn parse(src: &[u8], name: &str) -> Result<ObjDocument, ParseError> {
     };
 
     let n = doc.positions.len();
-    let width = columns - 3;
     doc.colors = match layout.rgb_at() {
         Some(c) => extra
             .chunks_exact(width)
@@ -344,6 +385,12 @@ pub fn parse(src: &[u8], name: &str) -> Result<ObjDocument, ParseError> {
     if layout.rgb_at().is_some() {
         doc.counts.vertices_with_color = n as u64;
     }
+    progress(&Partial {
+        done: src.len(),
+        total: src.len(),
+        positions: &doc.positions,
+        colors: Colors::Vertex(&doc.colors),
+    });
 
     let stem = name.rsplit_once('.').map_or(name, |(s, _)| s);
     let stem = stem.rsplit(['/', '\\']).next().unwrap_or(stem);
@@ -480,5 +527,33 @@ mod tests {
         assert_eq!(e.kind, ErrorKind::CommaDecimal);
         let e = parse(b"1 2 nan\n", "a.xyz").unwrap_err();
         assert_eq!(e.kind, ErrorKind::NonFinite);
+    }
+
+    #[test]
+    fn progress_shows_the_points_read_so_far() {
+        // ~12 MB of colored points: a few steps, then the final call.
+        let src: String = (0..400_000)
+            .map(|i| format!("{i}.125 {}.5 0.75 {} 120 7\n", i % 97, i % 256))
+            .collect();
+        let mut calls = Vec::new();
+        let d = parse_with_progress(src.as_bytes(), "scan.xyz", |p| {
+            let last = p.positions.len().saturating_sub(1);
+            calls.push((p.done, p.positions.len(), p.color(last)));
+        })
+        .unwrap();
+        assert!(calls.len() >= 3);
+        assert!(calls
+            .windows(2)
+            .all(|w| w[0].0 < w[1].0 && w[0].1 <= w[1].1));
+        // Before the end the columns already look like colors, and are shown as such.
+        let (done, n, color) = calls[0];
+        assert!(done >= STEP && n > 0 && n < 400_000);
+        let i = n - 1;
+        assert_eq!(
+            color,
+            Some([(i % 256) as f32 / 255.0, 120.0 / 255.0, 7.0 / 255.0])
+        );
+        assert_eq!(calls.last().unwrap().0, src.len());
+        assert_eq!(calls.last().unwrap().1, d.positions.len());
     }
 }

@@ -21,9 +21,20 @@ const token =
 
 const reportProblemUrl = (r: Report) => problemUrl("Problem with a conversion", `engine ${r.engine_version}, ${r.output.format}, parity ${r.parity_hash.slice(0, 12)}`);
 
-/** The result seal, re-animated whenever the result changes. */
-function Seal({ summary, id }: { summary: Summary; id: string }) {
+/** The result seal, re-animated whenever the result changes. Until the file is written
+ *  (`pending`: what is happening), it can't be called an exact copy yet: a spinner and
+ *  the step instead. */
+function Seal({ summary, id, pending }: { summary: Summary; id: string; pending: string | null }) {
   const exact = summary.status === "exact";
+  if (pending !== null)
+    return (
+      <div className="flex min-w-0 items-center gap-3" role="status">
+        <div className="grid size-9 shrink-0 place-items-center rounded-[3px] border-[1.5px] border-line bg-panel-solid">
+          <span className="size-4 animate-spin rounded-full border-2 border-line border-t-accent" aria-hidden="true" />
+        </div>
+        <div className="min-w-0 truncate font-display text-[17px] leading-tight font-semibold tracking-tight text-fg-2">{pending.replace(/…$/, "")}</div>
+      </div>
+    );
   return (
     <div className="flex min-w-0 items-center gap-3">
       <AnimatePresence mode="popLayout" initial={false}>
@@ -298,7 +309,7 @@ export function ResultCard(p: ResultProps) {
   return (
     <aside className="panel pointer-events-auto flex max-h-full min-h-0 w-full flex-col overflow-hidden" aria-label="Result">
       <div className="flex items-center justify-between gap-2 px-5 pt-4 pb-3">
-        <Seal summary={s} id={`${report.parity_hash}${s.status}`} />
+        <Seal summary={s} id={`${report.parity_hash}${s.status}`} pending={p.busy} />
         <Menu position="bottom-end" offset={6} width={240} classNames={menuStyles}>
           <Menu.Target>
             <Button variant="ghost" size="icon-sm" aria-label="More">

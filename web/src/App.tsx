@@ -9,13 +9,17 @@ import { ChoiceScreen } from "@/components/ChoiceScreen";
 import { DropScreen } from "@/components/DropScreen";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { FailedScreen } from "@/components/FailedScreen";
-import { LoadingScreen, PreflightScreen } from "@/components/LoadingScreen";
+import { PreflightScreen } from "@/components/PreflightScreen";
+import { LoadRail } from "@/components/LoadRail";
 import { TopBar } from "@/components/TopBar";
 import { WorkspaceSkeleton } from "@/components/WorkspaceSkeleton";
 import { Button } from "@/components/ui/button";
 import type { PreviewState } from "@/components/Workspace";
 import { engine, EngineError, isEmpty, OutputFile, RESTARTED, sha256Hex, type Failure, type Inspection, type Progress, type Result } from "@/lib/engine";
 import { CLI_URL, explain, type Explained } from "@/lib/errors";
+import { fmt } from "@/lib/format";
+import { pointFeed } from "@/lib/pointFeed";
+import { finishRun, onHash, onProgress, onShown, runLabel, startRun, type Run } from "@/lib/run";
 import { baseName, heavySplit, jobName, plan, saveFile, sourceSize, stem, zipFiles, type Job, type Source } from "@/lib/files";
 import {
   AUTO,
@@ -81,6 +85,10 @@ const Workspace = lazy(() => loadWorkspace().then((m) => ({ default: m.Workspace
 
 const failureOf = (e: unknown): Failure => (e instanceof EngineError ? e.failure : { kind: "other", message: e instanceof Error ? e.message : String(e) });
 const jobSize = (job: Job) => job.sources.reduce((n, s) => n + sourceSize(s), 0);
+/** What the engine parses: the models and point clouds. */
+const geometrySize = (job: Job) => job.sources.reduce((n, s) => n + (/\.(obj|xyz)$/i.test(s.path) ? sourceSize(s) : 0), 0);
+/** How long the rail stays, all done, once the file is written. */
+const RAIL_LINGER_MS = 1400;
 /** The file a failure is about: the one that couldn't be read, else the drawing. */
 const failedName = (job: Job, e: unknown) => (e instanceof EngineError && e.failure.kind === "parse" && e.failure.parse.file) || jobName(job);
 
@@ -100,7 +108,29 @@ export function App() {
     pendingRef.current = names;
     setPendingState(names);
   };
-  const [loading, setLoading] = useState<{ name: string; progress: Progress | null; startedAt: number }>({ name: "", progress: null, startedAt: 0 });
+  /** The drawing being opened. */
+  const [loading, setLoading] = useState<{ name: string }>({ name: "" });
+  /** Opening, step by step (the station rail); null when nothing is being opened. Updated
+   *  at most once a frame: reading reports every few hundred kilobytes. */
+  const [run, setRunState] = useState<Run | null>(null);
+  const runRef = useRef<Run | null>(null);
+  const runFrame = useRef(0);
+  const setRun = (r: Run | null) => {
+    runRef.current = r;
+    cancelAnimationFrame(runFrame.current);
+    runFrame.current = 0;
+    setRunState(r);
+  };
+  const updateRun = (f: (r: Run) => Run) => {
+    if (!runRef.current) return;
+    runRef.current = f(runRef.current);
+    runFrame.current ||= requestAnimationFrame(() => {
+      runFrame.current = 0;
+      setRunState(runRef.current);
+    });
+  };
+  /** The file being written: elements written of all. */
+  const [write, setWrite] = useState<{ done: number; total: number } | null>(null);
   const [failed, setFailed] = useState<{ name: string; explained: Explained; retry?: () => void } | null>(null);
   const [preflight, setPreflight] = useState<{ name: string; size: number; go: () => void } | null>(null);
   const [choice, setChoice] = useState<{ combined: Job; separate: Job[] } | null>(null);
@@ -203,6 +233,8 @@ export function App() {
 
   // ---------------------------------------------------------------- failures
   const fail = (name: string, e: unknown, retry?: () => void) => {
+    setRun(null);
+    pointFeed.clear();
     const failure = failureOf(e);
     const retryable = failure.kind === "crash" || failure.kind === "read" || failure.kind === "other";
     setFailed({ name, explained: explain(failure), retry: retryable ? retry : undefined });
@@ -229,9 +261,11 @@ export function App() {
         settings,
         wantPreview,
         (p) => {
-          // Opening: the loading screen names each step. Afterwards: the busy label does.
-          if (screenRef.current === "loading") setLoading((l) => ({ ...l, progress: p }));
-          else setBusy(busyLabel(p.stage, settings.format));
+          // Opening: the rail shows each step. The busy label says it too (and keeps the
+          // download waiting).
+          updateRun((r) => onProgress(r, p));
+          if (p.stage === "write") setWrite({ done: p.done, total: p.total });
+          if (screenRef.current !== "loading") setBusy(busyLabel(p.stage, settings.format));
         },
         // The model is shown as soon as it can be, while its file is still being written:
         // the result is provisional (Download waits, busy) until the file arrives.
@@ -244,6 +278,7 @@ export function App() {
           setPreview({ buffers: e.preview, builtUp: e.decisions.up_axis, id: ++seq.current, fileId: cur.id });
           setBusy(busyLabel("hash", settings.format));
           setPending([]);
+          updateRun((r) => onShown(r, null));
           if (screenRef.current === "loading") setScreen("work", "push");
         },
       );
@@ -271,7 +306,10 @@ export function App() {
       fail(cur.inspection.name, e, () => void openJob(cur.job, cur.handle, { choices: cur.choices, batchItem: cur.batchItem, force: true }));
       return false;
     } finally {
-      if (token === convertToken.current) setBusy(null);
+      if (token === convertToken.current) {
+        setBusy(null);
+        setWrite(null);
+      }
     }
     // Stable: everything it reads is a ref or a state setter (openJob is only called later).
   }, []);
@@ -310,7 +348,9 @@ export function App() {
       }
       const token = ++openToken.current;
       const previous = screenRef.current === "work" ? currentRef.current?.inspection.name : undefined;
-      setLoading({ name, progress: null, startedAt: performance.now() });
+      setLoading({ name });
+      pointFeed.clear();
+      setRun(startRun({ total: size, geometry: geometrySize(job), format: prefsRef.current.format === "dwg" ? "DWG" : "DXF", curves: prefsRef.current.curves }));
       if (!opts.reload) {
         setScreen("loading");
         setHidden([]); // another drawing: every layer in again
@@ -323,10 +363,13 @@ export function App() {
       // cloud loads. The file is still written once, from everything, after that.
       const split = heavySplit(job);
       const heavyNames = split ? split.heavy.map((h) => baseName(h.path)) : [];
-      const toLoading = (p: Progress) => setLoading((l) => ({ ...l, progress: p }));
+      const toRun = (p: Progress) => updateRun((r) => onProgress(r, p));
+      const toScene = (b: Parameters<typeof pointFeed.push>[0]) => {
+        if (token === openToken.current) pointFeed.push(b);
+      };
       try {
         if (split) {
-          const light = await engine.open(split.light, dwg, toLoading, true);
+          const light = await engine.open(split.light, dwg, toRun, true, toScene);
           if (token !== openToken.current) return;
           // Named and sized as the whole drawing (the top bar, adding materials), shown in part.
           const lightCur: Current = {
@@ -337,7 +380,13 @@ export function App() {
             choices: opts.choices ?? AUTO,
             batchItem: opts.batchItem ?? null,
           };
-          const e = await engine.preview(split.light, engineSettings(prefsRef.current, lightCur.choices));
+          // A scan still to come: the model is shown as exported. Scanners write Z up, and a
+          // model that comes with a scan shares its coordinates; the scan's points are shown
+          // in this frame as they are read. The drawing's own decision, from everything,
+          // settles it once all of it is read.
+          const scanToCome = !lightCur.choices.up && split.heavy.some((h) => /\.xyz$/i.test(h.path));
+          const e = await engine.preview(split.light, engineSettings(prefsRef.current, scanToCome ? { ...lightCur.choices, up: "as_is" } : lightCur.choices));
+          if (scanToCome) e.decisions = { ...e.decisions, up_from: "detected" };
           if (token !== openToken.current) return;
           if (!isEmpty(e.report)) {
             setCur(lightCur);
@@ -348,36 +397,34 @@ export function App() {
             setPreview({ buffers: e.preview, builtUp: e.decisions.up_axis, id: ++seq.current, fileId: lightCur.id });
             setPending(heavyNames);
             setBusy(`Loading ${heavyNames.join(", ")}…`);
+            updateRun((r) => onShown(r, { names: heavyNames }));
             if (screenRef.current !== "work") setScreen("work", "push");
           }
         }
-        const info = await engine.open(
-          job,
-          dwg,
-          (p) => {
-            if (screenRef.current === "loading") toLoading(p);
-            else if (split) {
-              // Reading is the first half, parsing the second.
-              const frac = p.total > 0 && (p.stage === "read" || p.stage === "parse") ? (p.stage === "parse" ? 0.5 : 0) + (p.done / p.total) * 0.5 : null;
-              const pct = frac === null ? "" : ` ${Math.round(frac * 100)}%`;
-              setBusy(`Loading ${heavyNames.join(", ")}…${pct}`);
-            }
-          },
-          !split,
-        );
+        const info = await engine.open(job, dwg, toRun, !split, toScene);
         if (token !== openToken.current) return;
         // Choices made while part of it was shown carry over.
         const choices = (split && currentRef.current?.job === job ? currentRef.current.choices : null) ?? opts.choices ?? AUTO;
         const cur: Current = { id: ++seq.current, job, handle, inspection: info, choices, batchItem: opts.batchItem ?? null };
         setCur(cur);
         if (!(await convert(cur, true)) || token !== openToken.current) return;
+        // Written: every station done, then the rail goes.
+        updateRun((r) => finishRun(onHash(r, resultRef.current?.report.parity_hash ?? "")));
+        const finished = runRef.current;
+        setTimeout(() => {
+          if (runRef.current === finished) setRun(null);
+        }, RAIL_LINGER_MS);
         setScreen("work", opts.reload || screenRef.current === "work" ? "replace" : "push");
         if (!opts.reload && previous && previous !== info.name) notifications.show({ message: `Replaced ${previous} with ${info.name}` });
         if (opts.reload) notifications.show({ message: `Reloaded ${info.name}` });
       } catch (e) {
         if (token === openToken.current) fail(failedName(job, e), e, () => void openJob(job, handle, { ...opts, force: true }));
       } finally {
-        if (token === openToken.current) setPending([]);
+        if (token === openToken.current) {
+          setPending([]);
+          // Stopped without finishing (an empty drawing, a failure): no rail left behind.
+          if (runRef.current && !runRef.current.finished) setRun(null);
+        }
         if (opts.reload) setBusy(null);
       }
     },
@@ -390,6 +437,8 @@ export function App() {
     ++openToken.current;
     ++convertToken.current;
     engine.restart(); // a file-list conversion it interrupts is retried (runBatch)
+    setRun(null);
+    pointFeed.clear();
     setBusy(null);
     shownPreview.current = null;
     setScreen(currentRef.current && resultRef.current ? "work" : batchRef.current.length ? "batch" : "empty", "replace");
@@ -596,15 +645,13 @@ export function App() {
   // The tab says what's happening, for anyone who switched away while a big file opens.
   const title = useRef(document.title);
   useEffect(() => {
-    const p = loading.progress;
-    const pct = p && p.total > 0 && (p.stage === "read" || p.stage === "parse") ? ` ${Math.round((p.done / p.total) * 100)}%` : "";
     document.title =
       screen === "loading"
-        ? `Opening${pct} · ${loading.name}`
+        ? `Opening${run ? `: ${runLabel(run)}` : ""} · ${loading.name}`
         : screen === "work" && busy && current
           ? `${busy.replace(/…$/, "")} · ${current.inspection.name}`
           : title.current;
-  }, [screen, loading, busy, current]);
+  }, [screen, loading, busy, current, run]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -620,6 +667,15 @@ export function App() {
   });
 
   // ---------------------------------------------------------------- render
+  /** How far the files still loading are, for their rows in the layers pane. */
+  const pendingNote = (() => {
+    if (!run || !pending.length) return undefined;
+    const readSt = run.stations.find((s) => s.key === "read");
+    if (run.counting && pending.includes(run.counting.file) && run.stations.find((s) => s.key === "model")?.state === "active")
+      return `${fmt(run.counting.count)} ${run.counting.cloud ? "points" : "vertices"}`;
+    if (readSt?.state === "active" && readSt.frac !== null) return `${Math.floor(readSt.frac * 100)}% read`;
+    return undefined;
+  })();
   const inBatch = current?.batchItem != null && batch.length > 0;
   return (
     <div className="relative h-dvh overflow-hidden">
@@ -653,16 +709,6 @@ export function App() {
           onCancel={() => setScreen(currentRef.current && resultRef.current ? "work" : "empty")}
         />
       )}
-      {screen === "loading" && (
-        <LoadingScreen
-          name={loading.name}
-          progress={loading.progress}
-          startedAt={loading.startedAt}
-          format={prefs.format === "dwg" ? "DWG" : "DXF"}
-          curves={prefs.curves}
-          onCancel={cancelOpen}
-        />
-      )}
       {screen === "failed" && failed && <FailedScreen name={failed.name} explained={failed.explained} onPick={() => void pick()} onRetry={failed.retry} />}
       {screen === "choose" && choice && (
         <ChoiceScreen separate={choice.separate} onCombine={() => void openJob(choice.combined, null)} onSeparate={() => startBatch(choice.separate)} />
@@ -681,18 +727,23 @@ export function App() {
           onDownloadAll={() => void downloadAll()}
         />
       )}
-      {screen === "work" && result && (
+      {/* While a drawing is opened the workspace is already there: the scene builds from
+          what is read, and the rail shows each step. */}
+      {(screen === "loading" || (screen === "work" && result)) && (
         <ErrorBoundary>
           <Suspense fallback={<WorkspaceSkeleton />}>
             <Workspace
-              result={result}
+              result={screen === "work" ? result : null}
               visible={visible}
               hidden={hidden}
-              preview={preview}
+              preview={screen === "work" ? preview : null}
               inspection={current?.inspection ?? null}
               pending={pending}
+              pendingNote={pendingNote}
               prefs={prefs}
               busy={busy}
+              write={write}
+              railShown={run !== null}
               downloaded={downloaded}
               onUp={(up: UpAxis | null) => change({ up })}
               onUnits={(units: Units | null) => change({ units })}
@@ -715,6 +766,21 @@ export function App() {
           </Suspense>
         </ErrorBoundary>
       )}
+
+      <AnimatePresence>
+        {run && (screen === "loading" || screen === "work") && (
+          <motion.div
+            key="rail"
+            initial={{ opacity: 0, y: -6 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -6 }}
+            transition={{ duration: 0.22, ease: "easeOut" }}
+            className="pointer-events-none absolute inset-x-0 top-[68px] z-20 flex justify-center px-3 lg:top-[76px] lg:right-[448px] lg:left-[300px] lg:px-0"
+          >
+            <LoadRail run={run} label={`${screen === "loading" ? "Opening" : "Preparing"} ${loading.name}`} onCancel={screen === "loading" ? cancelOpen : undefined} />
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       <Dropzone.FullScreen
         onDrop={(files) => void openFiles(files)}

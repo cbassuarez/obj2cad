@@ -59,6 +59,8 @@ export interface ResultProps {
   onView: (v: ViewName) => void;
   onOrtho: (on: boolean) => void;
   onFit: () => void;
+  /** The file being written: elements written of all (`total` 0: written in one go). */
+  write?: { done: number; total: number } | null;
   /** Download the drawing, leaving out hidden layers; `pick` asks where to save. */
   onDownload: (pick: boolean) => void;
   onDownloadReport: () => void;
@@ -144,24 +146,47 @@ export function sizeText(report: Report, decisions: Decisions, showIn: Units | n
 export const layersShown = ({ hiddenCount, layerCount }: Pick<ResultProps, "hiddenCount" | "layerCount">) => (hiddenCount === 0 ? "all" : hiddenCount < layerCount ? "some" : "none");
 
 /** The one filled button on the page. Hidden layers are left out. */
+/** How much of the file is written, when it is counted: "62%". */
+export const writtenPct = (w: ResultProps["write"]) => (w && w.total > 0 ? Math.floor((Math.min(w.done, w.total) / w.total) * 100) : null);
+
 export function DownloadButton({
   report,
   format,
   busy,
+  write,
   hiddenCount,
   layerCount,
   onDownload,
   className,
-}: Pick<ResultProps, "report" | "format" | "busy" | "hiddenCount" | "layerCount" | "onDownload"> & { className?: string }) {
+}: Pick<ResultProps, "report" | "format" | "busy" | "write" | "hiddenCount" | "layerCount" | "onDownload"> & { className?: string }) {
   const shown = layersShown({ hiddenCount, layerCount });
+  const pct = busy !== null ? writtenPct(write) : null;
   return (
     <Tip label={`Download (${shortcut("S")})`}>
-      <Button variant="primary" size="lg" className={cn("w-full justify-between px-5", className)} onClick={() => onDownload(false)} disabled={busy !== null || shown === "none"}>
+      <Button
+        variant="primary"
+        size="lg"
+        className={cn("relative w-full justify-between overflow-hidden px-5", className)}
+        onClick={() => onDownload(false)}
+        disabled={busy !== null || shown === "none"}
+      >
         <span className="flex items-center gap-2.5">
           <Download />
           Download {shortFormat(format)}
         </span>
-        <span className="num text-[12px] font-normal opacity-80">{busy !== null ? "…" : shown === "all" ? bytes(report.output.bytes) : `${fmt(layerCount - hiddenCount)} of ${fmt(layerCount)} layers`}</span>
+        <span className="num text-[12px] font-normal opacity-80">
+          {busy !== null ? (pct !== null ? `${pct}%` : "…") : shown === "all" ? bytes(report.output.bytes) : `${fmt(layerCount - hiddenCount)} of ${fmt(layerCount)} layers`}
+        </span>
+        {/* The file being written: the line fills as it is. */}
+        {busy !== null && write && (
+          <span className="absolute bottom-0 left-0 h-[3px] w-full overflow-hidden bg-white/25" aria-hidden="true">
+            {pct !== null ? (
+              <span className="block h-full bg-white transition-[width] duration-150 ease-linear" style={{ width: `${(Math.min(write.done, write.total) / write.total) * 100}%` }} />
+            ) : (
+              <span className="block h-full w-1/3 animate-indeterminate bg-white" />
+            )}
+          </span>
+        )}
       </Button>
     </Tip>
   );
@@ -170,13 +195,32 @@ export function DownloadButton({
 /** "Save as…" and the downloaded confirmation, under the download button. */
 export function DownloadAfter({
   busy,
+  write,
+  format,
   downloaded,
   hiddenCount,
   layerCount,
   onDownload,
   onAnother,
-}: Pick<ResultProps, "busy" | "downloaded" | "hiddenCount" | "layerCount" | "onDownload" | "onAnother">) {
+}: Pick<ResultProps, "busy" | "write" | "format" | "downloaded" | "hiddenCount" | "layerCount" | "onDownload" | "onAnother">) {
   const shown = layersShown({ hiddenCount, layerCount });
+  if (busy !== null && write) {
+    const pct = writtenPct(write);
+    return (
+      <div className="flex min-h-5 items-center gap-3 text-[12.5px] text-fg-3" role="status">
+        <span>
+          Writing the {shortFormat(format)}
+          {pct !== null ? (
+            <>
+              : <span className="num">{pct}%</span> written
+            </>
+          ) : (
+            "…"
+          )}
+        </span>
+      </div>
+    );
+  }
   if (downloaded && busy === null && shown !== "none")
     return (
       <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: "auto" }} className="flex items-center gap-2 text-[13px]">

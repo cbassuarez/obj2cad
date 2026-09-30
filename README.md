@@ -91,6 +91,20 @@ Both can be changed in one click. The command-line tool makes the same decisions
 default, so the same file gives the same drawing (byte for byte) in both;
 `obj2cad inspect file.obj` prints them.
 
+## While a file opens
+
+The app shows each step as it happens, on a rail of stations: Read, Model, View,
+Fingerprint and Write. A bar is only shown for something counted against a known total
+(bytes read of the files' size, bytes parsed of the models' and clouds', elements of the
+drawing written); a step with nothing to count says what it is doing instead. Bars never
+go back, and counts are counted, not estimated.
+
+The scene is built as the file is read: the points of a large model or cloud appear in the
+viewer as they are parsed (in their own colors, thinned to at most 1.5 million; display
+only), in the file's own axes, and the finished view replaces them once everything is
+read. The Download button fills as the file is written, and the result is only called an
+exact copy once it has been.
+
 ## Verification
 
 `tests/harness/parity.py` checks every conversion independently of the Rust code:

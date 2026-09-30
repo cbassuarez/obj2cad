@@ -3,7 +3,7 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { CSS2DObject, CSS2DRenderer } from "three/addons/renderers/CSS2DRenderer.js";
-import type { PreviewBuffers } from "@/lib/engine";
+import type { PointBatch, PreviewBuffers } from "@/lib/engine";
 import type { UpAxis } from "@/lib/settings";
 
 export interface ViewerTheme {
@@ -33,6 +33,8 @@ const FOV = 38;
 /** Dimension label numbers: up to 3 decimals, grouped thousands (like the result card). */
 const LENGTH = new Intl.NumberFormat("en-US", { maximumFractionDigits: 3 });
 const MARGIN = 1.35; // room for the dimension labels around the model
+/** Points read while a file loads fade in over this long. */
+const FADE_MS = 300;
 
 export class Viewer {
   private renderer: THREE.WebGLRenderer;
@@ -83,6 +85,18 @@ export class Viewer {
   private inv = new THREE.Quaternion();
   private key = new THREE.DirectionalLight(0xffffff, 1.7);
   private labelSize = new WeakMap<HTMLElement, { w: number; h: number }>();
+  /** Points of files being read, shown until the preview that has them (display only),
+   *  in the preview's frame (its orientation and origin), or before there is one, in the
+   *  file's own axes around the first points read. */
+  private building = new THREE.Group();
+  private buildingBox = new THREE.Box3();
+  private buildFrame: { up: UpAxis; origin: THREE.Vector3 } | null = null;
+  /** The size the view was last framed for while building; 0 before. */
+  private framedRadius = 0;
+  /** The person moved the view: the scene stops re-framing itself as it grows. */
+  private userMoved = false;
+  private previewOrigin = new THREE.Vector3();
+  private fades: { mat: THREE.PointsMaterial; start: number }[] = [];
 
   constructor(private host: HTMLElement) {
     this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
@@ -105,12 +119,15 @@ export class Viewer {
     this.controls.mouseButtons = { LEFT: THREE.MOUSE.ROTATE, MIDDLE: THREE.MOUSE.PAN, RIGHT: THREE.MOUSE.PAN };
     this.controls.addEventListener("change", () => this.requestRender());
     // Grabbing the view ends any animation at its end state.
-    this.controls.addEventListener("start", () => this.finishTween());
+    this.controls.addEventListener("start", () => {
+      this.finishTween();
+      this.userMoved = true;
+    });
 
     this.scene.add(new THREE.HemisphereLight(0xffffff, 0x7d8594, 1.5));
     this.key.position.set(1, -1.4, 2);
     this.persp.add(this.key);
-    this.scene.add(this.persp, this.content, this.dims);
+    this.scene.add(this.persp, this.content, this.building, this.dims);
 
     this.resizeObserver = new ResizeObserver(() => this.resize());
     this.resizeObserver.observe(host);
@@ -137,9 +154,14 @@ export class Viewer {
 
   /** Show new preview buffers, built in orientation `up`. */
   show(p: PreviewBuffers, up: UpAxis, refit: boolean): void {
+    // Points shown while the file was read: the preview has them all now. The view moves
+    // from them to the model instead of jumping.
+    const building = this.building.children.length > 0;
     this.clear();
+    this.clearPoints();
     this.tween = null;
     this.builtUp = this.shownUp = up;
+    this.previewOrigin.fromArray(p.origin);
     this.content.quaternion.identity();
     const position = new THREE.BufferAttribute(p.positions, 3);
     // Colors come in linear light, as the renderer takes vertex colors.
@@ -229,8 +251,101 @@ export class Viewer {
     }
     this.rebuildGrid();
     this.rebuildDims();
-    if (refit) this.setView("iso", false);
+    if (refit) this.setView("iso", building);
     else this.requestRender();
+  }
+
+  /** Show points of a file being read (they fade in), framing the view on what has been
+   *  read while the person hasn't moved it. */
+  addPoints(b: PointBatch): void {
+    if (!b.points.length) return;
+    // Output axes of a file point: a Y-up file stood upright is (x, −z, y).
+    const upright = (up: UpAxis, v: THREE.Vector3) => (up === "y_up_to_z_up" ? new THREE.Vector3(v.x, -v.z, v.y) : v.clone());
+    const origin = new THREE.Vector3().fromArray(b.origin);
+    if (!this.buildFrame) {
+      // Nothing shown yet: the file's own axes (which way is up is decided from all of
+      // it, when it has been read; the preview then turns it if needed).
+      this.buildFrame = this.hasContent ? { up: this.builtUp, origin: this.previewOrigin.clone() } : { up: "as_is", origin };
+    }
+    const { up, origin: frame } = this.buildFrame;
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute("position", new THREE.BufferAttribute(b.points, 3));
+    geo.setAttribute("color", new THREE.BufferAttribute(b.colors, 3, true));
+    const still = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+    const mat = new THREE.PointsMaterial({ vertexColors: true, size: 5, sizeAttenuation: false, transparent: !still, opacity: still ? 1 : 0 });
+    const pts = new THREE.Points(geo, mat);
+    if (up === "y_up_to_z_up") pts.quaternion.copy(UPRIGHT);
+    pts.position.copy(upright(up, origin).sub(frame));
+    pts.updateMatrix();
+    this.building.add(pts);
+    if (!still) this.fades.push({ mat, start: performance.now() });
+    geo.computeBoundingBox();
+    this.buildingBox.union(geo.boundingBox!.clone().applyMatrix4(pts.matrix));
+
+    const box = this.buildingBox.clone();
+    if (this.hasContent) box.union(this.box);
+    const radius = Math.max(box.getSize(new THREE.Vector3()).length() / 2, 1e-6);
+    if (!this.userMoved && (this.framedRadius === 0 || radius > this.framedRadius * 1.25)) this.frameOn(box, radius);
+    this.requestRender();
+  }
+
+  /** Show nothing (another drawing is being opened). */
+  reset(): void {
+    this.finishTween();
+    this.clear();
+    this.clearPoints();
+    this.radius = 1;
+    this.rebuildGrid();
+    this.requestRender();
+  }
+
+  /** Take away the points shown while reading. */
+  clearPoints(): void {
+    for (const c of [...this.building.children]) {
+      this.building.remove(c);
+      const pts = c as THREE.Points;
+      pts.geometry.dispose();
+      (pts.material as THREE.Material).dispose();
+    }
+    this.fades = [];
+    this.buildingBox.makeEmpty();
+    this.buildFrame = null;
+    this.framedRadius = 0;
+    this.userMoved = false;
+    this.requestRender();
+  }
+
+  /** Look at `box` (while building): from the iso direction the first time, then from
+   *  wherever the view is. */
+  private frameOn(box: THREE.Box3, radius: number): void {
+    const first = this.framedRadius === 0 && !this.hasContent;
+    this.framedRadius = radius;
+    this.radius = radius;
+    for (const c of [this.persp, this.ortho]) {
+      c.near = radius / 1000;
+      c.far = radius * 1000;
+      c.updateProjectionMatrix();
+    }
+    const center = box.getCenter(new THREE.Vector3());
+    // The grid is sized for what is in view, under all of it.
+    this.rebuildGrid();
+    if (this.grid) this.grid.position.z = box.min.z;
+    this.finishTween();
+    const dir = first ? VIEWS.iso.clone() : this.camera.position.clone().sub(this.controls.target).normalize();
+    const dist = (radius / Math.sin(THREE.MathUtils.degToRad(FOV / 2))) * MARGIN;
+    const fromPos = this.camera.position.clone();
+    const fromTarget = this.controls.target.clone();
+    const toPos = center.clone().addScaledVector(dir, dist);
+    const fromZoom = this.orthoHome();
+    this.animate(first ? 0 : 420, (t) => {
+      this.controls.target.lerpVectors(fromTarget, center, t);
+      this.camera.position.lerpVectors(fromPos, toPos, t);
+      if (this.camera === this.ortho) {
+        this.ortho.zoom = THREE.MathUtils.lerp(fromZoom, 1, t);
+        this.ortho.updateProjectionMatrix();
+      }
+      this.camera.lookAt(this.controls.target);
+    }, () => this.controls.update());
   }
 
   /** Show the model in orientation `up`, turning the existing preview (no rebuild). */
@@ -381,6 +496,7 @@ export class Viewer {
     cancelAnimationFrame(this.frame);
     this.resizeObserver.disconnect();
     this.clear();
+    this.clearPoints();
     for (const m of Object.values(this.dimmed)) m.dispose();
     this.controls.dispose();
     this.renderer.dispose();
@@ -608,6 +724,16 @@ export class Viewer {
     if (this.frame) return;
     this.frame = requestAnimationFrame(() => {
       this.frame = 0;
+      if (this.fades.length) {
+        const now = performance.now();
+        this.fades = this.fades.filter(({ mat, start }) => {
+          const t = Math.min(1, (now - start) / FADE_MS);
+          mat.opacity = t;
+          if (t >= 1) mat.transparent = false;
+          return t < 1;
+        });
+        if (this.fades.length) this.requestRender();
+      }
       if (this.tween) {
         const t = Math.min(1, (performance.now() - this.tween.start) / this.tween.ms);
         const eased = 1 - (1 - t) ** 3;

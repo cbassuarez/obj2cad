@@ -10,6 +10,7 @@
 //! [`MAX_ISSUES`] problems at once, but a file with any error produces no document.
 
 use crate::diag::{Code, Diagnostic, Diagnostics, Severity};
+use crate::partial::{Colors, Partial, STEP};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fmt;
@@ -391,13 +392,14 @@ struct Parser {
 
 /// Parse an OBJ file from raw bytes.
 pub fn parse(src: &[u8]) -> Result<ObjDocument, ParseError> {
-    parse_with_progress(src, |_, _| {})
+    parse_with_progress(src, |_| {})
 }
 
-/// [`parse`], calling `progress(bytes_done, bytes_total)` about every 8 MiB.
+/// [`parse`], calling `progress` with what has been read about every
+/// [`crate::partial::STEP`] bytes, and once at the end.
 pub fn parse_with_progress(
     src: &[u8],
-    mut progress: impl FnMut(usize, usize),
+    mut progress: impl FnMut(&Partial),
 ) -> Result<ObjDocument, ParseError> {
     if src.starts_with(b"\xFF\xFE") || src.starts_with(b"\xFE\xFF") {
         return Err(ParseError {
@@ -446,7 +448,6 @@ pub fn parse_with_progress(
     } else {
         b'\n'
     };
-    const STEP: usize = 8 << 20;
     let mut next_report = STEP;
     let mut logical: Vec<u8> = Vec::new();
     let mut logical_start = 0u64;
@@ -455,7 +456,7 @@ pub fn parse_with_progress(
         let raw = &src[start..end];
         start = end + 1;
         if end >= next_report {
-            progress(end, src.len());
+            progress(&p.partial(end, src.len()));
             next_report = end + STEP;
         }
         p.line += 1;
@@ -496,7 +497,7 @@ pub fn parse_with_progress(
             issues.push(issue);
         }
     }
-    progress(src.len(), src.len());
+    progress(&p.partial(src.len(), src.len()));
 
     // Forward references must exist by the end of the file.
     let totals = [
@@ -565,6 +566,16 @@ fn tokens(text: &[u8]) -> impl Iterator<Item = &[u8]> {
 }
 
 impl Parser {
+    /// What has been read so far.
+    fn partial(&self, done: usize, total: usize) -> Partial<'_> {
+        Partial {
+            done,
+            total,
+            positions: &self.doc.positions,
+            colors: Colors::Vertex(&self.doc.colors),
+        }
+    }
+
     fn issue<T>(&self, kind: ErrorKind, message: impl Into<String>) -> Result<T, ParseIssue> {
         Err(ParseIssue {
             line: self.line,
@@ -1458,13 +1469,21 @@ mod tests {
 
     #[test]
     fn progress_is_reported() {
-        // ~24 MB, so at least two progress steps (every 8 MiB) plus the final call.
+        // ~24 MB, so several progress steps plus the final call.
         let src: String = (0..800_000)
             .map(|i| format!("v {i}.000000 0.000000 0.000000\n"))
             .collect();
         let mut calls = Vec::new();
-        parse_with_progress(src.as_bytes(), |done, total| calls.push((done, total))).unwrap();
+        parse_with_progress(src.as_bytes(), |p| {
+            calls.push((p.done, p.total, p.positions.len()))
+        })
+        .unwrap();
         assert!(calls.len() >= 2);
-        assert_eq!(calls.last().unwrap().0, src.len());
+        assert_eq!(calls.last().unwrap(), &(src.len(), src.len(), 800_000));
+        // What was read so far grows with the bytes read.
+        assert!(calls
+            .windows(2)
+            .all(|w| w[0].2 <= w[1].2 && w[0].0 <= w[1].0));
+        assert!(calls[0].2 > 0 && calls[0].2 < 800_000);
     }
 }
