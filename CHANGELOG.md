@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.0](https://github.com/cbassuarez/obj2cad/compare/obj2cad-v0.5.2...obj2cad-v0.6.0) (2026-09-30)
+
+
+### Features
+
+* the station rail, a scene built as files are read, and a DXF write bar ([#17](https://github.com/cbassuarez/obj2cad/issues/17)) ([e24d394](https://github.com/cbassuarez/obj2cad/commit/e24d39459a96ca6a787dfabf8b5c8e60be5e8907))
+
 ## [0.5.2](https://github.com/cbassuarez/obj2cad/compare/obj2cad-v0.5.1...obj2cad-v0.5.2) (2026-09-29)
 
 
