@@ -43,6 +43,7 @@ export function LayersCard({
   onSelect,
   onHover,
   pending = [],
+  pendingNote,
 }: {
   report: Report;
   mode: LayerMode;
@@ -58,6 +59,8 @@ export function LayersCard({
   onHover: (layer: number | null) => void;
   /** Files of the drawing still loading (a large scan shown after the rest). */
   pending?: string[];
+  /** How far the files still loading are ("43% read", "1,204,113 points"). */
+  pendingNote?: string;
 }) {
   const rows = report.layers.map((l, i) => ({ ...l, i, total: l.faces + l.polylines + l.points + l.surfaces })).filter((l) => l.total > 0);
   const [query, setQuery] = useState("");
@@ -320,7 +323,7 @@ export function LayersCard({
             <span className="min-w-0 flex-1 truncate font-medium" title={name}>
               {name}
             </span>
-            <span className="text-[12px] text-fg-3">Loading…</span>
+            <span className="num shrink-0 text-[12px] text-fg-3">{pendingNote ?? "Loading…"}</span>
           </li>
         ))}
         {q && shownRows.length === 0 && <li className="px-2 py-3 text-[12.5px] text-fg-3">No layer matches “{query}”</li>}

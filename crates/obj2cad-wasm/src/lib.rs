@@ -6,6 +6,7 @@
 //! as typed arrays.
 
 mod preview;
+mod stream;
 
 use obj2cad_core::bundle::{self, Bundle, InputFile};
 use obj2cad_core::hints::{self, Choices, Hints, UnitsSource};
@@ -18,6 +19,7 @@ use preview::Preview;
 use serde::Deserialize;
 use std::cell::RefCell;
 use std::io::Write;
+use stream::Stream;
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
@@ -162,9 +164,14 @@ impl Session {
     }
 
     /// Read everything added into one drawing. `name` names it when it holds several
-    /// models or clouds (a zip's or folder's name). `progress(done, total)` is called
-    /// every few megabytes. Throws a plain object `{file, kind, line, message, issues,
-    /// truncated}` when a file can't be read without guessing.
+    /// models or clouds (a zip's or folder's name). Throws a plain object `{file, kind,
+    /// line, message, issues, truncated}` when a file can't be read without guessing.
+    ///
+    /// `progress(done, total, file, cloud, count, points, colors, origin)` is called every
+    /// few megabytes: bytes of the models and clouds read of their total, the file being
+    /// read, whether it is a point cloud, how many positions it has so far, and the points
+    /// read since the last call, to show while reading (thinned, xyz relative to `origin`,
+    /// colors in linear light; empty for small files).
     pub fn load(
         &mut self,
         name: String,
@@ -181,13 +188,22 @@ impl Session {
                 modified: *modified,
             })
             .collect();
-        let bundle = bundle::load(files, &name, |done, total| {
+        let mut stream = Stream::new(stream::BUDGET);
+        let bundle = bundle::load(files, &name, |l| {
             if let Some(f) = &progress {
-                let _ = f.call2(
-                    &JsValue::NULL,
-                    &JsValue::from_f64(done as f64),
-                    &JsValue::from_f64(total as f64),
-                );
+                stream.take(l);
+                let args = js_sys::Array::new();
+                args.push(&JsValue::from_f64(l.done as f64));
+                args.push(&JsValue::from_f64(l.total as f64));
+                args.push(&JsValue::from_str(l.file));
+                args.push(&JsValue::from_bool(l.cloud));
+                args.push(&JsValue::from_f64(l.partial.positions.len() as f64));
+                args.push(&js_sys::Float32Array::from(&stream.points[..]));
+                args.push(&js_sys::Uint8Array::from(&stream.colors[..]));
+                args.push(&js_sys::Float64Array::from(
+                    &stream.origin.unwrap_or_default()[..],
+                ));
+                let _ = f.apply(&JsValue::NULL, &args);
             }
         })
         .map_err(|e| parse_error(&e.file, &e.error))?;
@@ -327,7 +343,8 @@ impl Session {
     /// conversion then has no preview.
     ///
     /// `stage(name)` is called as each step starts: `"curves"`, `"preview"`, `"hash"`,
-    /// `"write"`.
+    /// `"write"`. While a DXF is written, `progress(done, total)` counts the elements
+    /// written of all there are (see `obj2cad_dxf::work`), with each piece of the file.
     #[allow(clippy::too_many_arguments)]
     pub fn convert(
         &self,
@@ -337,6 +354,7 @@ impl Session {
         sink: &js_sys::Function,
         stage: Option<js_sys::Function>,
         early: Option<js_sys::Function>,
+        progress: Option<js_sys::Function>,
     ) -> Result<Conversion, JsError> {
         let stage = |name: &str| {
             if let Some(f) = &stage {
@@ -426,13 +444,30 @@ impl Session {
             f: sink,
             written: 0,
         };
+        let mut report_written = |done: u64, total: u64| {
+            if let Some(f) = &progress {
+                let _ = f.call2(
+                    &JsValue::NULL,
+                    &JsValue::from_f64(done as f64),
+                    &JsValue::from_f64(total as f64),
+                );
+            }
+        };
         match s.format {
-            Format::Dxf => {
-                obj2cad_dxf::write_to(&model, &meta, obj2cad_dxf::Format::Ascii, &mut out)
-            }
-            Format::DxfBinary => {
-                obj2cad_dxf::write_to(&model, &meta, obj2cad_dxf::Format::Binary, &mut out)
-            }
+            Format::Dxf => obj2cad_dxf::write_to_with_progress(
+                &model,
+                &meta,
+                obj2cad_dxf::Format::Ascii,
+                &mut out,
+                &mut report_written,
+            ),
+            Format::DxfBinary => obj2cad_dxf::write_to_with_progress(
+                &model,
+                &meta,
+                obj2cad_dxf::Format::Binary,
+                &mut out,
+                &mut report_written,
+            ),
             #[cfg(feature = "dwg")]
             Format::Dwg => {
                 let bytes =

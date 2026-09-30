@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { PreparingView } from "@/components/WorkspaceSkeleton";
+import { LayersSkeleton, PreparingView, ResultSkeleton } from "@/components/WorkspaceSkeleton";
 import { AnimatePresence, motion } from "motion/react";
 import { Viewer, type AxisDirs } from "@/viewer/Viewer";
 import { AxisGizmo } from "@/components/AxisGizmo";
@@ -9,6 +9,7 @@ import { ViewTools, type ResultProps } from "@/components/controls";
 import type { Inspection, PreviewBuffers, Result } from "@/lib/engine";
 import type { Format, LayerMode, Prefs, UpAxis, Units } from "@/lib/settings";
 import { displayUnit, unitSymbol } from "@/lib/settings";
+import { pointFeed } from "@/lib/pointFeed";
 
 function cssVar(name: string) {
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
@@ -30,8 +31,11 @@ export function Workspace({
   preview,
   inspection,
   pending = [],
+  pendingNote,
   prefs,
   busy,
+  write = null,
+  railShown = false,
   downloaded,
   onUp,
   onUnits,
@@ -48,17 +52,23 @@ export function Workspace({
   onAddMtl,
   onAnother,
 }: {
-  result: Result;
+  /** The drawing; `null` while its files are still read (the scene builds meanwhile). */
+  result: Result | null;
   /** The drawing without the hidden layers (while some are hidden and it is ready). */
   visible: Result | null;
   /** Names of the layers left out of the drawing. */
   hidden: string[];
   preview: PreviewState | null;
   inspection: Inspection | null;
-  /** Files still loading, shown after the rest of the drawing. */
+  /** Files still loading, shown after the rest of the drawing, and how far they are. */
   pending?: string[];
+  pendingNote?: string;
   prefs: Prefs;
   busy: string | null;
+  /** The file being written: elements written of all (`total` 0: no count, a DWG). */
+  write?: { done: number; total: number } | null;
+  /** The station rail shows what is happening (the busy label is then not shown). */
+  railShown?: boolean;
   downloaded: string | null;
   onUp: (u: UpAxis | null) => void;
   onUnits: (u: Units | null) => void;
@@ -83,10 +93,11 @@ export function Workspace({
   const [axes, setAxes] = useState<AxisDirs | null>(null);
   const [edges, setEdges] = useState(false);
   const [ortho, setOrtho] = useState(false);
-  const { report, decisions } = result;
+  const report = result?.report;
+  const decisions = result?.decisions;
   const hidden = useMemo(() => {
     const names = new Set(hiddenNames);
-    return new Set(report.layers.flatMap((l, i) => (names.has(l.name) ? [i] : [])));
+    return new Set(report?.layers.flatMap((l, i) => (names.has(l.name) ? [i] : [])) ?? []);
   }, [hiddenNames, report]);
   /** The layer lit up in the viewer: the row under the pointer, else the one picked. */
   const [hovered, setHovered] = useState<number | null>(null);
@@ -99,11 +110,22 @@ export function Workspace({
     shownFile.current = null; // a new viewer has framed nothing yet
     v.setTheme({ grid: cssVar("--grid"), gridMajor: cssVar("--grid-major"), dim: cssVar("--dim"), edge: cssVar("--text") });
     viewer.current = v;
+    // The scene builds from the points of large files as they are read.
+    const off = pointFeed.listen((b) => (b ? v.addPoints(b) : v.clearPoints()));
     return () => {
+      off();
       v.dispose();
       viewer.current = null;
     };
   }, []);
+
+  // Another drawing is being opened: nothing of the last one stays in view.
+  const empty = result === null;
+  useEffect(() => {
+    if (!empty) return;
+    viewer.current?.reset();
+    shownFile.current = null;
+  }, [empty]);
 
   /** The preview the viewer shows (`id`); until it matches `preview`, "Preparing". */
   const [drawn, setDrawn] = useState<number | null>(null);
@@ -131,8 +153,11 @@ export function Workspace({
   }, [preview]);
 
   // A new orientation turns the existing preview.
-  useEffect(() => viewer.current?.setOrientation(decisions.up_axis), [decisions.up_axis, drawn]);
-  const shownUnit = displayUnit(decisions.units, prefs.showIn);
+  const upAxis = decisions?.up_axis;
+  useEffect(() => {
+    if (upAxis) viewer.current?.setOrientation(upAxis);
+  }, [upAxis, drawn]);
+  const shownUnit = displayUnit(decisions?.units ?? "unitless", prefs.showIn);
   useEffect(() => viewer.current?.setUnit(unitSymbol(shownUnit.unit), shownUnit.factor), [shownUnit.unit, shownUnit.factor]);
   useEffect(() => viewer.current?.setEdges(edges), [edges]);
   // Layers left out of the drawing are hidden in the viewer (after each rebuild too).
@@ -144,13 +169,13 @@ export function Workspace({
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
-  const changeHidden = (next: Set<number>) => onHidden(report.layers.filter((_, i) => next.has(i)).map((l) => l.name));
+  const changeHidden = (next: Set<number>) => report && onHidden(report.layers.filter((_, i) => next.has(i)).map((l) => l.name));
 
   const available = preview?.buffers.available ?? true;
-  const layerCount = report.layers.filter((l) => l.faces + l.polylines + l.points + l.surfaces > 0).length;
+  const layerCount = report?.layers.filter((l) => l.faces + l.polylines + l.points + l.surfaces > 0).length ?? 0;
   /** The download, as the button and the keyboard make it: hidden layers left out. */
   const download = (pickLocation: boolean) => {
-    if (busy === null && hidden.size < layerCount) onDownload(pickLocation);
+    if (result && busy === null && hidden.size < layerCount) onDownload(pickLocation);
   };
   // Everything the card says describes the file Download saves.
   const shown = hidden.size > 0 && visible ? visible : result;
@@ -170,7 +195,9 @@ export function Workspace({
     setOrtho(on);
     viewer.current?.setOrtho(on);
   };
-  const panel: ResultProps = {
+  const onFit = () => viewer.current?.fit();
+  const onView = (v: Parameters<Viewer["setView"]>[0]) => viewer.current?.setView(v);
+  const panel: ResultProps | null = !shown || !decisions ? null : {
     report: shown.report,
     decisions,
     format: prefs.format,
@@ -197,9 +224,10 @@ export function Workspace({
     onIncludeName,
     onCurves,
     onEdges: setEdges,
-    onView: (v) => viewer.current?.setView(v),
+    onView,
     onOrtho,
-    onFit: () => viewer.current?.fit(),
+    onFit,
+    write,
     onDownload: download,
     onDownloadReport,
     onAddMtl,
@@ -225,7 +253,7 @@ export function Workspace({
         )}
 
         <AnimatePresence>
-          {busy && (
+          {busy && !railShown && (
             <motion.div
               initial={{ opacity: 0, y: -6 }}
               animate={{ opacity: 1, y: 0 }}
@@ -243,9 +271,11 @@ export function Workspace({
           <AxisGizmo axes={axes} unit={unitSymbol(shownUnit.unit)} />
         </div>
 
-        <div className="absolute right-4 bottom-4 lg:top-[76px] lg:right-[396px] lg:bottom-auto">
-          <ViewTools edges={edges} ortho={ortho} onEdges={setEdges} onFit={panel.onFit} onView={panel.onView} onOrtho={onOrtho} />
-        </div>
+        {result && (
+          <div className="absolute right-4 bottom-4 lg:top-[76px] lg:right-[396px] lg:bottom-auto">
+            <ViewTools edges={edges} ortho={ortho} onEdges={setEdges} onFit={onFit} onView={onView} onOrtho={onOrtho} />
+          </div>
+        )}
       </div>
 
       {/* Panels float over the viewer on large screens; on small ones they share a bottom
@@ -257,7 +287,7 @@ export function Workspace({
           transition={{ delay: 0.1 }}
           className="pointer-events-none lg:absolute lg:top-[76px] lg:right-4 lg:flex lg:max-h-[calc(100%-92px)] lg:w-[364px]"
         >
-          <ResultCard {...panel} />
+          {panel ? <ResultCard {...panel} /> : <ResultSkeleton />}
         </motion.div>
         <motion.div
           initial={{ opacity: 0, x: -16 }}
@@ -265,6 +295,7 @@ export function Workspace({
           transition={{ delay: 0.05 }}
           className="pointer-events-none lg:absolute lg:top-[76px] lg:left-4 lg:flex lg:max-h-[calc(100%-200px)] lg:w-[268px]"
         >
+          {report ? (
           <LayersCard
             report={report}
             mode={prefs.layerMode}
@@ -277,7 +308,11 @@ export function Workspace({
             onHover={setHovered}
             inspection={inspection}
             pending={pending}
+            pendingNote={pendingNote}
           />
+          ) : (
+            <LayersSkeleton />
+          )}
         </motion.div>
       </div>
     </main>

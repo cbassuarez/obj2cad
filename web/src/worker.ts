@@ -11,12 +11,29 @@ type Module = typeof core;
 type Kind = "core" | "dwg";
 
 /** What the engine is doing. `read` and `parse` count bytes of `total`; `write` counts
- *  the bytes written so far (the total isn't known in advance, so `total` is 0); the
- *  others are steps without a count. `engine`: waiting for an engine module to load. */
+ *  the elements of the drawing written of `total` (a DWG is written in one go: `total`
+ *  is 0); the others are steps without a count (`total` 0). `engine`: waiting for an
+ *  engine module to load. */
 export interface Progress {
   stage: "engine" | "read" | "parse" | "hash" | "curves" | "write" | "preview";
   done: number;
   total: number;
+  /** `parse`: the file being read, whether it is a point cloud, and how many positions
+   *  (vertices or points) it has so far. */
+  file?: string;
+  cloud?: boolean;
+  count?: number;
+}
+
+/** Points read since the last batch, to show while the file is read (thinned; display
+ *  only). Positions are relative to `origin`, in the file's own axes; colors in linear
+ *  light, like the preview's. */
+export interface PointBatch {
+  points: Float32Array;
+  colors: Uint8Array;
+  origin: number[];
+  /** From a point cloud (else a model's vertices). */
+  cloud: boolean;
 }
 
 export interface ParseFailure {
@@ -91,6 +108,7 @@ export interface Early {
 
 export type Reply =
   | { id: number; type: "progress"; progress: Progress }
+  | { id: number; type: "points"; batch: PointBatch }
   | { id: number; type: "early"; early: Early }
   | { id: number; type: "ok"; result: unknown }
   | { id: number; type: "error"; failure: Failure };
@@ -183,12 +201,20 @@ async function load(id: number, sources: SourceFile[], name: string, kind: Kind)
       // A file inside a .zip is taken out here, off the page, by the browser's decompressor.
       const bytes = s.zip ? await extract(s.file, s.zip, progress) : await read(s.file, progress);
       before += size(s);
+      // Every file, however small, counts when it is in (large ones also as they come).
+      post({ id, type: "progress", progress: { stage: "read", done: before, total } });
       // Whole seconds, like the command-line tool; -1 when the date is unknown.
       const modified = s.file.lastModified > 0 ? Math.floor(s.file.lastModified / 1000) : -1;
       hashes.push(sha256(bytes));
       session.add_file(s.path, bytes, "", modified);
     }
-    session.load(name, (done: number, all: number) => post({ id, type: "progress", progress: { stage: "parse", done, total: all } }));
+    session.load(
+      name,
+      (done: number, all: number, file: string, cloud: boolean, count: number, points: Float32Array, colors: Uint8Array, origin: Float64Array) => {
+        if (points.length) post({ id, type: "points", batch: { points, colors, origin: Array.from(origin), cloud } }, [points.buffer, colors.buffer]);
+        post({ id, type: "progress", progress: { stage: "parse", done, total: all, file, cloud, count } });
+      },
+    );
     session.set_hashes(await Promise.all(hashes));
   } catch (e) {
     session.free();
@@ -231,18 +257,12 @@ function convert(id: number, o: Open, settings: EngineSettings, wantPreview: boo
   const key = geometryKey(settings);
   const progress = (stage: Progress["stage"], done = 0) => post({ id, type: "progress", progress: { stage, done, total: 0 } });
   const parts: ArrayBuffer[] = [];
-  let written = 0;
   let reported = 0;
   const c = o.session.convert(
     json,
     o.parity.get(key) ?? "",
     wantPreview,
-    (chunk: Uint8Array<ArrayBuffer>) => {
-      parts.push(chunk.buffer);
-      written += chunk.length;
-      // Every 8 MB is plenty to show the file growing.
-      if (written - reported >= 8 << 20) progress("write", (reported = written));
-    },
+    (chunk: Uint8Array<ArrayBuffer>) => parts.push(chunk.buffer),
     (stage: string) => progress(stage as Progress["stage"]),
     // The model goes to the app as soon as it can be shown; the file follows.
     !early
@@ -255,6 +275,13 @@ function convert(id: number, o: Open, settings: EngineSettings, wantPreview: boo
             first.free();
           }
         },
+    // Elements written of all there are, at most every 50 ms (and the last).
+    (done: number, total: number) => {
+      const now = performance.now();
+      if (done < total && now - reported < 50) return;
+      reported = now;
+      post({ id, type: "progress", progress: { stage: "write", done, total } });
+    },
   );
   try {
     o.parity.set(key, c.parity());

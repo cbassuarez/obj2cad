@@ -12,10 +12,23 @@ use crate::diag::{Code, Diagnostic, Diagnostics, Severity};
 use crate::hash::sha256_hex;
 use crate::mtl::{self, Library, TextureRef};
 use crate::obj::{self, ElementAttrs, ObjDocument, ParseError, NO_UV};
+use crate::partial::Partial;
 use crate::texture::{self, Image};
 use crate::xyz;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
+
+/// A bundle part-way through loading (see [`load`]).
+pub struct Loading<'a> {
+    /// Bytes of the models and clouds read so far, and their total.
+    pub done: usize,
+    pub total: usize,
+    /// The file being read (its name in the drawing), and whether it is a point cloud.
+    pub file: &'a str,
+    pub cloud: bool,
+    /// What has been read of that file so far.
+    pub partial: &'a Partial<'a>,
+}
 
 /// One file as given: its path (folders are kept for display, ignored for matching).
 pub struct InputFile<'a> {
@@ -167,11 +180,11 @@ pub fn is_supported(path: &str) -> bool {
 }
 
 /// Load a bundle. `name` names the drawing when it holds several models or clouds (a
-/// zip's or folder's name). `progress(done, total)` reports parsing by bytes.
+/// zip's or folder's name). `progress` reports parsing: bytes, and what has been read.
 pub fn load(
     files: Vec<InputFile<'_>>,
     name: &str,
-    mut progress: impl FnMut(usize, usize),
+    mut progress: impl FnMut(&Loading),
 ) -> Result<Bundle, BundleError> {
     // Display names: file names, made unique in path order ("a.obj", "a (2).obj").
     let mut files: Vec<(usize, InputFile<'_>)> = files.into_iter().enumerate().collect();
@@ -229,17 +242,26 @@ pub fn load(
     let mut parts: Vec<(usize, ObjDocument)> = Vec::new();
     for &i in &geometry {
         let bytes = files[i].bytes;
-        let doc = if kind(&names[i]) == Kind::Obj {
-            obj::parse_with_progress(bytes, |d, _| progress(done + d, total))
+        let cloud = kind(&names[i]) == Kind::Xyz;
+        let mut report = |partial: &Partial| {
+            progress(&Loading {
+                done: done + partial.done,
+                total,
+                file: &names[i],
+                cloud,
+                partial,
+            })
+        };
+        let doc = if cloud {
+            xyz::parse_with_progress(bytes, &names[i], &mut report)
         } else {
-            xyz::parse(bytes, &names[i])
+            obj::parse_with_progress(bytes, &mut report)
         }
         .map_err(|error| BundleError {
             file: names[i].clone(),
             error,
         })?;
         done += bytes.len();
-        progress(done, total);
         entries[i].role = if kind(&names[i]) == Kind::Obj {
             Role::Model
         } else {
@@ -674,7 +696,7 @@ mod tests {
             let now = load(
                 set.iter().map(|(p, x)| file(p, x)).collect(),
                 "site",
-                |_, _| {},
+                |_| {},
             )
             .unwrap();
             let later_files = set
@@ -684,7 +706,7 @@ mod tests {
                     ..file(p, x)
                 })
                 .collect();
-            let mut later = load(later_files, "site", |_, _| {}).unwrap();
+            let mut later = load(later_files, "site", |_| {}).unwrap();
             assert_ne!(later.source_sha256, now.source_sha256);
             later.set_hashes(&set.iter().map(|(_, x)| sha256_hex(x)).collect::<Vec<_>>());
             assert_eq!(later.source_sha256, now.source_sha256);
@@ -709,7 +731,7 @@ mod tests {
                 file("notes.txt", b"hi"),
             ],
             "",
-            |_, _| {},
+            |_| {},
         )
         .unwrap();
         assert_eq!((b.name.as_str(), b.stem.as_str()), ("Model.obj", "Model"));
@@ -735,7 +757,7 @@ mod tests {
                 file("part.obj", b"v 0 0 0\nv 1 0 0\nv 0 1 -0.000000\nf 1 2 3\n"),
             ],
             "site.zip",
-            |_, _| {},
+            |_| {},
         )
         .unwrap();
         assert_eq!(b.name, "site.zip");
@@ -761,7 +783,7 @@ mod tests {
                 file("b.mtl", b"newmtl paint\nKd 0 0 1\nmap_Kd wood.jpg\n"),
             ],
             "",
-            |_, _| {},
+            |_| {},
         )
         .unwrap();
         assert_eq!(b.doc.materials, ["paint", "paint (b)"]);
@@ -794,7 +816,7 @@ mod tests {
                 file("scan.xyz", b"0 0 5\n1 1 5\n"),
             ],
             "site.zip",
-            |_, _| {},
+            |_| {},
         )
         .unwrap();
         assert_eq!(b.doc.objects, ["Cube", "Cube (b)", "scan"]);
@@ -832,7 +854,7 @@ mod tests {
         let e = load(
             vec![file("ok.obj", b"v 0 0 0\n"), file("bad.xyz", b"1 2\n")],
             "",
-            |_, _| {},
+            |_| {},
         )
         .err()
         .unwrap();

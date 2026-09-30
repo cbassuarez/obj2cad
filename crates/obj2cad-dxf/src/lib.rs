@@ -146,6 +146,10 @@ struct Out<'w> {
     buf: Vec<u8>,
     sink: &'w mut dyn Write,
     written: u64,
+    /// Elements written so far (see [`work`]), reported at each flush.
+    done: u64,
+    total: u64,
+    progress: &'w mut dyn FnMut(u64, u64),
     next_handle: u64,
     ryu: ryu::Buffer,
     itoa: itoa::Buffer,
@@ -163,6 +167,7 @@ impl Out<'_> {
         self.sink.write_all(&self.buf)?;
         self.written += self.buf.len() as u64;
         self.buf.clear();
+        (self.progress)(self.done, self.total);
         Ok(())
     }
 
@@ -340,6 +345,7 @@ impl Out<'_> {
     /// symmetric under negation, so it round-trips by construction); otherwise the
     /// shortest form. Binary writes the double's bytes.
     fn xyz(&mut self, model: &CadModel, v: u32) {
+        self.done += 1;
         let p = model.position(v);
         for (axis, code) in [10, 20, 30].into_iter().enumerate() {
             if self.format == Format::Binary {
@@ -392,6 +398,29 @@ fn handles_needed(model: &CadModel) -> u64 {
         + model.surfaces.len() as u64
 }
 
+/// How much there is to write, in the elements [`write_to_with_progress`] counts: every
+/// coordinate triple (a mesh's vertices, polyline vertices, spline control points,
+/// points), every mesh face and every curved surface. Known before writing.
+pub fn work(model: &CadModel) -> u64 {
+    model
+        .meshes
+        .iter()
+        .map(|m| (m.vertices.len() + m.faces().count()) as u64)
+        .sum::<u64>()
+        + model
+            .polylines
+            .iter()
+            .map(|l| l.vertices.len() as u64)
+            .sum::<u64>()
+        + model
+            .splines
+            .iter()
+            .map(|c| c.control.len() as u64)
+            .sum::<u64>()
+        + model.points.len() as u64
+        + model.surfaces.len() as u64
+}
+
 /// Write `model` as DXF R2018 to `sink`. Returns the number of bytes written.
 pub fn write_to(
     model: &CadModel,
@@ -399,12 +428,27 @@ pub fn write_to(
     format: Format,
     sink: &mut dyn Write,
 ) -> io::Result<u64> {
+    write_to_with_progress(model, meta, format, sink, &mut |_, _| {})
+}
+
+/// [`write_to`], calling `progress(done, total)` each time a piece goes to `sink` (about
+/// every megabyte), counting the elements of [`work`]; the last call has `done == total`.
+pub fn write_to_with_progress(
+    model: &CadModel,
+    meta: &Meta,
+    format: Format,
+    sink: &mut dyn Write,
+    progress: &mut dyn FnMut(u64, u64),
+) -> io::Result<u64> {
     let mut out = Out {
         format,
         acds: Vec::new(),
         buf: Vec::with_capacity(CHUNK + 4096),
         sink,
         written: 0,
+        done: 0,
+        total: work(model),
+        progress,
         next_handle: FIRST_HANDLE,
         ryu: ryu::Buffer::new(),
         itoa: itoa::Buffer::new(),
@@ -541,6 +585,7 @@ pub fn write_to(
         out.maybe_flush()?;
     }
     out.flush()?;
+    debug_assert_eq!(out.done, out.total, "work count");
     debug_assert_eq!(
         out.next_handle,
         FIRST_HANDLE + handles_needed(model),
@@ -565,6 +610,7 @@ fn entities(out: &mut Out, model: &CadModel, meta: &Meta) -> io::Result<()> {
         let list_len: usize = m.faces().map(|f| f.len() + 1).sum();
         out.int(93, list_len as i64);
         for f in m.faces() {
+            out.done += 1;
             out.int(90, f.len() as i64);
             for &i in f {
                 out.int(90, i64::from(i));
@@ -628,6 +674,7 @@ fn entities(out: &mut Out, model: &CadModel, meta: &Meta) -> io::Result<()> {
     let product = format!("obj2cad {}", obj2cad_core::VERSION);
     for s in &model.surfaces {
         let layer = &model.layers[s.layer as usize].name;
+        out.done += 1;
         let kind = if s.body.solid { "3DSOLID" } else { "SURFACE" };
         let h = format!(
             "{:X}",
@@ -855,6 +902,24 @@ mod tests {
         assert!(sink.0.len() > 2, "written in several chunks");
         assert_eq!(n as usize, whole.len());
         assert_eq!(sink.0.concat(), whole);
+
+        // Progress: one call per piece, never backwards, ending at the known total.
+        let mut calls = Vec::new();
+        let mut sink = Chunks(Vec::new());
+        write_to_with_progress(&model, &META, Format::Ascii, &mut sink, &mut |d, t| {
+            calls.push((d, t))
+        })
+        .unwrap();
+        assert_eq!(sink.0.concat(), whole, "progress doesn't change the file");
+        assert_eq!(calls.len(), sink.0.len());
+        let total = work(&model);
+        assert!(calls.iter().all(|&(_, t)| t == total));
+        assert!(calls.windows(2).all(|w| w[0].0 <= w[1].0));
+        assert!(
+            calls.iter().any(|&(d, _)| d > 0 && d < total),
+            "reported mid-way"
+        );
+        assert_eq!(calls.last().unwrap().0, total);
     }
 
     /// Minimal binary DXF reader, independent of the writer, for the tests below.

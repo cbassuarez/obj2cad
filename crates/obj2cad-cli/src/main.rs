@@ -310,7 +310,7 @@ fn load_inputs(
             modified: g.modified,
         })
         .collect();
-    let bundle = obj2cad_core::bundle::load(files, &bundle_name, |_, _| {}).map_err(|e| {
+    let bundle = obj2cad_core::bundle::load(files, &bundle_name, |_| {}).map_err(|e| {
         let mut msg = e.to_string();
         for issue in e.error.more.iter() {
             msg.push_str(&format!("\n  line {}: {}", issue.line, issue.message));

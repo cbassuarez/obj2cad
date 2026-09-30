@@ -14,6 +14,7 @@ pub mod hints;
 pub mod mtl;
 pub mod obj;
 pub mod output;
+pub mod partial;
 pub mod report;
 pub mod synth;
 pub mod texture;
@@ -25,6 +26,7 @@ pub use convert::{
 pub use diag::{Code, Diagnostic, Severity};
 pub use obj::{parse, parse_with_progress, ErrorKind, ObjDocument, ParseError, ParseIssue};
 pub use output::Meta;
+pub use partial::Partial;
 
 /// Engine version, recorded in every output file and report.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

@@ -99,14 +99,23 @@ for (const format of ["dxf", "dwg"] as const) {
   }
 }
 
-test("opening a large file names each step and can be cancelled; the next file still converts", async ({ page }) => {
+test("opening a large file shows each step on the rail, and can be cancelled; the next file still converts", async ({ page }) => {
   const big = path.join(mkdtempSync(path.join(tmpdir(), "obj2cad-e2e-")), "big.obj");
-  execFileSync(cli, ["synth", "900", big]); // about 1.6 million faces
+  execFileSync(cli, ["synth", "1400", big]); // about 3.9 million faces
   await open(page, [big]);
-  const loading = page.getByRole("status", { name: "Opening big.obj" });
-  await expect(loading).toBeVisible();
-  await expect(loading.getByText("Reading the model")).toBeVisible();
-  await loading.getByRole("button", { name: "Cancel" }).click();
+  // While the model is read the rail counts its vertices; Cancel is clicked in that same
+  // moment (the page is busy building the scene, and a round trip could miss it).
+  const stations = await page.waitForFunction(
+    () => {
+      const rail = document.querySelector('[role="status"][aria-label="Opening big.obj"]');
+      if (!rail || !/Model: active, [\d,]+ vertices/.test(rail.textContent ?? "")) return null;
+      rail.querySelector("button")!.click();
+      return [...rail.querySelectorAll("li .sr-only")].map((e) => (e.textContent ?? "").split(":")[0]);
+    },
+    null,
+    { timeout: 30_000 },
+  );
+  expect(await stations.jsonValue()).toEqual(["Read", "Model", "View", "Fingerprint", "Write DXF"]);
   await expect(page.getByRole("heading", { name: "OBJ to DWG / DXF" })).toBeVisible();
   const obj = path.join(fixtures, "edge", "cube_materials.obj");
   const mtl = path.join(fixtures, "edge", "cube_materials.mtl");
@@ -139,10 +148,19 @@ test("a large scan loads after the model it comes with; the file is written once
   for (let i = 0; i < 750_000; i++) rows.push(`${(i % 1000) - 500}.123 ${Math.floor(i / 1000)}.456 0.789 ${i % 256} 120 ${255 - (i % 256)}\n`);
   writeFileSync(scan, rows.join(""));
   await open(page, [obj, scan]);
-  // The model is shown while the scan is still loading, and the layers say so.
-  await expect(page.getByRole("status", { name: "Loading scan.xyz" })).toBeVisible();
-  await expect(card(page).getByText("1 face on 1 layer")).toBeVisible();
-  await expect(downloadButton(page)).toBeDisabled();
+  // The model is shown while the scan is still loading, and the layers say so; Download
+  // waits, and nothing is called an exact copy before the file is written. (Read in one
+  // moment: the scan may finish loading between two checks.)
+  const loading = await page.waitForFunction(() => {
+    if (!document.querySelector('[aria-label="Loading scan.xyz"]')) return null;
+    const card = document.querySelector('aside[aria-label="Result"]');
+    const download = [...document.querySelectorAll("button")].find((b) => /^Download (DXF|DWG)/.test(b.textContent ?? ""));
+    return { card: card?.textContent ?? "", disabled: !!download?.disabled };
+  });
+  const seen = await loading.jsonValue();
+  expect(seen.card).toContain("1 face on 1 layer");
+  expect(seen.card).not.toContain("Exact copy");
+  expect(seen.disabled).toBe(true);
   await expect(page.getByRole("status", { name: "Loading scan.xyz" })).toHaveCount(0, { timeout: 60_000 });
   await expect(downloadButton(page)).toBeEnabled({ timeout: 60_000 });
   await expect(card(page).getByText("750,001 shapes on 2 layers")).toBeVisible();
