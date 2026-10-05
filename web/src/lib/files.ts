@@ -4,7 +4,11 @@
 import { zip, type AsyncZippable } from "fflate";
 import { listZip, type ZipEntry } from "@/lib/zip";
 
-const ext = (name: string) => name.slice(name.lastIndexOf(".") + 1).toLowerCase();
+// As the engine reads it (bundle.rs `kind`): no dot, no extension.
+const ext = (name: string) => {
+  const dot = name.lastIndexOf(".");
+  return dot < 0 ? "" : name.slice(dot + 1).toLowerCase();
+};
 /** The file name without any folders (zip entries and dropped folders carry paths). */
 export const baseName = (path: string) => path.split(/[\\/]/).pop() ?? path;
 export const stem = (name: string) => baseName(name).replace(/\.[^.]+$/, "");
