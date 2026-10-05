@@ -9,7 +9,7 @@ Why patches:
      properties (DWGPROPS: custom properties such as `obj2cad.parity`) are lost. The fix
      writes the document's summary in the layout acadrust's own reader parses.
 Both should go upstream; until then this script produces the patched source in
-`vendor/acadrust` (git-ignored), which the workspace uses through `[patch.crates-io]` in
+`vendor/acadrust` (git-ignored, except its Cargo.toml so Dependabot can resolve the patch), which the workspace uses through `[patch.crates-io]` in
 the root Cargo.toml.
 
 acadrust is MPL-2.0: the modified files keep their license, and the modifications are
