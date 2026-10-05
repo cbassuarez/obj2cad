@@ -7,8 +7,61 @@
       "changelog-path": "CHANGELOG.md",
       "bump-minor-pre-major": true,
       "extra-files": [
-        { "type": "toml", "path": "Cargo.toml", "jsonpath": "$.workspace.package.version" },
-        { "type": "json", "path": "web/package.json", "jsonpath": "$.version" }
+        {
+          "type": "toml",
+          "path": "Cargo.toml",
+          "jsonpath": "$.workspace.package.version"
+        },
+        {
+          "type": "toml",
+          "path": "Cargo.lock",
+          "jsonpath": "$.package[?(@.name.value=='obj2cad-acis')].version"
+        },
+        {
+          "type": "toml",
+          "path": "Cargo.lock",
+          "jsonpath": "$.package[?(@.name.value=='obj2cad-cli')].version"
+        },
+        {
+          "type": "toml",
+          "path": "Cargo.lock",
+          "jsonpath": "$.package[?(@.name.value=='obj2cad-core')].version"
+        },
+        {
+          "type": "toml",
+          "path": "Cargo.lock",
+          "jsonpath": "$.package[?(@.name.value=='obj2cad-curves')].version"
+        },
+        {
+          "type": "toml",
+          "path": "Cargo.lock",
+          "jsonpath": "$.package[?(@.name.value=='obj2cad-dwg')].version"
+        },
+        {
+          "type": "toml",
+          "path": "Cargo.lock",
+          "jsonpath": "$.package[?(@.name.value=='obj2cad-dxf')].version"
+        },
+        {
+          "type": "toml",
+          "path": "Cargo.lock",
+          "jsonpath": "$.package[?(@.name.value=='obj2cad-wasm')].version"
+        },
+        {
+          "type": "json",
+          "path": "web/package.json",
+          "jsonpath": "$.version"
+        },
+        {
+          "type": "json",
+          "path": "web/package-lock.json",
+          "jsonpath": "$.version"
+        },
+        {
+          "type": "json",
+          "path": "web/package-lock.json",
+          "jsonpath": "$.packages[''].version"
+        }
       ]
     }
   }
