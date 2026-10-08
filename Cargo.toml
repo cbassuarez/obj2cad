@@ -30,8 +30,6 @@ debug = false
 lto = true
 codegen-units = 1
 
-# acadrust with obj2cad's negative-zero fix. `vendor/` is generated (git-ignored but for
-# acadrust's Cargo.toml, which Dependabot needs to resolve this patch): run
-# `python tools/vendor/fetch_acadrust.py` once after cloning.
+# obj2cad's fork of acadrust (the DWG writer): see vendor/acadrust/OBJ2CAD.md.
 [patch.crates-io]
 acadrust = { path = "vendor/acadrust" }

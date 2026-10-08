@@ -6,12 +6,12 @@
 //! never applied by scaling.
 
 use crate::color::{self, Mix};
+use crate::coords::Token;
 use crate::diag::{Code, Diagnostic, Diagnostics, Severity};
 use crate::mtl::Palette;
 use crate::obj::{ObjDocument, NO_UV};
 use crate::texture::Texture;
 use serde::{Deserialize, Serialize};
-use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 /// AutoCAD's default SMOOTHMESHMAXFACE; larger meshes are split so they open with default settings.
@@ -28,6 +28,9 @@ pub struct Materials<'a> {
     pub palette: Option<&'a Palette>,
     /// Material name → its diffuse texture.
     pub textures: HashMap<&'a str, Texture<'a>>,
+    /// Each face's color from its texture, sampled beforehand with [`sample_texture`]
+    /// (in place of `textures`, whose images then needn't be kept).
+    pub sampled: Option<&'a [Option<[u8; 3]>]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -304,28 +307,23 @@ impl CadModel<'_> {
 
     /// Output text of coordinate `axis` of source vertex `v`: the original token, with
     /// the sign flipped textually where the axis mapping negates.
-    pub fn coord_text(&self, v: u32, axis: usize) -> Cow<'_, str> {
+    pub fn coord_text(&self, v: u32, axis: usize) -> String {
         let (t, negate) = self.coord_source(v, axis);
+        let t = t.as_str();
         if !negate {
-            Cow::Borrowed(t)
+            t.to_owned()
         } else if let Some(rest) = t.strip_prefix('-') {
-            Cow::Borrowed(rest)
+            rest.to_owned()
         } else {
-            Cow::Owned(format!("-{}", t.strip_prefix('+').unwrap_or(t)))
+            format!("-{}", t.strip_prefix('+').unwrap_or(t))
         }
     }
 
     /// The original token behind output coordinate `axis` of vertex `v`, and whether the
     /// axis mapping negates it. Lets writers emit text without allocating.
-    pub fn coord_source(&self, v: u32, axis: usize) -> (&str, bool) {
+    pub fn coord_source(&self, v: u32, axis: usize) -> (Token<'_>, bool) {
         let (src_axis, negate) = self.source_axis(axis);
         (self.doc.coord_text(v as usize, src_axis), negate)
-    }
-
-    /// [`Self::coord_source`] as bytes (for writers copying the text as it is).
-    pub fn coord_source_bytes(&self, v: u32, axis: usize) -> (&[u8], bool) {
-        let (src_axis, negate) = self.source_axis(axis);
-        (self.doc.coord_bytes(v as usize, src_axis), negate)
     }
 
     /// The source axis an output axis comes from, and whether it is negated.
@@ -491,7 +489,7 @@ pub fn convert<'a>(
         doc,
         &Materials {
             palette,
-            textures: HashMap::new(),
+            ..Default::default()
         },
         options,
     )
@@ -501,8 +499,6 @@ pub fn convert<'a>(
 fn vertex_rgb(doc: &ObjDocument, v: u32) -> Option<[u8; 3]> {
     doc.colors
         .get(v as usize)
-        .copied()
-        .flatten()
         .map(|c| c.map(|x| (f64::from(x).clamp(0.0, 1.0) * 255.0).round() as u8))
 }
 
@@ -526,7 +522,8 @@ fn face_colors(
     excluded: &HashSet<u32>,
     lost: &mut [bool],
 ) -> Option<FaceColors> {
-    let textured = !materials.textures.is_empty() && !doc.face_uvs.is_empty();
+    let textured =
+        (!materials.textures.is_empty() || materials.sampled.is_some()) && !doc.face_uvs.is_empty();
     if !textured && doc.counts.vertices_with_color == 0 {
         return None;
     }
@@ -548,20 +545,22 @@ fn face_colors(
         if excluded.contains(&layer_of_attr[attr]) {
             continue;
         }
-        let range = doc.faces.offsets[fi] as usize..doc.faces.offsets[fi + 1] as usize;
-        uvs.clear();
-        if textured {
-            for &t in doc.face_uvs.get(range).unwrap_or(&[]) {
-                if t == NO_UV {
-                    break;
-                }
-                uvs.push(doc.texcoords[t as usize]);
-            }
-        }
-        let (key, c) = match tex_of_attr[attr] {
-            Some((m, tex)) if uvs.len() == face.len() => {
+        let from_texture = match materials.sampled {
+            Some(s) => s.get(fi).copied().flatten().map(|c| {
+                let m = doc.attrs[attr]
+                    .material
+                    .expect("a textured face has a material");
+                (m as usize, c)
+            }),
+            None => tex_of_attr[attr].and_then(|(m, tex)| {
+                face_uvs(doc, fi, &mut uvs);
+                (textured && uvs.len() == face.len()).then(|| (m, tex.face_color(&uvs)))
+            }),
+        };
+        let (key, c) = match from_texture {
+            Some((m, c)) => {
                 mark_lost(doc, face, lost);
-                ((0, m), tex.face_color(&uvs))
+                ((0, m), c)
             }
             _ => match mean_vertex_color(doc, face) {
                 Some(c) => ((1, layer_of_attr[attr] as usize), c),
@@ -597,6 +596,42 @@ fn face_colors(
     Some(out)
 }
 
+/// Face `fi`'s texture coordinates, up to the first corner without one.
+fn face_uvs(doc: &ObjDocument, fi: usize, uvs: &mut Vec<[f32; 2]>) {
+    let range = doc.faces.offsets[fi] as usize..doc.faces.offsets[fi + 1] as usize;
+    uvs.clear();
+    for &t in doc.face_uvs.get(range).unwrap_or(&[]) {
+        if t == NO_UV {
+            break;
+        }
+        uvs.push(doc.texcoords[t as usize]);
+    }
+}
+
+/// The color `tex` gives each face on `material` that has texture coordinates at every
+/// corner, into `out` (one per face): what a conversion with `tex` among
+/// [`Materials::textures`] shows, sampled once (see [`Materials::sampled`]).
+pub fn sample_texture(
+    doc: &ObjDocument,
+    material: &str,
+    tex: &Texture,
+    out: &mut [Option<[u8; 3]>],
+) {
+    let Some(m) = doc.materials.iter().position(|x| x == material) else {
+        return;
+    };
+    let mut uvs = Vec::new();
+    for (fi, face) in doc.faces.iter().enumerate() {
+        if doc.attrs[doc.faces.attr[fi] as usize].material != Some(m as u32) {
+            continue;
+        }
+        face_uvs(doc, fi, &mut uvs);
+        if uvs.len() == face.len() {
+            out[fi] = Some(tex.face_color(&uvs));
+        }
+    }
+}
+
 /// The average (in linear light) of the corners' vertex colors, if they all have one.
 fn mean_vertex_color(doc: &ObjDocument, corners: &[u32]) -> Option<[u8; 3]> {
     let mut mix = Mix::default();
@@ -611,7 +646,7 @@ fn mean_vertex_color(doc: &ObjDocument, corners: &[u32]) -> Option<[u8; 3]> {
 fn mark_lost(doc: &ObjDocument, corners: &[u32], lost: &mut [bool]) {
     if !lost.is_empty() {
         for &v in corners {
-            lost[v as usize] |= doc.colors.get(v as usize).is_some_and(Option::is_some);
+            lost[v as usize] |= doc.colors.get(v as usize).is_some();
         }
     }
 }
@@ -897,7 +932,9 @@ pub fn convert_with<'a>(
             )
         });
     }
-    let mut points = Vec::new();
+    // Sized up front: a point cloud's list is the largest thing a conversion makes, and
+    // grown by doubling it would briefly take three times its size.
+    let mut points = Vec::with_capacity(doc.points.indices.len());
     for (i, p) in doc.points.iter().enumerate() {
         let attr = doc.points.attr[i];
         for &v in p {

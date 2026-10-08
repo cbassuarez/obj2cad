@@ -8,12 +8,13 @@
 //! hash, writers, preview) works on a bundle exactly as on a single file. Every file is
 //! accounted for in the report: used, not needed, or missing.
 
+use crate::coords::{concat, Coords};
 use crate::diag::{Code, Diagnostic, Diagnostics, Severity};
 use crate::hash::sha256_hex;
 use crate::mtl::{self, Library, TextureRef};
 use crate::obj::{self, ElementAttrs, ObjDocument, ParseError, NO_UV};
 use crate::partial::Partial;
-use crate::texture::{self, Image};
+use crate::texture::{self, Image, Texture};
 use crate::xyz;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
@@ -33,12 +34,85 @@ pub struct Loading<'a> {
 /// One file as given: its path (folders are kept for display, ignored for matching).
 pub struct InputFile<'a> {
     pub path: String,
-    pub bytes: &'a [u8],
+    pub content: Content<'a>,
     /// Precomputed SHA-256 (the browser hashes natively); computed when `None`. Empty
     /// when the caller supplies it after loading, with [`Bundle::set_hashes`].
     pub sha256: Option<String>,
     /// Modification time, Unix seconds (whole seconds, so every caller agrees).
     pub modified: Option<f64>,
+}
+
+/// A file's bytes: in memory, or read in pieces from somewhere else (a large file the
+/// browser holds, outside the engine's memory). A point cloud read in pieces is never
+/// in memory whole; anything else is read whole when it is needed.
+#[derive(Clone, Copy)]
+pub enum Content<'a> {
+    Bytes(&'a [u8]),
+    Pieces(&'a dyn Pieces),
+}
+
+/// A file read in pieces (see [`Content`]).
+pub trait Pieces {
+    fn len(&self) -> usize;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    /// Copy the file's bytes `at..at + buf.len()` into `buf`.
+    fn read(&self, at: usize, buf: &mut [u8]);
+}
+
+/// How much of a file is read at a time.
+const PIECE: usize = 4 << 20;
+
+impl Content<'_> {
+    pub fn len(&self) -> usize {
+        match self {
+            Content::Bytes(b) => b.len(),
+            Content::Pieces(p) => p.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Every byte (copied into memory when read in pieces).
+    pub fn whole(&self) -> std::borrow::Cow<'_, [u8]> {
+        match self {
+            Content::Bytes(b) => std::borrow::Cow::Borrowed(b),
+            Content::Pieces(p) => {
+                let mut all = vec![0; p.len()];
+                for (i, piece) in all.chunks_mut(PIECE).enumerate() {
+                    p.read(i * PIECE, piece);
+                }
+                std::borrow::Cow::Owned(all)
+            }
+        }
+    }
+
+    /// Every piece in order (the whole file at once when it is in memory).
+    fn each(&self, mut f: impl FnMut(&[u8])) {
+        match self {
+            Content::Bytes(b) => f(b),
+            Content::Pieces(p) => {
+                let mut buf = vec![0; PIECE.min(p.len())];
+                let mut at = 0;
+                while at < p.len() {
+                    let n = PIECE.min(p.len() - at);
+                    p.read(at, &mut buf[..n]);
+                    f(&buf[..n]);
+                    at += n;
+                }
+            }
+        }
+    }
+
+    fn sha256(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        self.each(|piece| h.update(piece));
+        crate::hash::hex(&h.finalize())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -70,11 +144,12 @@ pub struct FileEntry {
     pub note: Option<String>,
 }
 
-/// A material's texture: which decoded image, and how the MTL maps it.
+/// A material's texture: which image file (by position in the bundle), and how the MTL
+/// maps it.
 #[derive(Debug, Clone)]
-pub struct MaterialTexture {
-    pub image: usize,
-    pub map: TextureRef,
+struct MaterialTexture {
+    image: usize,
+    map: TextureRef,
 }
 
 pub struct Bundle {
@@ -82,8 +157,10 @@ pub struct Bundle {
     /// Material colors (`Kd`) by (possibly renamed) material name; `None` when no model
     /// has a material library.
     pub palette: Option<mtl::Palette>,
-    pub textures: HashMap<String, MaterialTexture>,
-    pub images: Vec<Image>,
+    /// Each face's color from its material's texture (see [`crate::Materials::sampled`]),
+    /// sampled once while loading so the images needn't be kept: decoded, a model's
+    /// textures can take gigabytes. Empty when no face has a texture.
+    pub face_textures: Vec<Option<[u8; 3]>>,
     pub files: Vec<FileEntry>,
     /// The drawing's name: the model's file name, or the bundle's name for several.
     pub name: String,
@@ -225,7 +302,7 @@ pub fn load(
             name: n.clone(),
             input,
             role: Role::NotUsed,
-            bytes: f.bytes.len() as u64,
+            bytes: f.content.len() as u64,
             sha256: f.sha256.clone(),
             note: None,
         })
@@ -237,11 +314,11 @@ pub fn load(
     let geometry: Vec<usize> = (0..files.len())
         .filter(|&i| matches!(kind(&names[i]), Kind::Obj | Kind::Xyz))
         .collect();
-    let total: usize = geometry.iter().map(|&i| files[i].bytes.len()).sum();
+    let total: usize = geometry.iter().map(|&i| files[i].content.len()).sum();
     let mut done = 0usize;
     let mut parts: Vec<(usize, ObjDocument)> = Vec::new();
     for &i in &geometry {
-        let bytes = files[i].bytes;
+        let content = files[i].content;
         let cloud = kind(&names[i]) == Kind::Xyz;
         let mut report = |partial: &Partial| {
             progress(&Loading {
@@ -253,15 +330,18 @@ pub fn load(
             })
         };
         let doc = if cloud {
-            xyz::parse_with_progress(bytes, &names[i], &mut report)
+            // Read as it comes: only what is kept of the points is ever in memory.
+            let mut reader = xyz::Reader::new(&names[i], content.len());
+            content.each(|piece| reader.feed(piece, &mut report));
+            reader.finish(&mut report)
         } else {
-            obj::parse_with_progress(bytes, &mut report)
+            obj::parse_with_progress(&content.whole(), &mut report)
         }
         .map_err(|error| BundleError {
             file: names[i].clone(),
             error,
         })?;
-        done += bytes.len();
+        done += content.len();
         entries[i].role = if kind(&names[i]) == Kind::Obj {
             Role::Model
         } else {
@@ -278,12 +358,17 @@ pub fn load(
         .collect();
 
     // ---- material libraries and textures ------------------------------------------------
-    let mut images: Vec<Image> = Vec::new();
-    let mut image_of: HashMap<usize, Option<usize>> = HashMap::new();
+    // Whether each image file could be read, and the last one decoded (each is sampled
+    // as soon as it is decoded, then dropped: see `Bundle::face_textures`).
+    let mut readable: HashMap<usize, bool> = HashMap::new();
+    let mut decoded: Option<(usize, Image)> = None;
+    // Per part: each face's texture color (empty when none has one).
+    let mut samples: Vec<Vec<Option<[u8; 3]>>> = Vec::new();
     let mut any_library = false;
     // Per part: material name → (Kd, texture).
     let mut definitions: Vec<Definitions> = Vec::new();
     for (pi, (i, doc)) in parts.iter().enumerate() {
+        samples.push(Vec::new());
         let mut defs = HashMap::new();
         if kind(&names[*i]) != Kind::Obj {
             definitions.push(defs);
@@ -320,11 +405,10 @@ pub fn load(
         {
             libs.push(mtls[0]);
         }
-        let _ = pi;
         for m in libs {
             any_library = true;
             entries[m].role = Role::Materials;
-            let lib: Library = mtl::parse_library(files[m].bytes);
+            let lib: Library = mtl::parse_library(&files[m].content.whole());
             for (mat, kd) in &lib.colors {
                 defs.entry(mat.clone())
                     .or_insert((None, None))
@@ -354,12 +438,15 @@ pub fn load(
                     }
                     continue;
                 };
-                let decoded = *image_of.entry(img).or_insert_with(|| {
-                    match texture::decode(files[img].bytes) {
+                if readable.get(&img) == Some(&false) {
+                    continue;
+                }
+                if decoded.as_ref().is_none_or(|(d, _)| *d != img) {
+                    decoded = None;
+                    match texture::decode(&files[img].content.whole()) {
                         Ok(image) => {
                             entries[img].role = Role::Texture;
-                            images.push(image);
-                            Some(images.len() - 1)
+                            decoded = Some((img, image));
                         }
                         Err(e) => {
                             entries[img].role = Role::Unreadable;
@@ -370,34 +457,54 @@ pub fn load(
                                     "{n} couldn't be read ({e}); its materials keep their color"
                                 )
                             });
-                            None
                         }
                     }
-                });
-                if let Some(image) = decoded {
-                    slot.1 = Some(MaterialTexture {
-                        image,
-                        map: t.clone(),
-                    });
+                    readable.insert(img, decoded.is_some());
                 }
+                let Some((_, image)) = &decoded else {
+                    continue;
+                };
+                let s = &mut samples[pi];
+                if s.is_empty() {
+                    s.resize(doc.faces.len(), None);
+                }
+                crate::convert::sample_texture(doc, mat, &Texture { image, map: t }, s);
+                slot.1 = Some(MaterialTexture {
+                    image: img,
+                    map: t.clone(),
+                });
             }
         }
         definitions.push(defs);
     }
 
+    drop(decoded);
+
     // ---- one document -------------------------------------------------------------------
     let several = parts.len() > 1;
+    let face_textures = if samples.iter().all(Vec::is_empty) {
+        Vec::new()
+    } else {
+        let parts_samples = samples
+            .into_iter()
+            .zip(&parts)
+            .map(|(s, (_, d))| {
+                if s.is_empty() {
+                    vec![None; d.faces.len()]
+                } else {
+                    s
+                }
+            })
+            .collect();
+        concat(parts_samples, |_, _| {})
+    };
     let (doc, renames) = merge(&names, parts, &definitions, several);
     let mut palette = mtl::Palette::new();
-    let mut textures = HashMap::new();
     for (pi, defs) in definitions.into_iter().enumerate() {
-        for (mat, (kd, tex)) in defs {
+        for (mat, (kd, _)) in defs {
             let name = renames.get(&(pi, mat.clone())).cloned().unwrap_or(mat);
             if let Some(kd) = kd {
                 palette.entry(name.clone()).or_insert(kd);
-            }
-            if let Some(t) = tex {
-                textures.entry(name).or_insert(t);
             }
         }
     }
@@ -407,13 +514,13 @@ pub fn load(
     // ---- identity -----------------------------------------------------------------------
     for (e, f) in entries.iter_mut().zip(&files) {
         if e.sha256.is_none() && e.role != Role::NotUsed {
-            e.sha256 = Some(sha256_hex(f.bytes));
+            e.sha256 = Some(f.content.sha256());
         }
     }
     let source_sha256 = source_sha256(&entries, &geometry);
     let (display, source_len) = if geometry.len() == 1 {
         let g = geometry[0];
-        (names[g].clone(), files[g].bytes.len() as u64)
+        (names[g].clone(), files[g].content.len() as u64)
     } else {
         let len = entries
             .iter()
@@ -441,8 +548,7 @@ pub fn load(
         modified,
         doc,
         palette: any_library.then_some(palette),
-        textures,
-        images,
+        face_textures,
         files: entries,
         stem: stem_of(&display).to_owned(),
         name: display,
@@ -469,16 +575,16 @@ fn merge(
 ) -> (ObjDocument, Renames) {
     let mut renames = Renames::new();
     if !several {
-        let doc = parts.into_iter().next().map(|(_, d)| d).unwrap_or_else(|| {
-            let mut d = ObjDocument {
+        let doc = parts
+            .into_iter()
+            .next()
+            .map(|(_, d)| d)
+            .unwrap_or_else(|| ObjDocument {
                 faces: obj::Elements::empty(),
                 lines: obj::Elements::empty(),
                 points: obj::Elements::empty(),
                 ..Default::default()
-            };
-            d.coord_offsets.push(0);
-            d
-        });
+            });
         return (doc, renames);
     }
 
@@ -530,14 +636,26 @@ fn merge(
         points: obj::Elements::empty(),
         ..Default::default()
     };
-    out.coord_offsets.push(0);
     let any_uvs = parts.iter().any(|(_, d)| !d.face_uvs.is_empty());
+    let any_weights = parts.iter().any(|(_, d)| !d.weights.is_empty());
     let mut names_index: [HashMap<String, u32>; 3] = Default::default();
     // Object and group names already used by an earlier file.
     let mut taken: [std::collections::HashSet<String>; 2] = Default::default();
     let mut header_taken = false;
     let mut attr_index: HashMap<ElementAttrs, u32> = HashMap::new();
-    for (pi, (fi, d)) in parts.into_iter().enumerate() {
+    // The large arrays of each file, joined once every file is in (see `coords::concat`):
+    // a point cloud's are moved rather than copied, so they never take twice their size.
+    let mut positions = Vec::new();
+    let mut coords = Vec::new();
+    let mut texcoords = Vec::new();
+    let mut weights = Vec::new();
+    let mut face_uvs = Vec::new();
+    let mut elements: [Joined; 3] = Default::default();
+    // Per file: where its vertices, texture coordinates and element indices start.
+    let mut bases: Vec<(u32, u32, [u32; 3])> = Vec::new();
+    let mut attr_maps: Vec<Vec<u32>> = Vec::new();
+    let (mut v0, mut t0, mut i0) = (0u32, 0u32, [0u32; 3]);
+    for (pi, (fi, mut d)) in parts.into_iter().enumerate() {
         let file = &names[fi];
         let stem = stem_of(file).to_owned();
         out.files.push(file.clone());
@@ -561,16 +679,6 @@ fn merge(
             own[which].insert(raw.to_owned(), n.clone());
             n
         };
-        let v0 = out.positions.len() as u32;
-        let t0 = out.texcoords.len() as u32;
-        // Coordinates and their text.
-        let text0 = out.coord_text.len() as u32;
-        out.coord_text.extend_from_slice(&d.coord_text);
-        out.coord_offsets
-            .extend(d.coord_offsets[1..].iter().map(|o| o + text0));
-        out.positions.extend_from_slice(&d.positions);
-        out.colors.extend_from_slice(&d.colors);
-        out.texcoords.extend_from_slice(&d.texcoords);
         // Names.
         let mut intern = |which: usize, n: &str, list: &mut Vec<String>| -> u32 {
             *names_index[which].entry(n.to_owned()).or_insert_with(|| {
@@ -606,36 +714,34 @@ fn merge(
                 })
             })
             .collect();
-        // Elements.
-        let add = |dst: &mut obj::Elements, src: &obj::Elements| {
-            for (k, el) in src.iter().enumerate() {
-                let shifted: Vec<u32> = el.iter().map(|&v| v + v0).collect();
-                dst.push_element(&shifted, attr_map[src.attr[k] as usize], src.line[k])
-                    .expect("sizes were checked when parsing");
-            }
-        };
-        if any_uvs {
-            if d.face_uvs.is_empty() {
-                out.face_uvs
-                    .resize(out.face_uvs.len() + d.faces.indices.len(), NO_UV);
+        bases.push((v0, t0, i0));
+        let (n, n_uv) = (d.positions.len(), d.texcoords.len());
+        // Coordinates, their text and colors.
+        positions.push(std::mem::take(&mut d.positions));
+        coords.push(std::mem::take(&mut d.coords));
+        out.colors.append(std::mem::take(&mut d.colors));
+        texcoords.push(std::mem::take(&mut d.texcoords));
+        if any_weights {
+            weights.push(if d.weights.is_empty() {
+                vec![1.0; n]
             } else {
-                out.face_uvs.extend(
-                    d.face_uvs
-                        .iter()
-                        .map(|&t| if t == NO_UV { NO_UV } else { t + t0 }),
-                );
-            }
+                std::mem::take(&mut d.weights)
+            });
         }
-        add(&mut out.faces, &d.faces);
-        add(&mut out.lines, &d.lines);
-        add(&mut out.points, &d.points);
-        if !d.weights.is_empty() || !out.weights.is_empty() {
-            out.weights.resize(v0 as usize, 1.0);
-            if d.weights.is_empty() {
-                out.weights.resize(v0 as usize + d.positions.len(), 1.0);
+        if any_uvs {
+            face_uvs.push(if d.face_uvs.is_empty() {
+                vec![NO_UV; d.faces.indices.len()]
             } else {
-                out.weights.extend_from_slice(&d.weights);
-            }
+                std::mem::take(&mut d.face_uvs)
+            });
+        }
+        // Elements.
+        for (k, el) in [&mut d.faces, &mut d.lines, &mut d.points]
+            .into_iter()
+            .enumerate()
+        {
+            i0[k] += el.indices.len() as u32;
+            elements[k].push(std::mem::take(el));
         }
         out.curves
             .extend(d.curves.iter().map(|c| obj::FreeformCurve {
@@ -668,8 +774,73 @@ fn merge(
                 message: format!("{file}: {}", x.message),
                 ..x
             }));
+        attr_maps.push(attr_map);
+        v0 += n as u32;
+        t0 += n_uv as u32;
+    }
+
+    out.positions = concat(positions, |_, _| {});
+    out.coords = Coords::concat(coords).expect("coordinate text within 4 GB");
+    out.texcoords = concat(texcoords, |_, _| {});
+    out.weights = concat(weights, |_, _| {});
+    out.face_uvs = concat(face_uvs, |p, t| {
+        if *t != NO_UV {
+            *t += bases[p].1;
+        }
+    });
+    for (k, (dst, parts)) in [&mut out.faces, &mut out.lines, &mut out.points]
+        .into_iter()
+        .zip(elements)
+        .enumerate()
+    {
+        *dst = parts.join(k, &bases, &attr_maps);
     }
     (out, renames)
+}
+
+/// One kind of element (faces, lines or points) of every file, to join.
+#[derive(Default)]
+struct Joined {
+    offsets: Vec<Vec<u32>>,
+    indices: Vec<Vec<u32>>,
+    attr: Vec<Vec<u32>>,
+    line: Vec<Vec<u64>>,
+}
+
+impl Joined {
+    fn push(&mut self, mut e: obj::Elements) {
+        // Each element's end, without the leading 0 (moved down in place).
+        e.offsets.remove(0);
+        self.offsets.push(e.offsets);
+        self.indices.push(e.indices);
+        self.attr.push(e.attr);
+        self.line.push(e.line);
+    }
+
+    /// The elements of kind `k` (0 faces, 1 lines, 2 points) of every file, in order,
+    /// pointing at the joined vertices and attributes.
+    fn join(
+        self,
+        k: usize,
+        bases: &[(u32, u32, [u32; 3])],
+        attr_maps: &[Vec<u32>],
+    ) -> obj::Elements {
+        let total: usize = self.indices.iter().map(Vec::len).sum();
+        u32::try_from(total).expect("more than 4 billion element references");
+        // Part 0 is the leading 0; file p is part p + 1.
+        let mut offsets = vec![vec![0u32]];
+        offsets.extend(self.offsets);
+        obj::Elements {
+            offsets: concat(offsets, |p, o| {
+                if p > 0 {
+                    *o += bases[p - 1].2[k];
+                }
+            }),
+            indices: concat(self.indices, |p, v| *v += bases[p].0),
+            attr: concat(self.attr, |p, a| *a = attr_maps[p][*a as usize]),
+            line: concat(self.line, |_, _| {}),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -679,7 +850,7 @@ mod tests {
     fn file<'a>(path: &str, bytes: &'a [u8]) -> InputFile<'a> {
         InputFile {
             path: path.into(),
-            bytes,
+            content: Content::Bytes(bytes),
             sha256: None,
             modified: None,
         }
@@ -767,7 +938,7 @@ mod tests {
         assert_eq!(b.doc.objects, ["part", "scan"]);
         assert_eq!(b.doc.faces.get(0), &[0, 1, 2]);
         assert_eq!(b.doc.points.get(0), &[3]);
-        assert!(b.doc.colors[3].is_some());
+        assert!(b.doc.colors.get(3).is_some());
     }
 
     #[test]

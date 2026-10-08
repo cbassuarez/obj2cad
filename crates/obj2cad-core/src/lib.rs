@@ -8,6 +8,7 @@
 pub mod bundle;
 pub mod color;
 pub mod convert;
+pub mod coords;
 pub mod diag;
 pub mod hash;
 pub mod hints;
@@ -18,6 +19,7 @@ pub mod partial;
 pub mod report;
 pub mod synth;
 pub mod texture;
+pub mod vertex_colors;
 pub mod xyz;
 
 pub use convert::{
