@@ -86,6 +86,55 @@ run 16.1 → 9.5 s; every output byte-identical.
   the page for over three seconds). Layer extents come from the engine, so three.js never
   scans vertex buffers, and colors arrive ready for display.
 
+### Memory: large scans in the browser
+
+WebAssembly has 4 GB. Reference: a Matterport export, a 1.7 GB `.xyz` (43 million colored
+points) with a textured model (466 textures of 2048²). It used to stop the engine while
+parsing (it needed about 5 GB for the cloud alone, and 5.6 GB more for the decoded
+textures); it now converts with a peak of 2.55 GB. Outputs are byte-identical to before
+(every fixture in every format, and a 2.5-million-point slice of this export).
+
+- **The file stays in the browser.** A file of 64 MB or more isn't copied into the engine;
+  it is read from the browser's copy in 4 MB pieces as it is parsed (`bundle::Content`),
+  so a cloud's text is never in engine memory.
+- **Coordinate text, one byte each.** A plain decimal is kept as its number of decimals and
+  rebuilt from its value when written (checked exact when stored); other text is kept as
+  written (`coords.rs`). 1.7 GB of text and offsets became 130 MB.
+- **Colors as bytes** (`vertex_colors.rs`): a cloud's colors are 3 bytes a point, not an
+  optional float triple (16), and vertices without a color take nothing.
+- **No doubling.** The reader sizes its arrays once from the first 4 MB; a bundle's files are
+  joined by moving the largest one's arrays, not copying them; the point list and the
+  preview are sized up front (the preview to the points it shows).
+- **Textures sampled once, one at a time,** while loading: each face's color from its
+  texture is kept and the image dropped (`Bundle::face_textures`).
+- **The parity hash sorts points in batches** of 8 million (splitters from a sample), the
+  same bytes as one sort.
+- When memory still runs out, the app says the drawing is too large for the browser (the
+  allocator notes the failed request) instead of a generic error.
+
+### DWG of a large scan
+
+acadrust (the DWG writer) builds the whole drawing as objects, then the whole objects
+section, then the file: for the reference scan that is tens of gigabytes, natively too.
+obj2cad's fork (`vendor/acadrust/OBJ2CAD.md`) streams the points of a drawing with more
+than a million: each is filled into one reusable POINT and encoded by acadrust's own code,
+the AcDbObjects section is compressed and written a page at a time, model space's
+BLOCK_HEADER (which lists every point) is written last with its list spliced in as it goes
+out, and the handle map keeps one byte per point. The file goes out as it is made but for
+its first 256 bytes, written last (the browser puts them back in front).
+
+| Reference scan, DWG | Time | Peak memory | File |
+|---|---|---|---|
+| CLI (native) | 137 s | 3.3 GB | 1.05 GB |
+| Web engine (WebAssembly) | 134 s from adding the files | 2.7 GB | the same size |
+
+Drawings below the threshold are written exactly as before (byte-identical on every
+fixture). The streamed layout is read back exactly by acadrust's reader (70,000 points in
+the unit tests; a 2.5-million-point slice of the reference through the parity harness).
+The reference's objects section is 2.17 GB: past 2 GB, its handle map's offsets are wider
+than 32 bits, which acadrust reads; that a file this large opens in AutoCAD is still to be
+confirmed.
+
 ## Next levers, if needed
 
 - M2 is at its budget. About 0.63 s is engine work (write, parity, output digest); the rest

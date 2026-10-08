@@ -2,11 +2,15 @@
 //!
 //! DWG stores coordinates as raw IEEE-754 doubles, so every coordinate is exact by
 //! construction. The one trap is negative zero: acadrust 0.5.5 folds `-0.0` into the
-//! short code for `+0.0`, which `tools/vendor/fetch_acadrust.py` patches. The tests
-//! read every file back and compare every coordinate's bits.
+//! short code for `+0.0`, which obj2cad's fork fixes (`vendor/acadrust/OBJ2CAD.md`).
+//! The tests read every file back and compare every coordinate's bits.
 //!
 //! The drawing mirrors the DXF writer: the same layers and colors, the same entities
 //! (MESH, 3D POLYLINE, POINT), units, dates, custom properties and opening view.
+//!
+//! A drawing with many points (a scan) streams them: they are encoded one at a time as
+//! the file is written, never held as acadrust entities, and the file goes out as it is
+//! made (see obj2cad's fork of acadrust, `DwgWriter::write_streaming`).
 
 use acadrust::entities::solid3d::AcisData;
 use acadrust::entities::surface::SurfaceKind;
@@ -14,9 +18,12 @@ use acadrust::entities::{
     Mesh, MeshFace, Point, Polyline3D, Solid3D, Spline, Surface, Vertex3DPolyline,
 };
 use acadrust::tables::TableEntry;
-use acadrust::{CadDocument, Color, DwgWriter, DxfVersion, EntityType, Layer, Vector2, Vector3};
+use acadrust::{
+    CadDocument, Color, DwgWriter, DxfVersion, EntityType, Layer, PointStream, Vector2, Vector3,
+};
 use obj2cad_core::convert::CadModel;
 use obj2cad_core::output::{fitted_view, Meta, VIEW_DIRECTION};
+use std::io::{Seek, Write};
 
 /// The acadrust in use (patched), for tools that read DWG back.
 pub use acadrust;
@@ -52,8 +59,17 @@ fn color(c: Option<[u8; 3]>) -> Color {
     c.map_or(Color::ByLayer, rgb)
 }
 
+/// Drawings with more points than this stream them (see the module docs). Below it the
+/// file is laid out as acadrust always has, the layout checked in AutoCAD.
+pub const STREAM_POINTS: usize = 1 << 20;
+
 /// Build the drawing as an acadrust document.
 pub fn document(model: &CadModel, meta: &Meta) -> Result<CadDocument, Error> {
+    document_with(model, meta, true)
+}
+
+/// [`document`], with or without the points (streamed instead, see [`write_to`]).
+fn document_with(model: &CadModel, meta: &Meta, points: bool) -> Result<CadDocument, Error> {
     let mut doc = CadDocument::with_version(DxfVersion::AC1032);
 
     let h = &mut doc.header;
@@ -130,7 +146,7 @@ pub fn document(model: &CadModel, meta: &Meta) -> Result<CadDocument, Error> {
         spline.weights = c.weights.clone().unwrap_or_default();
         doc.add_entity(EntityType::Spline(spline)).map_err(fail)?;
     }
-    for p in &model.points {
+    for p in model.points.iter().filter(|_| points) {
         let mut point = Point::new();
         point.common.layer = model.layers[p.layer as usize].name.clone();
         point.common.color = color(p.color);
@@ -164,7 +180,140 @@ pub fn document(model: &CadModel, meta: &Meta) -> Result<CadDocument, Error> {
 
 /// Write `model` as DWG R2018.
 pub fn write(model: &CadModel, meta: &Meta) -> Result<Vec<u8>, Error> {
-    DwgWriter::write_to_vec(&document(model, meta)?).map_err(fail)
+    let mut out = std::io::Cursor::new(Vec::new());
+    write_to(model, meta, &mut out)?;
+    Ok(out.into_inner())
+}
+
+/// Write `model` as DWG R2018 to `out`, in order but for its first 256 bytes, which are
+/// written again at the end (a seek to the start and back to the end; see [`HeldHead`]
+/// for outputs that can't seek).
+pub fn write_to<W: Write + Seek>(model: &CadModel, meta: &Meta, out: W) -> Result<(), Error> {
+    write_streaming_over(model, meta, out, STREAM_POINTS)
+}
+
+/// [`write_to`], streaming the points when there are more than `over`.
+fn write_streaming_over<W: Write + Seek>(
+    model: &CadModel,
+    meta: &Meta,
+    out: W,
+    over: usize,
+) -> Result<(), Error> {
+    if model.points.len() <= over {
+        return DwgWriter::write_to_writer(out, &document(model, meta)?).map_err(fail);
+    }
+    let doc = document_with(model, meta, false)?;
+    DwgWriter::write_streaming(out, &doc, &ModelPoints::new(model)).map_err(fail)
+}
+
+/// A model's points, given to the DWG writer one at a time.
+struct ModelPoints<'a> {
+    model: &'a CadModel<'a>,
+    bounds: Option<(Vector3, Vector3)>,
+}
+
+impl<'a> ModelPoints<'a> {
+    fn new(model: &'a CadModel<'a>) -> Self {
+        let bounds = model
+            .points
+            .iter()
+            .map(|p| model.position(p.vertex))
+            .fold(None, |b: Option<([f64; 3], [f64; 3])>, p| {
+                Some(match b {
+                    None => (p, p),
+                    Some((lo, hi)) => (
+                        [0, 1, 2].map(|a| lo[a].min(p[a])),
+                        [0, 1, 2].map(|a| hi[a].max(p[a])),
+                    ),
+                })
+            })
+            .map(|(lo, hi)| (v3(lo), v3(hi)));
+        Self { model, bounds }
+    }
+}
+
+impl PointStream for ModelPoints<'_> {
+    fn len(&self) -> usize {
+        self.model.points.len()
+    }
+
+    fn point(&self, i: usize, point: &mut Point) {
+        let p = &self.model.points[i];
+        let layer = &self.model.layers[p.layer as usize].name;
+        if point.common.layer != *layer {
+            point.common.layer = layer.clone();
+        }
+        point.common.color = color(p.color);
+        point.location = v3(self.model.position(p.vertex));
+    }
+
+    fn bounds(&self) -> Option<(Vector3, Vector3)> {
+        self.bounds
+    }
+}
+
+/// An output that can't seek, for [`write_to`]: everything goes to `out` in order, but
+/// the file's first 256 bytes, written last, go to `head` (the caller puts them first).
+pub struct HeldHead<F: FnMut(&[u8]) -> std::io::Result<()>> {
+    out: F,
+    /// The first 256 bytes, as written so far.
+    pub head: [u8; HEAD],
+    at: u64,
+    len: u64,
+}
+
+/// The bytes of a DWG written last, at the start of the file.
+pub const HEAD: usize = 0x100;
+
+impl<F: FnMut(&[u8]) -> std::io::Result<()>> HeldHead<F> {
+    pub fn new(out: F) -> Self {
+        Self {
+            out,
+            head: [0; HEAD],
+            at: 0,
+            len: 0,
+        }
+    }
+}
+
+impl<F: FnMut(&[u8]) -> std::io::Result<()>> Write for HeldHead<F> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut buf = buf;
+        let n = buf.len();
+        // The start of the file: kept.
+        if self.at < HEAD as u64 {
+            let k = (HEAD - self.at as usize).min(buf.len());
+            self.head[self.at as usize..self.at as usize + k].copy_from_slice(&buf[..k]);
+            self.at += k as u64;
+            buf = &buf[k..];
+        }
+        if !buf.is_empty() {
+            if self.at != self.len {
+                return Err(std::io::Error::other(
+                    "a DWG may only rewrite its first 256 bytes",
+                ));
+            }
+            (self.out)(buf)?;
+            self.at += buf.len() as u64;
+        }
+        self.len = self.len.max(self.at);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<F: FnMut(&[u8]) -> std::io::Result<()>> Seek for HeldHead<F> {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.at = match pos {
+            std::io::SeekFrom::Start(p) => p,
+            std::io::SeekFrom::End(d) => self.len.saturating_add_signed(d),
+            std::io::SeekFrom::Current(d) => self.at.saturating_add_signed(d),
+        };
+        Ok(self.at)
+    }
 }
 
 #[cfg(test)]
@@ -193,6 +342,29 @@ mod tests {
         created_unix: Some(1_700_000_000.0),
     };
 
+    /// Write `model` the way every test checks: streamed when `stream` (whatever its size),
+    /// through [`HeldHead`] (a sink that can't seek), and checked to be the same bytes as
+    /// writing to memory.
+    fn written(model: &CadModel, stream: bool) -> Vec<u8> {
+        let over = if stream { 0 } else { usize::MAX };
+        let mut direct = std::io::Cursor::new(Vec::new());
+        write_streaming_over(model, &META, &mut direct, over).unwrap();
+        let mut body = Vec::new();
+        let mut held = HeldHead::new(|b: &[u8]| {
+            body.extend_from_slice(b);
+            Ok(())
+        });
+        write_streaming_over(model, &META, &mut held, over).unwrap();
+        let head = held.head;
+        let streamed: Vec<u8> = head.iter().copied().chain(body).collect();
+        let direct = direct.into_inner();
+        assert!(
+            streamed == direct,
+            "held head differs from writing to memory"
+        );
+        direct
+    }
+
     fn read(bytes: &[u8]) -> CadDocument {
         DwgReader::from_stream(std::io::Cursor::new(bytes.to_vec()))
             .read()
@@ -203,8 +375,14 @@ mod tests {
         [v.x.to_bits(), v.y.to_bits(), v.z.to_bits()]
     }
 
-    /// Every coordinate, face, line, point, layer and color comes back exactly.
+    /// Every coordinate, face, line, point, layer and color comes back exactly, whether
+    /// the points are streamed or not.
     fn assert_round_trip(src: &str, up: UpAxis) {
+        assert_round_trip_as(src, up, false);
+        assert_round_trip_as(src, up, true);
+    }
+
+    fn assert_round_trip_as(src: &str, up: UpAxis, stream: bool) {
         let doc = parse(src.as_bytes()).unwrap();
         let model = convert(
             &doc,
@@ -214,7 +392,7 @@ mod tests {
                 ..Options::default()
             },
         );
-        let back = read(&write(&model, &META).unwrap());
+        let back = read(&written(&model, stream));
 
         let meshes: Vec<&Mesh> = back
             .entities()
@@ -291,7 +469,24 @@ mod tests {
                 bits(&got.location),
                 model.position(p.vertex).map(f64::to_bits)
             );
+            assert_eq!(got.common.layer, model.layers[p.layer as usize].name);
+            assert_eq!(got.common.color, color(p.color));
         }
+        // Model space owns every entity, and every handle is distinct.
+        let mut handles: Vec<u64> = back.entities().map(|e| e.common().handle.value()).collect();
+        let n = handles.len();
+        handles.sort_unstable();
+        handles.dedup();
+        assert_eq!(handles.len(), n, "duplicate handles");
+        let ms = back.block_records.get("*Model_Space").expect("model space");
+        assert_eq!(
+            ms.entity_handles.len(),
+            model.meshes.len()
+                + model.polylines.len()
+                + model.points.len()
+                + model.splines.len()
+                + model.surfaces.len()
+        );
 
         for layer in model.layers.iter().skip(1) {
             let got = back
@@ -323,6 +518,73 @@ mod tests {
     #[test]
     fn point_clouds() {
         assert_round_trip("v 1 2 3\nv -0.0 5 6\nv 7 8 -9.5\n", UpAxis::AsIs);
+    }
+
+    /// A cloud spread over many pages of the objects section and many handle map chunks,
+    /// with colors and two layers, streamed: every point comes back exactly.
+    #[test]
+    fn streamed_clouds_read_back_exactly() {
+        let mut src = String::from("o scan\n");
+        for i in 0..70_000u32 {
+            let h = i.wrapping_mul(2_654_435_761);
+            src.push_str(&format!(
+                "v {}.{:03} -{}.5 {} {} {} {}\n",
+                h % 1000,
+                i % 1000,
+                h % 77,
+                if i % 3 == 0 {
+                    "-0.0".into()
+                } else {
+                    format!("{}e-3", h % 9)
+                },
+                f64::from(h % 256) / 255.0,
+                f64::from((h >> 8) % 256) / 255.0,
+                f64::from((h >> 16) % 256) / 255.0,
+            ));
+            if i == 35_000 {
+                src.push_str("o rest\n");
+            }
+        }
+        src.push_str("o part\nv 0 0 0\nv 1 0 0\nv 0 1 0\nf 70001 70002 70003\n");
+        let doc = parse(src.as_bytes()).unwrap();
+        let model = convert(
+            &doc,
+            None,
+            Options {
+                keep_loose_points: true,
+                ..Options::default()
+            },
+        );
+        assert!(model.points.len() >= 70_000);
+        assert_round_trip_as(&src, UpAxis::AsIs, true);
+        assert_round_trip_as(&src, UpAxis::YUpToZUp, true);
+        // Handles pass 0xFFFF, so model space's references to them grow a byte.
+        let back = read(&written(&model, true));
+        assert_eq!(
+            back.entities().count(),
+            model.points.len() + model.meshes.len()
+        );
+    }
+
+    /// The handle map of a streamed cloud reaches past 2 GB of objects: those offsets
+    /// read back exactly (acadrust's own reader decodes them as 64-bit).
+    #[test]
+    fn handle_offsets_past_two_gigabytes_round_trip() {
+        use acadrust::io::dwg::dwg_stream_readers::handle_reader::read_handles;
+        use acadrust::io::dwg::dwg_stream_writers::handle_writer::write_sorted_handles;
+        let entries: Vec<(u64, i64)> = (0..5000u64)
+            .map(|i| {
+                (
+                    0x20 + i,
+                    i as i64 * 1_000_003 + if i > 2500 { 3_000_000_000 } else { 0 },
+                )
+            })
+            .collect();
+        let back = read_handles(&write_sorted_handles(entries.iter().copied(), 0)).unwrap();
+        assert_eq!(back.len(), entries.len());
+        for (h, o) in entries {
+            assert_eq!(back[&h], o, "handle {h:#x}");
+        }
     }
 
     #[test]

@@ -55,7 +55,7 @@ export function explain(f: Failure | { kind: "empty" }): Explained {
         case "ambiguous_columns":
           return { ...withLines, title: `${at} has columns that could mean two things`, action: "Export the point cloud as x y z, or x y z r g b." };
         case "too_large":
-          return { ...withLines, title: "Too large for the browser version", action: "Use the command-line version.", cli: true };
+          return { ...withLines, title: "Too large for the browser version", action: "obj2cad on your computer can convert it, with the same settings.", cli: true };
         default:
           return { ...withLines, title: `${at} can't be read`, action: EXPORT_AGAIN };
       }
@@ -64,6 +64,8 @@ export function explain(f: Failure | { kind: "empty" }): Explained {
       return { ...base, title: "The file couldn't be read", action: "Check that it isn't open in another app, then try again.", lines: [f.message] };
     case "engine":
       return { ...base, title: "obj2cad can't start in this browser", action: "Reload the page, or try a current Chrome, Edge, Firefox or Safari.", lines: [f.message], report: true };
+    case "memory":
+      return { ...base, title: "Too large for the browser version", action: "A browser tab can't hold this drawing. obj2cad on your computer can, with the same settings.", lines: [f.message], cli: true };
     case "crash":
       return { ...base, title: "obj2cad stopped on this file", action: "Try again. If it happens again, report it.", lines: [f.message], report: true };
     default:

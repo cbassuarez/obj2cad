@@ -7,6 +7,8 @@ use obj2cad_dxf::Format;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+mod handoff;
+
 const USAGE: &str = "usage:
   obj2cad convert <inputs...> [options]
       inputs: .obj, .xyz, .mtl, .jpg/.png files, folders or .zip files; together they
@@ -29,6 +31,8 @@ const USAGE: &str = "usage:
   obj2cad bench [--synthetic N] [--runs R] [--json] [files.obj...]
   obj2cad synth <n> <out.obj>    write an n×n synthetic terrain (for tests)
   obj2cad acis-samples <dir>     ACIS test bodies as DXF, binary DXF and DWG (AutoCAD acceptance)
+  obj2cad setup [--remove]       let the web app's \"Open in obj2cad\" open files here
+  obj2cad open-url <link>        convert the file an obj2cad:// link names (run by setup's link)
   obj2cad --version";
 
 fn main() -> ExitCode {
@@ -111,6 +115,48 @@ fn run(args: Vec<String>) -> Result<(), String> {
             println!("obj2cad {}", obj2cad_core::VERSION);
             Ok(())
         }
+        Some("setup") => match it.next().as_deref() {
+            None => handoff::setup(false),
+            Some("--remove") => handoff::setup(true),
+            Some(_) => Err(USAGE.into()),
+        },
+        // Opened by the operating system in a window of its own: kept open to be read.
+        Some("open-url") => {
+            let url = it.next().ok_or(USAGE)?;
+            let result = handoff::open_url(&url, convert_cmd);
+            if let Err(e) = &result {
+                eprintln!("obj2cad: {e}");
+            }
+            handoff::pause();
+            result.map_err(|_| "stopped".into())
+        }
+        // Opened by double-clicking the download: offer to set it up.
+        None if std::io::IsTerminal::is_terminal(&std::io::stdin()) => {
+            println!(
+                "obj2cad {}: OBJ and point clouds to DWG and DXF.
+",
+                obj2cad_core::VERSION
+            );
+            print!("Set it up so the web app's \"Open in obj2cad\" opens files here? [Y/n] ");
+            std::io::Write::flush(&mut std::io::stdout()).ok();
+            let mut answer = String::new();
+            std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut answer).ok();
+            let result = match answer.trim().to_ascii_lowercase().as_str() {
+                "" | "y" | "yes" => handoff::setup(false),
+                _ => {
+                    println!(
+                        "
+{USAGE}"
+                    );
+                    Ok(())
+                }
+            };
+            if let Err(e) = &result {
+                eprintln!("obj2cad: {e}");
+            }
+            handoff::pause();
+            result
+        }
         _ => Err(USAGE.into()),
     }
 }
@@ -120,6 +166,11 @@ struct Gathered {
     path: String,
     bytes: Vec<u8>,
     modified: Option<f64>,
+}
+
+/// The length and SHA-256 of a written file.
+fn sha256_file(path: &Path) -> std::io::Result<(u64, String)> {
+    obj2cad_core::hash::sha256_read(std::fs::File::open(path)?)
 }
 
 fn modified(meta: &std::fs::Metadata) -> Option<f64> {
@@ -305,7 +356,7 @@ fn load_inputs(
         .iter()
         .map(|g| obj2cad_core::bundle::InputFile {
             path: g.path.clone(),
-            bytes: &g.bytes,
+            content: obj2cad_core::bundle::Content::Bytes(&g.bytes),
             sha256: None,
             modified: g.modified,
         })
@@ -394,23 +445,10 @@ fn convert_cmd(args: Vec<String>) -> Result<(), String> {
         }
     });
     let doc = &bundle.doc;
-    let images_by_material: std::collections::HashMap<&str, obj2cad_core::texture::Texture> =
-        bundle
-            .textures
-            .iter()
-            .map(|(m, t)| {
-                (
-                    m.as_str(),
-                    obj2cad_core::texture::Texture {
-                        image: &bundle.images[t.image],
-                        map: &t.map,
-                    },
-                )
-            })
-            .collect();
     let materials = obj2cad_core::Materials {
         palette: bundle.palette.as_ref(),
-        textures: images_by_material,
+        sampled: (!bundle.face_textures.is_empty()).then_some(&bundle.face_textures[..]),
+        ..Default::default()
     };
 
     let h = hints::hints(doc);
@@ -457,11 +495,21 @@ fn convert_cmd(args: Vec<String>) -> Result<(), String> {
         fingerprint_seed: &source_sha,
         created_unix,
     };
-    let bytes = match format {
-        OutFormat::Dxf(f) => obj2cad_dxf::write(&model, &meta, f),
-        OutFormat::Dwg => obj2cad_dwg::write(&model, &meta).map_err(|e| e.to_string())?,
-    };
-    std::fs::write(&output, &bytes).map_err(|e| format!("{}: {e}", output.display()))?;
+    // Straight to the file: a scan's drawing can be several gigabytes.
+    let io_err = |e: std::io::Error| format!("{}: {e}", output.display());
+    let mut out =
+        std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(&output).map_err(io_err)?);
+    match format {
+        OutFormat::Dxf(f) => obj2cad_dxf::write_to(&model, &meta, f, &mut out)
+            .map(|_| ())
+            .map_err(io_err)?,
+        OutFormat::Dwg => {
+            obj2cad_dwg::write_to(&model, &meta, &mut out).map_err(|e| e.to_string())?
+        }
+    }
+    std::io::Write::flush(&mut out).map_err(io_err)?;
+    drop(out);
+    let (written, written_sha) = sha256_file(&output).map_err(io_err)?;
 
     let rep = report::build(
         &model,
@@ -474,8 +522,8 @@ fn convert_cmd(args: Vec<String>) -> Result<(), String> {
         &parity,
         report::Written {
             format: format.id(),
-            bytes: bytes.len() as u64,
-            sha256: Some(obj2cad_core::hash::sha256_hex(&bytes)),
+            bytes: written,
+            sha256: Some(written_sha),
         },
     );
     let report_path = report_path.unwrap_or_else(|| output.with_extension("report.json"));

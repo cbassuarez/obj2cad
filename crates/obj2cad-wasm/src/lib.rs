@@ -8,17 +8,18 @@
 mod preview;
 mod stream;
 
-use obj2cad_core::bundle::{self, Bundle, InputFile};
+use obj2cad_core::bundle::{self, Bundle, Content, InputFile, Pieces};
 use obj2cad_core::hints::{self, Choices, Hints, UnitsSource};
-use obj2cad_core::texture::Texture;
 use obj2cad_core::{
     convert_with, hash, report, CadModel, LayerMode, Materials, Meta, Options, ParseError, Units,
     UpAxis,
 };
 use preview::Preview;
 use serde::Deserialize;
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::RefCell;
 use std::io::Write;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use stream::Stream;
 use wasm_bindgen::prelude::*;
 
@@ -37,6 +38,48 @@ pub fn has_dwg() -> bool {
 
 thread_local! {
     static PANIC_REPORTER: RefCell<Option<js_sys::Function>> = const { RefCell::new(None) };
+}
+
+/// The system allocator, noting the size of a request it couldn't meet. Running out of
+/// memory aborts without a panic (the hook never runs), so this is how the web app tells
+/// a file too large for WebAssembly's 4 GB from a crash.
+struct NoteFailures;
+
+static FAILED_ALLOC: AtomicUsize = AtomicUsize::new(0);
+
+impl NoteFailures {
+    fn note(p: *mut u8, size: usize) -> *mut u8 {
+        if p.is_null() {
+            FAILED_ALLOC.store(size.max(1), Ordering::Relaxed);
+        }
+        p
+    }
+}
+
+// SAFETY: every call goes to `System` unchanged; only a null result is noted.
+unsafe impl GlobalAlloc for NoteFailures {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        Self::note(System.alloc(layout), layout.size())
+    }
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        Self::note(System.alloc_zeroed(layout), layout.size())
+    }
+    unsafe fn realloc(&self, p: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+        Self::note(System.realloc(p, layout, size), size)
+    }
+    unsafe fn dealloc(&self, p: *mut u8, layout: Layout) {
+        System.dealloc(p, layout)
+    }
+}
+
+#[global_allocator]
+static ALLOC: NoteFailures = NoteFailures;
+
+/// The size in bytes of the last allocation that failed, or 0. Read after the engine
+/// stops: nothing in it recovers from a failed allocation, so one is why it stopped.
+#[wasm_bindgen]
+pub fn failed_allocation() -> f64 {
+    FAILED_ALLOC.load(Ordering::Relaxed) as f64
 }
 
 /// `f(message)` is called if the engine panics. The instance is unusable afterwards; the
@@ -118,12 +161,37 @@ fn settings_from(json: &str) -> Result<Settings, JsError> {
 
 // ---------------------------------------------------------------- session
 
+/// Files at least this large stay in the browser's memory and are read from there in
+/// pieces: WebAssembly has 4 GB, and a large point cloud's text alone can take half of it.
+const LARGE: u32 = 64 << 20;
+
+/// A file added to a session: copied in, or (large) left where the browser holds it.
+enum Held {
+    Bytes(Vec<u8>),
+    Browser(BrowserBytes),
+}
+
+/// A file in the browser's memory, read in pieces (see [`LARGE`]).
+struct BrowserBytes(js_sys::Uint8Array);
+
+impl Pieces for BrowserBytes {
+    fn len(&self) -> usize {
+        self.0.length() as usize
+    }
+
+    fn read(&self, at: usize, buf: &mut [u8]) {
+        self.0
+            .subarray(at as u32, (at + buf.len()) as u32)
+            .copy_to(buf);
+    }
+}
+
 /// One loaded bundle (a model, or models, clouds, materials and textures): parsed once,
 /// converted as often as settings change.
 #[wasm_bindgen]
 pub struct Session {
     /// Files added but not loaded yet.
-    pending: Vec<(String, Vec<u8>, String, Option<f64>)>,
+    pending: Vec<(String, Held, String, Option<f64>)>,
     bundle: Option<Bundle>,
     parse_ms: f64,
     hints: Option<Hints>,
@@ -157,10 +225,22 @@ impl Session {
 
     /// Add a file (`path` may include folders; `sha256` from the browser's native digest,
     /// or empty to give it after loading with `set_hashes`; `modified` in Unix seconds,
-    /// or a negative number when unknown).
-    pub fn add_file(&mut self, path: String, bytes: Vec<u8>, sha256: String, modified: f64) {
+    /// or a negative number when unknown). A large file is not copied: it is read from
+    /// `bytes` while loading, so `bytes` must stay as it is until `load` returns.
+    pub fn add_file(
+        &mut self,
+        path: String,
+        bytes: js_sys::Uint8Array,
+        sha256: String,
+        modified: f64,
+    ) {
         let modified = (modified >= 0.0).then_some(modified);
-        self.pending.push((path, bytes, sha256, modified));
+        let held = if bytes.length() >= LARGE {
+            Held::Browser(BrowserBytes(bytes))
+        } else {
+            Held::Bytes(bytes.to_vec())
+        };
+        self.pending.push((path, held, sha256, modified));
     }
 
     /// Read everything added into one drawing. `name` names it when it holds several
@@ -181,9 +261,12 @@ impl Session {
         let pending = std::mem::take(&mut self.pending);
         let files = pending
             .iter()
-            .map(|(path, bytes, sha, modified)| InputFile {
+            .map(|(path, held, sha, modified)| InputFile {
                 path: path.clone(),
-                bytes,
+                content: match held {
+                    Held::Bytes(b) => Content::Bytes(b),
+                    Held::Browser(b) => Content::Pieces(b),
+                },
                 sha256: Some(sha.clone()),
                 modified: *modified,
             })
@@ -273,22 +356,10 @@ impl Session {
 
     fn model(&self, s: &Settings) -> Result<CadModel<'_>, JsError> {
         let (b, _) = self.loaded()?;
-        let textures = b
-            .textures
-            .iter()
-            .map(|(m, t)| {
-                (
-                    m.as_str(),
-                    Texture {
-                        image: &b.images[t.image],
-                        map: &t.map,
-                    },
-                )
-            })
-            .collect();
         let materials = Materials {
             palette: b.palette.as_ref(),
-            textures,
+            sampled: (!b.face_textures.is_empty()).then_some(&b.face_textures[..]),
+            ..Default::default()
         };
         Ok(convert_with(&b.doc, &materials, self.options(s)?))
     }
@@ -325,6 +396,7 @@ impl Session {
             decisions: decisions(&s, &model, h),
             timings,
             preview: Some(preview),
+            head: Vec::new(),
         })
     }
 
@@ -402,6 +474,7 @@ impl Session {
                 decisions: decisions.clone(),
                 timings: "{}".into(),
                 preview: preview.take(),
+                head: Vec::new(),
             };
             let _ = f.call1(&JsValue::NULL, &JsValue::from(first));
         }
@@ -444,6 +517,8 @@ impl Session {
             f: sink,
             written: 0,
         };
+        #[cfg_attr(not(feature = "dwg"), allow(unused_mut))]
+        let mut head = Vec::new();
         let mut report_written = |done: u64, total: u64| {
             if let Some(f) = &progress {
                 let _ = f.call2(
@@ -468,15 +543,17 @@ impl Session {
                 &mut out,
                 &mut report_written,
             ),
+            // The file goes out as it is made, but for its first 256 bytes, written last:
+            // a placeholder goes first, and the conversion carries them (`take_head`).
             #[cfg(feature = "dwg")]
-            Format::Dwg => {
-                let bytes =
-                    obj2cad_dwg::write(&model, &meta).map_err(|e| JsError::new(&e.to_string()))?;
-                bytes
-                    .chunks(1 << 20)
-                    .try_for_each(|c| out.write_all(c))
-                    .map(|()| bytes.len() as u64)
-            }
+            Format::Dwg => (|| {
+                out.write_all(&[0; obj2cad_dwg::HEAD])?;
+                let mut sink = obj2cad_dwg::HeldHead::new(|b: &[u8]| out.write_all(b));
+                obj2cad_dwg::write_to(&model, &meta, &mut sink)
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+                head = sink.head.to_vec();
+                Ok(0)
+            })(),
             #[cfg(not(feature = "dwg"))]
             Format::Dwg => {
                 return Err(JsError::new(
@@ -510,6 +587,7 @@ impl Session {
             decisions,
             timings,
             preview,
+            head,
         })
     }
 }
@@ -566,6 +644,8 @@ pub struct Conversion {
     decisions: String,
     timings: String,
     preview: Option<Preview>,
+    /// A DWG's first 256 bytes, written last (its first piece was a placeholder).
+    head: Vec<u8>,
 }
 
 macro_rules! take {
@@ -621,6 +701,11 @@ impl Conversion {
     /// Per-stage milliseconds, as JSON.
     pub fn timings(&self) -> String {
         self.timings.clone()
+    }
+    /// For a DWG: the file's first 256 bytes, in place of its first piece (a placeholder:
+    /// they are written last). Empty for a DXF.
+    pub fn take_head(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.head)
     }
     pub fn has_preview(&self) -> bool {
         self.preview.is_some()

@@ -1,19 +1,28 @@
 import { CircleAlert, ExternalLink } from "lucide-react";
 import { motion } from "motion/react";
 import { Button } from "@/components/ui/button";
-import { CLI_URL, problemUrl, type Explained } from "@/lib/errors";
+import { CliHandoff } from "@/components/CliHandoff";
+import { problemUrl, type Explained } from "@/lib/errors";
+import type { Job } from "@/lib/files";
+import type { Prefs } from "@/lib/settings";
 
 export function FailedScreen({
   name,
   explained,
+  job,
+  prefs,
   onPick,
   onRetry,
 }: {
   name: string;
   explained: Explained;
+  /** The drawing that failed, for "Open in obj2cad" when the command line is the way on. */
+  job?: Job;
+  prefs: Prefs;
   onPick: () => void;
   onRetry?: () => void;
 }) {
+  const handoff = explained.cli && job;
   const e = explained;
   return (
     <main className="paper flex h-dvh items-center justify-center overflow-hidden px-4 pt-[76px] pb-4">
@@ -32,30 +41,31 @@ export function FailedScreen({
             {e.more && "\n…"}
           </pre>
         )}
-        <div className="flex flex-wrap items-center gap-3">
-          {onRetry && (
-            <Button variant="primary" onClick={onRetry}>
-              Try again
+        {handoff ? (
+          <CliHandoff job={job} prefs={prefs}>
+            <Button variant="secondary" onClick={onPick}>
+              Choose a file…
             </Button>
-          )}
-          <Button variant={onRetry ? "secondary" : "primary"} onClick={onPick}>
-            Choose a file…
-          </Button>
-          {e.cli && (
-            <Button variant="link" asChild>
-              <a href={CLI_URL} target="_blank" rel="noreferrer">
-                Command-line version <ExternalLink />
-              </a>
+          </CliHandoff>
+        ) : (
+          <div className="flex flex-wrap items-center gap-3">
+            {onRetry && (
+              <Button variant="primary" onClick={onRetry}>
+                Try again
+              </Button>
+            )}
+            <Button variant={onRetry ? "secondary" : "primary"} onClick={onPick}>
+              Choose a file…
             </Button>
-          )}
-          {e.report && (
-            <Button variant="link" asChild>
-              <a href={problemUrl(e.title, e.lines.join("\n"))} target="_blank" rel="noreferrer">
-                Report a problem <ExternalLink />
-              </a>
-            </Button>
-          )}
-        </div>
+            {e.report && (
+              <Button variant="link" asChild>
+                <a href={problemUrl(e.title, e.lines.join("\n"))} target="_blank" rel="noreferrer">
+                  Report a problem <ExternalLink />
+                </a>
+              </Button>
+            )}
+          </div>
+        )}
       </motion.div>
     </main>
   );
