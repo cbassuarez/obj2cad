@@ -66,7 +66,6 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-      - run: python tools/vendor/fetch_acadrust.py
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
@@ -75,6 +74,10 @@ jobs:
         if: matrix.target == 'x86_64-apple-darwin'
         run: /usr/bin/pgrep -q oahd || sudo softwareupdate --install-rosetta --agree-to-license
       - name: Verify (parity harness)
+        # bash on every OS: in Windows' default PowerShell, "$BIN" is an unset PowerShell
+        # variable, the harness got `--bin ""` and every file failed (0.6.0 shipped no
+        # Windows build).
+        shell: bash
         env:
           BIN: target/${{ matrix.target }}/release/obj2cad
         run: |
@@ -123,7 +126,6 @@ jobs:
 
       - name: Verify (tests + parity harness)
         run: |
-          python tools/vendor/fetch_acadrust.py
           cargo test --workspace
           cargo build --release -p obj2cad-cli
           pip install -r tests/harness/requirements.txt

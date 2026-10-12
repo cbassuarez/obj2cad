@@ -47,10 +47,12 @@ export interface ParseFailure {
 }
 
 /** `parse`: the file can't be read without guessing. `crash`: the engine stopped (the
- *  worker must be replaced). `engine`: the engine couldn't start. */
+ *  worker must be replaced). `memory`: the drawing needs more memory than a browser tab
+ *  gives (the worker must be replaced). `engine`: the engine couldn't start. */
 export type Failure =
   | { kind: "parse"; parse: ParseFailure }
   | { kind: "crash"; message: string }
+  | { kind: "memory"; message: string }
   | { kind: "engine"; message: string }
   | { kind: "read"; message: string }
   | { kind: "other"; message: string };
@@ -120,6 +122,8 @@ const post = (msg: Reply, transfer: Transferable[] = []) => (self as DedicatedWo
 let panicMessage: string | null = null;
 const modules: Partial<Record<Kind, Promise<Module>>> = {};
 const ready = new Set<Kind>();
+/** The engine modules started, to ask after a stop whether memory ran out. */
+const started: Module[] = [];
 
 function engine(kind: Kind): Promise<Module> {
   const onPanic = (m: string) => {
@@ -130,12 +134,14 @@ function engine(kind: Kind): Promise<Module> {
       ? initCore().then(() => {
           core.on_panic(onPanic);
           ready.add("core");
+          started.push(core);
           return core;
         })
       : import("./wasm/obj2cad_wasm_dwg.js").then(async (m) => {
           await m.default();
           m.on_panic(onPanic);
           ready.add("dwg");
+          started.push(m as unknown as Module);
           return m as unknown as Module;
         });
   return modules[kind]!;
@@ -217,7 +223,13 @@ async function load(id: number, sources: SourceFile[], name: string, kind: Kind)
     );
     session.set_hashes(await Promise.all(hashes));
   } catch (e) {
-    session.free();
+    // After the engine stops mid-call the session is still marked in use, and freeing it
+    // throws over the real failure. The worker is replaced then anyway.
+    try {
+      session.free();
+    } catch {
+      /* the engine stopped */
+    }
     throw e;
   }
   return { kind, session, sources, name, parity: new Map() };
@@ -284,6 +296,9 @@ function convert(id: number, o: Open, settings: EngineSettings, wantPreview: boo
     },
   );
   try {
+    // A DWG's first 256 bytes are written last, in place of its first piece.
+    const head = c.take_head();
+    if (head.length) parts[0] = head.buffer as ArrayBuffer;
     o.parity.set(key, c.parity());
     const preview = takePreview(c);
     return {
@@ -302,8 +317,12 @@ function convert(id: number, o: Open, settings: EngineSettings, wantPreview: boo
 function failure(err: unknown): Failure {
   if (panicMessage !== null || err instanceof WebAssembly.RuntimeError) {
     dead = true;
+    const wanted = Math.max(0, ...started.map((m) => m.failed_allocation()));
+    if (wanted > 0) return { kind: "memory", message: `out of memory: ${Math.ceil(wanted / 2 ** 20)} MB more couldn't be had` };
     return { kind: "crash", message: panicMessage ?? String(err) };
   }
+  // The browser couldn't hold the file itself.
+  if (err instanceof RangeError && /allocation|memory/i.test(err.message)) return { kind: "memory", message: err.message };
   if (err && typeof err === "object" && "kind" in err && "line" in err && "issues" in err) return { kind: "parse", parse: err as ParseFailure };
   if (err instanceof Error && "engineFailed" in err) return { kind: "engine", message: err.message };
   if (err instanceof ReadError || (err instanceof DOMException && err.name === "NotReadableError")) return { kind: "read", message: (err as Error).message };
@@ -313,7 +332,7 @@ function failure(err: unknown): Failure {
 self.onmessage = async (e: MessageEvent<Request>) => {
   const req = e.data;
   if (dead) {
-    post({ id: req.id, type: "error", failure: { kind: "crash", message: panicMessage ?? "the engine stopped" } });
+    post({ id: req.id, type: "error", failure: failure(new WebAssembly.RuntimeError("the engine stopped")) });
     return;
   }
   try {

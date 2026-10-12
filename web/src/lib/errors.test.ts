@@ -26,6 +26,8 @@ describe("error copy", () => {
     expect(explain({ kind: "crash", message: "unreachable" }).report).toBe(true);
     expect(explain({ kind: "engine", message: "no wasm" }).report).toBe(true);
     expect(explain({ kind: "parse", parse: parse("too_large") }).cli).toBe(true);
+    expect(explain({ kind: "memory", message: "out of memory" }).cli).toBe(true);
+    expect(explain({ kind: "memory", message: "out of memory" }).report).toBeUndefined();
   });
 
   it("prefills an issue with version and error, never file contents", () => {

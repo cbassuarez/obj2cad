@@ -16,7 +16,7 @@ import { WorkspaceSkeleton } from "@/components/WorkspaceSkeleton";
 import { Button } from "@/components/ui/button";
 import type { PreviewState } from "@/components/Workspace";
 import { engine, EngineError, isEmpty, OutputFile, RESTARTED, sha256Hex, type Failure, type Inspection, type Progress, type Result } from "@/lib/engine";
-import { CLI_URL, explain, type Explained } from "@/lib/errors";
+import { explain, type Explained } from "@/lib/errors";
 import { fmt } from "@/lib/format";
 import { pointFeed } from "@/lib/pointFeed";
 import { finishRun, onHash, onProgress, onShown, runLabel, startRun, type Run } from "@/lib/run";
@@ -131,8 +131,8 @@ export function App() {
   };
   /** The file being written: elements written of all. */
   const [write, setWrite] = useState<{ done: number; total: number } | null>(null);
-  const [failed, setFailed] = useState<{ name: string; explained: Explained; retry?: () => void } | null>(null);
-  const [preflight, setPreflight] = useState<{ name: string; size: number; go: () => void } | null>(null);
+  const [failed, setFailed] = useState<{ name: string; explained: Explained; job?: Job; retry?: () => void } | null>(null);
+  const [preflight, setPreflight] = useState<{ name: string; size: number; job: Job; go: () => void } | null>(null);
   const [choice, setChoice] = useState<{ combined: Job; separate: Job[] } | null>(null);
   const [batch, setBatch] = useState<BatchItem[]>([]);
   const [downloaded, setDownloaded] = useState<string | null>(null);
@@ -232,12 +232,12 @@ export function App() {
   }, [needRefresh, updateServiceWorker]);
 
   // ---------------------------------------------------------------- failures
-  const fail = (name: string, e: unknown, retry?: () => void) => {
+  const fail = (name: string, e: unknown, retry?: () => void, job?: Job) => {
     setRun(null);
     pointFeed.clear();
     const failure = failureOf(e);
     const retryable = failure.kind === "crash" || failure.kind === "read" || failure.kind === "other";
-    setFailed({ name, explained: explain(failure), retry: retryable ? retry : undefined });
+    setFailed({ name, explained: explain(failure), job, retry: retryable ? retry : undefined });
     setScreen("failed", screenRef.current === "empty" ? "push" : "replace");
   };
 
@@ -303,7 +303,7 @@ export function App() {
       return true;
     } catch (e) {
       if (token !== convertToken.current) return false;
-      fail(cur.inspection.name, e, () => void openJob(cur.job, cur.handle, { choices: cur.choices, batchItem: cur.batchItem, force: true }));
+      fail(cur.inspection.name, e, () => void openJob(cur.job, cur.handle, { choices: cur.choices, batchItem: cur.batchItem, force: true }), cur.job);
       return false;
     } finally {
       if (token === convertToken.current) {
@@ -342,7 +342,7 @@ export function App() {
       const name = jobName(job);
       const size = jobSize(job);
       if (size > BIG && !opts.force) {
-        setPreflight({ name, size, go: () => void openJob(job, handle, { ...opts, force: true }) });
+        setPreflight({ name, size, job, go: () => void openJob(job, handle, { ...opts, force: true }) });
         setScreen("preflight");
         return;
       }
@@ -418,7 +418,7 @@ export function App() {
         if (!opts.reload && previous && previous !== info.name) notifications.show({ message: `Replaced ${previous} with ${info.name}` });
         if (opts.reload) notifications.show({ message: `Reloaded ${info.name}` });
       } catch (e) {
-        if (token === openToken.current) fail(failedName(job, e), e, () => void openJob(job, handle, { ...opts, force: true }));
+        if (token === openToken.current) fail(failedName(job, e), e, () => void openJob(job, handle, { ...opts, force: true }), job);
       } finally {
         if (token === openToken.current) {
           setPending([]);
@@ -704,12 +704,13 @@ export function App() {
         <PreflightScreen
           name={preflight.name}
           size={preflight.size}
-          cliUrl={CLI_URL}
+          job={preflight.job}
+          prefs={prefs}
           onContinue={preflight.go}
           onCancel={() => setScreen(currentRef.current && resultRef.current ? "work" : "empty")}
         />
       )}
-      {screen === "failed" && failed && <FailedScreen name={failed.name} explained={failed.explained} onPick={() => void pick()} onRetry={failed.retry} />}
+      {screen === "failed" && failed && <FailedScreen name={failed.name} explained={failed.explained} job={failed.job} prefs={prefs} onPick={() => void pick()} onRetry={failed.retry} />}
       {screen === "choose" && choice && (
         <ChoiceScreen separate={choice.separate} onCombine={() => void openJob(choice.combined, null)} onSeparate={() => startBatch(choice.separate)} />
       )}

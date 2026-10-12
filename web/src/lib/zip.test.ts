@@ -29,6 +29,14 @@ describe("zip", () => {
     expect(new TextDecoder().decode(await extract(archive, entries[2]))).toBe("newmtl a\nKd 1 0 0\n");
   });
 
+  it("refuses a stored file cut short", async () => {
+    const whole = zipSync({ "model.obj": [text("v 0 0 0\n".repeat(100)), { level: 0 }] });
+    const [entry] = await listZip(new Blob([whole]), "cut.zip");
+    // Keep the directory, drop the end of the file's bytes.
+    const cut = new Blob([whole.slice(0, entry.offset + 30 + "model.obj".length + 10), whole.slice(whole.length - 200)]);
+    await expect(extract(cut, entry)).rejects.toThrow("model.obj: damaged entry");
+  });
+
   it("says what is wrong with a file that isn't a zip", async () => {
     await expect(listZip(new Blob([text("not a zip")]), "x.zip")).rejects.toThrow("x.zip: not a .zip file");
   });

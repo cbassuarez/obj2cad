@@ -80,6 +80,11 @@ impl Preview {
             .unwrap_or([0.0; 3]);
         let nv: usize = model.meshes.iter().map(|m| m.vertices.len()).sum();
         let refs: usize = model.meshes.iter().map(|m| m.face_indices.len()).sum();
+        let stride = model.points.len().div_ceil(max_points.max(1)).max(1);
+        // Every `stride`-th point of each layer: at most one more per layer than that.
+        let point_layers: std::collections::BTreeSet<u32> =
+            model.points.iter().map(|p| p.layer).collect();
+        let shown = model.points.len() / stride + point_layers.len();
         let mut out = Preview {
             positions: Vec::with_capacity(nv * 3),
             colors: Vec::with_capacity(nv * 3),
@@ -89,8 +94,8 @@ impl Preview {
             lines: Vec::new(),
             line_colors: Vec::new(),
             line_groups: Vec::new(),
-            points: Vec::with_capacity(model.points.len() * 3),
-            point_colors: Vec::with_capacity(model.points.len() * 3),
+            points: Vec::with_capacity(shown * 3),
+            point_colors: Vec::with_capacity(shown * 3),
             point_groups: Vec::new(),
             point_stride: 1,
             layer_bounds: Vec::new(),
@@ -199,27 +204,24 @@ impl Preview {
                 (out.lines.len() / 3) as u32 - start,
             );
         }
-        let mut by_layer: Vec<usize> = (0..model.points.len()).collect();
-        by_layer.sort_by_key(|&i| model.points[i].layer);
-        let stride = model.points.len().div_ceil(max_points.max(1)).max(1);
         out.point_stride = stride as u32;
-        let (mut layer, mut k) = (u32::MAX, 0usize);
-        for i in by_layer {
-            let p = &model.points[i];
-            // Every `stride`-th point of each layer (a layer's extent still counts them all).
-            if p.layer != layer {
-                (layer, k) = (p.layer, 0);
+        // Layer by layer, each in order (a cloud's tens of millions of points needn't be
+        // sorted: there are few layers).
+        for layer in point_layers {
+            let mut k = 0usize;
+            for p in model.points.iter().filter(|p| p.layer == layer) {
+                // Every `stride`-th point of each layer (a layer's extent still counts them all).
+                let f = rel(p.vertex).map(|c| c as f32);
+                bounds.grow(p.layer, f);
+                k += 1;
+                if !(k - 1).is_multiple_of(stride) {
+                    continue;
+                }
+                let start = (out.points.len() / 3) as u32;
+                out.points.extend(f);
+                out.point_colors.extend_from_slice(&color(p.color, p.layer));
+                push_group(&mut out.point_groups, p.layer, start, 1);
             }
-            let f = rel(p.vertex).map(|c| c as f32);
-            bounds.grow(p.layer, f);
-            k += 1;
-            if (k - 1) % stride != 0 {
-                continue;
-            }
-            let start = (out.points.len() / 3) as u32;
-            out.points.extend(f);
-            out.point_colors.extend_from_slice(&color(p.color, p.layer));
-            push_group(&mut out.point_groups, p.layer, start, 1);
         }
         // Recognized curved surfaces: their exact edges (closed surfaces, a few circles),
         // drawn as lines over the mesh on their own layer.

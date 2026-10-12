@@ -216,7 +216,7 @@ class Engine {
       this.pending.delete(msg.id);
       if (msg.type === "ok") p.resolve(msg.result);
       else {
-        if (msg.failure.kind === "crash") this.restart();
+        if (msg.failure.kind === "crash" || msg.failure.kind === "memory") this.restart();
         p.reject(new EngineError(msg.failure));
       }
     };

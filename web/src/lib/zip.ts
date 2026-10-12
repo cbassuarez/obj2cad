@@ -100,7 +100,13 @@ export async function extract(archive: Blob, entry: ZipEntry, progress?: (done: 
   if (u32(head, 0) !== 0x04034b50) throw new Error(`${entry.name}: damaged entry in the .zip`);
   const start = entry.offset + 30 + u16(head, 26) + u16(head, 28);
   const data = archive.slice(start, start + entry.compressed);
-  if (entry.method === 0) return new Uint8Array(await data.arrayBuffer());
+  if (entry.method === 0) {
+    // A cut-off archive gives fewer bytes than the directory promises.
+    const stored = new Uint8Array(await data.arrayBuffer());
+    if (stored.length !== entry.size) throw new Error(`${entry.name}: damaged entry in the .zip`);
+    progress?.(stored.length);
+    return stored;
+  }
   const out = new Uint8Array(entry.size);
   let native: DecompressionStream | null = null;
   try {

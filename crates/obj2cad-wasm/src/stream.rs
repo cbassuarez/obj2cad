@@ -87,7 +87,7 @@ impl Stream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use obj2cad_core::bundle::{self, InputFile};
+    use obj2cad_core::bundle::{self, Content, InputFile};
 
     fn stream(
         src: &[u8],
@@ -98,7 +98,7 @@ mod tests {
         let (mut points, mut colors, mut calls) = (Vec::new(), Vec::new(), 0);
         let files = vec![InputFile {
             path: name.into(),
-            bytes: src,
+            content: Content::Bytes(src),
             sha256: None,
             modified: None,
         }];

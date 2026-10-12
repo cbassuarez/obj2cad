@@ -353,7 +353,8 @@ impl Out<'_> {
                 continue;
             }
             self.code(code);
-            let (t, negate) = model.coord_source_bytes(v, axis);
+            let (token, negate) = model.coord_source(v, axis);
+            let t = token.as_bytes();
             if plain_decimal(t) {
                 debug_assert_eq!(
                     std::str::from_utf8(t)

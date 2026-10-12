@@ -9,11 +9,14 @@
 //! and an [`ErrorKind`]. Parsing continues past an error to report up to
 //! [`MAX_ISSUES`] problems at once, but a file with any error produces no document.
 
+use crate::coords::{Coords, Token};
 use crate::diag::{Code, Diagnostic, Diagnostics, Severity};
 use crate::partial::{Colors, Partial, STEP};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fmt;
+
+pub use crate::vertex_colors::VertexColors;
 
 /// How many problems a failed parse reports before it stops looking.
 pub const MAX_ISSUES: usize = 20;
@@ -122,15 +125,6 @@ impl Elements {
         }
     }
 
-    pub(crate) fn push_element(
-        &mut self,
-        indices: &[u32],
-        attr: u32,
-        line: u64,
-    ) -> Result<(), ParseIssue> {
-        self.push(indices, attr, line)
-    }
-
     pub fn len(&self) -> usize {
         self.attr.len()
     }
@@ -193,8 +187,8 @@ pub struct SourceCounts {
 #[derive(Debug, Default)]
 pub struct ObjDocument {
     pub positions: Vec<[f64; 3]>,
-    /// Per-vertex RGB colors (`v x y z r g b`). `None` for vertices without a color.
-    pub colors: Vec<Option<[f32; 3]>>,
+    /// Per-vertex RGB colors (`v x y z r g b`, or a point cloud's color columns).
+    pub colors: VertexColors,
     pub faces: Elements,
     pub lines: Elements,
     pub points: Elements,
@@ -220,8 +214,7 @@ pub struct ObjDocument {
     /// step with `attrs`). Empty for a single file.
     pub files: Vec<String>,
     pub attr_file: Vec<u32>,
-    pub(crate) coord_text: Vec<u8>,
-    pub(crate) coord_offsets: Vec<u32>,
+    pub(crate) coords: Coords,
 }
 
 /// A face corner without a texture coordinate.
@@ -242,7 +235,7 @@ pub struct FreeformCurve {
 }
 
 /// Powers of ten that are exact in f64.
-const POW10: [f64; 23] = [
+pub(crate) const POW10: [f64; 23] = [
     1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16,
     1e17, 1e18, 1e19, 1e20, 1e21, 1e22,
 ];
@@ -284,18 +277,8 @@ pub(crate) fn plain_number(t: &[u8]) -> Option<f64> {
 
 impl ObjDocument {
     /// The exact source text of coordinate `axis` (0..3) of vertex `v`.
-    pub fn coord_text(&self, v: usize, axis: usize) -> &str {
-        let k = v * 3 + axis;
-        let s =
-            &self.coord_text[self.coord_offsets[k] as usize..self.coord_offsets[k + 1] as usize];
-        // Only ASCII number tokens that parsed successfully are stored.
-        std::str::from_utf8(s).expect("coordinate text is ASCII")
-    }
-
-    /// [`Self::coord_text`] as bytes (without re-checking that they are text).
-    pub fn coord_bytes(&self, v: usize, axis: usize) -> &[u8] {
-        let k = v * 3 + axis;
-        &self.coord_text[self.coord_offsets[k] as usize..self.coord_offsets[k + 1] as usize]
+    pub fn coord_text(&self, v: usize, axis: usize) -> Token<'_> {
+        self.coords.get(v * 3 + axis, self.positions[v][axis])
     }
 
     pub fn has_vertex_colors(&self) -> bool {
@@ -438,7 +421,6 @@ pub fn parse_with_progress(
         materials: Names::default(),
         forward: Vec::new(),
     };
-    p.doc.coord_offsets.push(0);
 
     let mut issues: Vec<ParseIssue> = Vec::new();
     let mut truncated = false;
@@ -803,14 +785,12 @@ impl Parser {
     fn vertex(&mut self, rest: &[u8]) -> Result<(), ParseIssue> {
         match self.read_vertex(rest) {
             Ok((p, text, color, weight)) => {
-                for t in text {
-                    self.doc.coord_text.extend_from_slice(t);
-                    let end = u32::try_from(self.doc.coord_text.len()).map_err(|_| ParseIssue {
+                for (t, v) in text.into_iter().zip(p) {
+                    self.doc.coords.push(t, v).map_err(|_| ParseIssue {
                         line: self.line,
                         kind: ErrorKind::TooLarge,
                         message: "coordinate text exceeds 4 GB".into(),
                     })?;
-                    self.doc.coord_offsets.push(end);
                 }
                 if let Some(w) = weight {
                     self.doc.counts.weighted_vertices += 1;
@@ -831,8 +811,7 @@ impl Parser {
             Err(e) => {
                 // Keep indices aligned so one bad vertex doesn't cascade into bogus
                 // index errors on every later face (the document is discarded anyway).
-                let end = *self.doc.coord_offsets.last().unwrap_or(&0);
-                self.doc.coord_offsets.extend_from_slice(&[end; 3]);
+                (0..3).for_each(|_| self.doc.coords.push_empty());
                 self.doc.positions.push([0.0; 3]);
                 self.doc.colors.push(None);
                 Err(e)
@@ -1460,7 +1439,7 @@ mod tests {
     #[test]
     fn vertex_colors() {
         let d = ok("v 0 0 0 1 0 0\nv 0 0 0\n");
-        assert_eq!(d.colors[0], Some([1.0, 0.0, 0.0]));
+        assert_eq!(d.colors.get(0), Some([1.0, 0.0, 0.0]));
         assert!(d
             .diagnostics
             .iter()

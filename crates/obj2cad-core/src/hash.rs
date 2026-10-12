@@ -126,15 +126,11 @@ fn write_parity(model: &CadModel, out: &mut impl Out) {
     for l in &model.polylines {
         lines.push(model, l.vertices.iter().copied());
     }
-    let mut points = Records::with_capacity(model.points.len(), model.points.len() * 24);
-    for p in &model.points {
-        points.push(model, std::iter::once(p.vertex));
-    }
 
     out.put(b"obj2cad-parity-v1\0");
     faces.write(out, b'f');
     lines.write(out, b'l');
-    points.write(out, b'p');
+    write_points(model, out, POINT_BATCH);
     // Splines (free-form curves), only when there are any, so every other file keeps its
     // hash: degree (u32 BE), knot count (u32 BE), knots, control points, weights (bits).
     if !model.splines.is_empty() {
@@ -164,10 +160,114 @@ fn write_parity(model: &CadModel, out: &mut impl Out) {
     }
 }
 
+/// Points sorted at a time, at most (about 190 MB of keys).
+const POINT_BATCH: usize = 8 << 20;
+
+/// The points' records (`p`), sorted, in batches of about `batch` so that a point cloud
+/// of any size takes bounded memory: splitters taken from a sorted sample cut the keys
+/// into ranges, and each range is gathered, sorted and written in turn. A point's record
+/// is its 24 bytes, so bytewise order is the order of its (x, y, z) bits.
+fn write_points(model: &CadModel, out: &mut impl Out, batch: usize) {
+    let key = |p: &crate::convert::PointEntity| model.position(p.vertex).map(f64::to_bits);
+    let n = model.points.len();
+    let mut buf: Vec<u8> = Vec::with_capacity(1 << 16);
+    buf.push(b'p');
+    buf.extend_from_slice(&(n as u64).to_le_bytes());
+
+    let ranges = n.div_ceil(batch.max(1)).max(1);
+    // Range r is splitters[r - 1]..splitters[r], open at both ends.
+    let splitters: Vec<[u64; 3]> = if ranges == 1 {
+        Vec::new()
+    } else {
+        let every = (n / (64 * ranges)).max(1);
+        let mut sample: Vec<[u64; 3]> = model.points.iter().step_by(every).map(key).collect();
+        sample.sort_unstable();
+        (1..ranges)
+            .map(|r| sample[r * sample.len() / ranges])
+            .collect()
+    };
+    let mut keys: Vec<[u64; 3]> = Vec::new();
+    for r in 0..ranges {
+        let lo = r.checked_sub(1).map(|i| splitters[i]);
+        let hi = splitters.get(r).copied();
+        if lo.is_some() && lo == hi {
+            continue;
+        }
+        keys.clear();
+        keys.extend(
+            model
+                .points
+                .iter()
+                .map(key)
+                .filter(|k| lo.is_none_or(|lo| *k >= lo) && hi.is_none_or(|hi| *k < hi)),
+        );
+        keys.sort_unstable();
+        for k in &keys {
+            buf.extend_from_slice(&24u32.to_le_bytes());
+            for c in k {
+                buf.extend_from_slice(&c.to_be_bytes());
+            }
+            if buf.len() >= (1 << 16) - 4096 {
+                out.put(&buf);
+                buf.clear();
+            }
+        }
+    }
+    out.put(&buf);
+}
+
 pub fn sha256_hex(bytes: &[u8]) -> String {
     hex(&Sha256::digest(bytes))
 }
 
-fn hex(bytes: &[u8]) -> String {
+/// The length and SHA-256 of everything `r` reads (a file too large to hold).
+pub fn sha256_read(mut r: impl std::io::Read) -> std::io::Result<(u64, String)> {
+    let mut h = Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    let mut len = 0u64;
+    loop {
+        match r.read(&mut buf) {
+            Ok(0) => return Ok((len, hex(&h.finalize()))),
+            Ok(n) => {
+                h.update(&buf[..n]);
+                len += n as u64;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{convert, Options};
+
+    #[test]
+    fn points_sorted_in_batches_hash_as_sorted_at_once() {
+        // Repeated points and points that differ only in y or z, in no order.
+        let src: String = (0..5000u32)
+            .map(|i| {
+                let h = i.wrapping_mul(2_654_435_761);
+                format!("{} {} {}\n", h % 7, (h >> 8) % 5, i32::from(h & 1 == 0) - 1)
+            })
+            .collect();
+        let doc = crate::xyz::parse(src.as_bytes(), "scan.xyz").unwrap();
+        let model = convert(&doc, None, Options::default());
+        let mut whole = Vec::new();
+        write_points(&model, &mut whole, usize::MAX);
+        for batch in [1, 7, 100, 4999] {
+            let mut batched = Vec::new();
+            write_points(&model, &mut batched, batch);
+            assert!(batched == whole, "batches of {batch}");
+        }
+        // The records are sorted bytewise.
+        let recs: Vec<&[u8]> = whole[9..].chunks(28).map(|r| &r[4..]).collect();
+        assert_eq!(recs.len(), 5000);
+        assert!(recs.windows(2).all(|w| w[0] <= w[1]));
+    }
 }
