@@ -1,12 +1,13 @@
 # obj2cad
 
-Convert Wavefront OBJ to DWG/DXF **without changing a single bit of geometry**.
+<!--Ideum internal tooling.--> 
+<!--10/12/2026: initial commit, seb suarez -->
+Convert Wavefront OBJ to DWG/DXF *and ensure professional output*.
 
-**Use it: https://cbassuarez.com/obj2cad/** (runs entirely in your browser; files are
-never uploaded; installable and works offline).
+You can use the tool at https://ideum.github.io/obj2cad/ (runs entirely in your browser; files are
+never uploaded; it is also installable and works offline).
 
-> Status: pre-release (see [the plan](docs/PLAN.md)). DXF (ASCII and binary) is verified;
-> DWG and curved surfaces are in beta until they pass AutoCAD acceptance.
+> **N.B.** DWG and curved surfaces are in beta until they pass AutoCAD acceptance.
 
 ## What "exact" means here
 
@@ -18,15 +19,15 @@ never uploaded; installable and works offline).
 - Anything the target format cannot carry (UVs, normals, per-vertex colors, …) is listed
   in the report. Nothing is dropped silently.
 - Ambiguous input (bad numbers, out-of-range indices, NaN/Inf) is **rejected with a line
-  number**, never guessed.
+  number**, not guessed.
 - Same input + same version → byte-identical output.
 
 Every conversion writes a `*.report.json` with input/output SHA-256, a canonical
-**parity hash** of the geometry, the layer map, and all notes. The parity hash is also
+parity hash of the geometry, the layer map, and all notes. The parity hash is also
 stored in the drawing's custom properties (`DWGPROPS` in AutoCAD), so any file can be
 traced back to its source.
 
-## What goes in
+## Accepted inputs 
 
 A model (`.obj`), or a bundle: a `.zip`, a folder, or several files with the model's
 material libraries (`.mtl`), texture images (`.jpg`, `.png`) and point clouds (`.xyz`).
@@ -127,7 +128,7 @@ fuzzed nightly (`fuzz/`).
 ## Try it
 
 Command-line binaries for Linux, macOS and Windows are attached to every
-[release](https://github.com/cbassuarez/obj2cad/releases/latest). To build from source:
+[release](https://github.com/cbassuarez/obj2cad/releases/latest). You canbuild from source:
 
 ```bash
 cargo build --release -p obj2cad-cli
@@ -153,9 +154,9 @@ for your account, no administrator rights needed. A browser can't pass a file's 
 so obj2cad looks for the file by name and size in Downloads, Desktop and Documents and
 asks before converting it (or asks you to drag it into the window); the drawing is written
 next to it. `obj2cad setup --remove` undoes the setup. On macOS, an unsigned download has
-to be opened with right-click → Open the first time.
+to be opened with right-click → Open the first time. This is a known limitation of the engine. 
 
-Web app: React + TypeScript, Tailwind v4, shadcn/ui (Radix) controls, Mantine (dropzone,
+Web app, if you're maintaining: React + TypeScript, Tailwind v4, shadcn/ui (Radix) controls, Mantine (dropzone,
 modal, menu, notifications), Motion, three.js; the same Rust core compiled to WebAssembly in
 a Web Worker. One set of CSS tokens themes all of it (a single light "drafting" theme).
 
